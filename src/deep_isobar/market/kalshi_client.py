@@ -101,10 +101,12 @@ _MONTH_MAP: dict[str, int] = {
     "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
-# Ticker regex — matches e.g. KXHIGHCHI-26MAR18-B51.5 or HIGHCHI-26MAR18-B90
-# Groups: (series)(YY)(MMM)(DD)(threshold — may be decimal)
+# Ticker regex — matches bracket (B) and threshold-edge (T) formats:
+#   KXHIGHCHI-26MAR18-B51.5   — range bracket, floor in °F
+#   KXHIGHCHI-26MAR17-T30     — edge bracket (above/below threshold)
+# Groups: (series)(YY)(MMM)(DD)(bracket_type: B|T)(threshold — may be decimal)
 _TICKER_RE = re.compile(
-    r"^([A-Z0-9]+)-(\d{2})([A-Z]{3})(\d{2})-B([\d.]+)$",
+    r"^([A-Z0-9]+)-(\d{2})([A-Z]{3})(\d{2})-([BT])([\d.]+)$",
     re.IGNORECASE,
 )
 
@@ -112,9 +114,31 @@ _TICKER_RE = re.compile(
 # Stub constants
 # ---------------------------------------------------------------------------
 
-_STUB_THRESHOLDS = [60, 65, 70, 75, 80, 85, 90]
+# Season-appropriate threshold ranges for Chicago high_temp_f stubs.
+# Each season has 7 thresholds in 5°F increments centred on the typical
+# seasonal high so that at least some contracts are near the money when
+# running the pipeline locally in winter/spring/summer/fall.
+_STUB_THRESHOLDS_BY_SEASON: dict[str, list[int]] = {
+    "winter": [10, 15, 20, 25, 30, 35, 40],   # Dec / Jan / Feb
+    "spring": [30, 35, 40, 45, 50, 55, 60],   # Mar / Apr / May
+    "summer": [65, 70, 75, 80, 85, 90, 95],   # Jun / Jul / Aug
+    "fall":   [35, 40, 45, 50, 55, 60, 65],   # Sep / Oct / Nov
+}
+
 _STUB_BID = 48.0   # cents (adapter normalises to 0.48)
 _STUB_ASK = 52.0   # cents (adapter normalises to 0.52)
+
+
+def _stub_thresholds_for_date(target_date: date) -> list[int]:
+    """Return season-appropriate stub thresholds for *target_date*."""
+    month = target_date.month
+    if month in (12, 1, 2):
+        return _STUB_THRESHOLDS_BY_SEASON["winter"]
+    if month in (3, 4, 5):
+        return _STUB_THRESHOLDS_BY_SEASON["spring"]
+    if month in (6, 7, 8):
+        return _STUB_THRESHOLDS_BY_SEASON["summer"]
+    return _STUB_THRESHOLDS_BY_SEASON["fall"]
 
 # ---------------------------------------------------------------------------
 # Optional dependency: cryptography (required for RSA-PSS auth)
@@ -325,7 +349,7 @@ def _parse_ticker(ticker: str) -> dict[str, Any] | None:
         return None
 
     try:
-        threshold_f = round(float(match.group(5)))
+        threshold_f = round(float(match.group(6)))
     except ValueError:
         logger.debug("_parse_ticker: unparseable threshold in ticker %r", ticker)
         return None
@@ -594,13 +618,18 @@ def _fetch_orderbook_from_api(
 def _stub_fetch_live_contracts() -> list[MarketContract]:
     """Return deterministic mock Chicago high_temp_f contracts (stub mode).
 
-    Returns 7 contracts at thresholds [60, 65, 70, 75, 80, 85, 90]°F
-    for tomorrow's date, using the internal contract ID format.
+    Returns 7 contracts in a season-appropriate 5°F threshold range for
+    today's date.  Thresholds are chosen so that at least some contracts
+    are near the money when running the pipeline locally in any season.
+    The scheduler derives its target date from these contracts, so the
+    forecast and probability surface are automatically aligned with the
+    contracts in hand.
     """
-    target_date = date.today() + timedelta(days=1)
+    target_date = date.today()
+    thresholds = _stub_thresholds_for_date(target_date)
     logger.info(
         "fetch_live_contracts [STUB]: target_date=%s thresholds=%s",
-        target_date, _STUB_THRESHOLDS,
+        target_date, thresholds,
     )
     return [
         MarketContract(
@@ -615,7 +644,7 @@ def _stub_fetch_live_contracts() -> list[MarketContract]:
             raw_title=f"Chicago High >= {t}°F on {target_date.isoformat()}",
             active=True,
         )
-        for t in _STUB_THRESHOLDS
+        for t in thresholds
     ]
 
 

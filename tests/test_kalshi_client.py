@@ -122,7 +122,24 @@ def test_parse_ticker_malformed_returns_none():
     assert kc._parse_ticker("NOT-A-TICKER") is None
 
 
-def test_parse_ticker_missing_b_prefix_returns_none():
+def test_parse_ticker_t_prefix_valid():
+    """T-format edge-bracket tickers parse correctly."""
+    result = kc._parse_ticker("KXHIGHCHI-26MAR17-T30")
+    assert result is not None
+    assert result["series"] == "KXHIGHCHI"
+    assert result["target_date"] == date(2026, 3, 17)
+    assert result["threshold_f"] == 30
+
+
+def test_parse_ticker_t_prefix_decimal_rounded():
+    """T29.5 rounds to 30."""
+    result = kc._parse_ticker("KXHIGHCHI-26MAR17-T29.5")
+    assert result is not None
+    assert result["threshold_f"] == 30
+
+
+def test_parse_ticker_missing_bracket_prefix_returns_none():
+    """No B or T prefix → no match."""
     assert kc._parse_ticker("KXHIGHCHI-26MAR18-51.5") is None
 
 
@@ -336,6 +353,25 @@ def test_parse_orderbook_response_empty_both_sides():
 # ---------------------------------------------------------------------------
 
 
+def test_stub_thresholds_for_date_spring():
+    """March should return spring thresholds (~30-60°F range)."""
+    from datetime import date as _date
+    thresholds = kc._stub_thresholds_for_date(_date(2026, 3, 17))
+    assert len(thresholds) == 7
+    assert min(thresholds) < 50   # well below summer range
+    assert max(thresholds) <= 65  # not summer temps
+
+
+def test_stub_thresholds_for_date_summer():
+    thresholds = kc._stub_thresholds_for_date(date(2026, 7, 15))
+    assert min(thresholds) >= 60
+
+
+def test_stub_thresholds_for_date_winter():
+    thresholds = kc._stub_thresholds_for_date(date(2026, 1, 15))
+    assert max(thresholds) <= 45
+
+
 @patch.object(kc, "_load_credentials", return_value=None)
 def test_fetch_live_contracts_returns_list(_):
     result = kc.fetch_live_contracts("Kalshi")
@@ -412,6 +448,23 @@ def test_fetch_live_contracts_live_parses_api_response(mock_get, _):
 
 @patch.object(kc, "_load_credentials", return_value=_FAKE_CREDENTIALS)
 @patch.object(kc, "_kalshi_get")
+def test_fetch_live_contracts_parses_t_format_tickers(mock_get, _):
+    """T-prefix edge-bracket tickers (e.g. KXHIGHCHI-26MAR17-T30) are parsed."""
+    mock_get.return_value = {
+        "markets": [
+            _make_market_dict("KXHIGHCHI-26MAR17-T30"),
+            _make_market_dict("KXHIGHCHI-26MAR17-B27.5"),
+        ],
+        "cursor": None,
+    }
+    result = kc.fetch_live_contracts("Kalshi")
+    assert len(result) == 2
+    thresholds = {c.threshold_f for c in result}
+    assert thresholds == {30, 28}   # T30→30, B27.5→round(27.5)=28
+
+
+@patch.object(kc, "_load_credentials", return_value=_FAKE_CREDENTIALS)
+@patch.object(kc, "_kalshi_get")
 def test_fetch_live_contracts_skips_unparseable_tickers(mock_get, _):
     mock_get.return_value = {
         "markets": [
@@ -430,14 +483,14 @@ def test_fetch_live_contracts_skips_unparseable_tickers(mock_get, _):
 def test_fetch_live_contracts_empty_response_falls_back_to_stub(mock_get, _):
     mock_get.return_value = {"markets": [], "cursor": None}
     result = kc.fetch_live_contracts("Kalshi")
-    assert len(result) == len(kc._STUB_THRESHOLDS)
+    assert len(result) == 7   # one per stub threshold in the current season
 
 
 @patch.object(kc, "_load_credentials", return_value=_FAKE_CREDENTIALS)
 @patch.object(kc, "_kalshi_get", side_effect=RuntimeError("network timeout"))
 def test_fetch_live_contracts_api_error_falls_back_to_stub(_, __):
     result = kc.fetch_live_contracts("Kalshi")
-    assert len(result) == len(kc._STUB_THRESHOLDS)
+    assert len(result) == 7   # one per stub threshold in the current season
 
 
 @patch.object(kc, "_load_credentials", return_value=_FAKE_CREDENTIALS)
@@ -477,5 +530,5 @@ def test_stub_mode_config_forces_stub_despite_credentials(mock_setting, _):
 
     mock_setting.side_effect = side_effect
     result = kc.fetch_live_contracts("Kalshi")
-    assert len(result) == len(kc._STUB_THRESHOLDS)
+    assert len(result) == 7   # one per stub threshold in the current season
     assert all(c.city == "Chicago" for c in result)

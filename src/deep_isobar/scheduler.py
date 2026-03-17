@@ -106,20 +106,31 @@ def run_once(now_utc: datetime | None = None) -> list[TradeSignal]:
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
 
-    target_date = (now_utc + timedelta(days=1)).date()
-
-    logger.info(
-        "run_once: city=%s metric=%s target_date=%s",
-        _CITY,
-        _METRIC,
-        target_date,
-    )
+    logger.info("run_once: city=%s metric=%s", _CITY, _METRIC)
 
     # ── Step 1: City profile ──────────────────────────────────────────────
     # KeyError here is fatal — re-raised immediately.
     profile = get_city_profile(_CITY)
 
-    # ── Step 2: Forecasts ─────────────────────────────────────────────────
+    # ── Step 2: Live contracts — fetched first so target_date can be derived ──
+    # At 5am the next day's contracts may not be listed yet; Kalshi returns
+    # whatever is currently open (today's or tomorrow's).  The stub falls back
+    # to today's date.  We derive target_date from what we actually receive so
+    # forecasts and the probability surface are always aligned with the contracts.
+    contracts = fetch_live_contracts(_MARKET_SOURCE)
+    if not contracts:
+        logger.warning("run_once: no contracts returned by %s — returning empty", _MARKET_SOURCE)
+        return []
+
+    target_date = min(c.target_date for c in contracts)
+    logger.info(
+        "run_once: received %d contracts from %s — target_date=%s",
+        len(contracts),
+        _MARKET_SOURCE,
+        target_date,
+    )
+
+    # ── Step 3: Forecasts (for the contract target date) ──────────────────
     forecasts = fetch_forecasts_for_city(
         city=_CITY,
         target_date=target_date,
@@ -128,7 +139,7 @@ def run_once(now_utc: datetime | None = None) -> list[TradeSignal]:
     )
     logger.debug("run_once: fetched %d forecast points", len(forecasts))
 
-    # ── Step 3: Temperature ensemble ──────────────────────────────────────
+    # ── Step 4: Temperature ensemble ──────────────────────────────────────
     ensemble = build_temperature_ensemble(
         city_profile=profile,
         forecasts=forecasts,
@@ -143,20 +154,12 @@ def run_once(now_utc: datetime | None = None) -> list[TradeSignal]:
         ensemble.methodology,
     )
 
-    # ── Step 4: KDE distribution ──────────────────────────────────────────
+    # ── Step 5: KDE distribution ──────────────────────────────────────────
     forecast_values = [fp.forecast_value_f for fp in forecasts]
     kde = build_kde_distribution(
         forecast_values_f=forecast_values,
         bandwidth=profile.kde_bandwidth,
     )
-
-    # ── Step 5: Live contracts (fetched before surface so we can derive range) ──
-    contracts = fetch_live_contracts(_MARKET_SOURCE)
-    if not contracts:
-        logger.warning("run_once: no contracts returned by %s — returning empty", _MARKET_SOURCE)
-        return []
-
-    logger.info("run_once: received %d contracts from %s", len(contracts), _MARKET_SOURCE)
 
     # ── Step 6: Probability surface (range auto-derived from contract thresholds) ─
     cfg_min: int = get_setting("models.probability_surface.min_temp_f", 10)
