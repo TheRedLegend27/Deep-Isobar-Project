@@ -25,6 +25,16 @@ import yaml
 _PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
 _SETTINGS_CACHE: dict[str, Any] | None = None
 
+# ---------------------------------------------------------------------------
+# Load .env into the process environment (no-op if file is absent or
+# python-dotenv is not installed — never overwrites existing env vars)
+# ---------------------------------------------------------------------------
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(_PROJECT_ROOT / ".env", override=False)
+except ImportError:  # pragma: no cover
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Public API

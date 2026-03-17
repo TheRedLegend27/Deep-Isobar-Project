@@ -72,21 +72,42 @@ def build_kde_distribution(
         raise ValueError(f"bandwidth must be positive, got {bandwidth}")
 
     data = np.array(forecast_values_f, dtype=float)
+
+    # gaussian_kde requires non-zero variance.  When all values are identical
+    # (e.g. two models agree exactly or only one source is live) add a tiny
+    # symmetric jitter so the covariance matrix is positive-definite.
+    if np.std(data) == 0.0:
+        logger.debug(
+            "build_kde_distribution: all %d values identical (%.4f) — adding jitter",
+            len(data), data[0],
+        )
+        data = data + np.linspace(-0.001, 0.001, len(data))
+
     kde = gaussian_kde(data)
 
     if bandwidth is not None:
         # Multiply the auto-detected Scott factor by the city-specific multiplier.
         kde.set_bandwidth(bw_method=kde.factor * bandwidth)
+
+    # Enforce a minimum effective bandwidth of 2°F (typical day-ahead forecast
+    # RMSE) so that degenerate inputs don't collapse the distribution to a
+    # near-point-mass.  The factor is set such that factor * data.std() == 2°F.
+    _MIN_BW_F = 2.0
+    data_std = float(data.std(ddof=1))
+    actual_bw_f = kde.factor * data_std
+    if actual_bw_f < _MIN_BW_F:
+        kde.set_bandwidth(bw_method=_MIN_BW_F / data_std)
         logger.debug(
-            "build_kde_distribution  n=%d bandwidth_multiplier=%.2f "
-            "effective_factor=%.4f",
-            len(forecast_values_f), bandwidth, kde.factor,
+            "build_kde_distribution: bandwidth clamped %.4f → %.1f°F (minimum)",
+            actual_bw_f, _MIN_BW_F,
         )
-    else:
-        logger.debug(
-            "build_kde_distribution  n=%d default_factor=%.4f",
-            len(forecast_values_f), kde.factor,
-        )
+
+    logger.debug(
+        "build_kde_distribution  n=%d bandwidth_multiplier=%s effective_bw_f=%.2f",
+        len(forecast_values_f),
+        f"{bandwidth:.2f}" if bandwidth is not None else "default",
+        kde.factor * data_std,
+    )
 
     return kde
 

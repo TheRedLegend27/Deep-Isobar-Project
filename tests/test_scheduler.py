@@ -199,6 +199,114 @@ def test_run_once_signal_contract_id_matches():
 
 
 # ---------------------------------------------------------------------------
+# _attempt_paper_trades
+# ---------------------------------------------------------------------------
+
+
+def _make_signal(contract_id: str, side: str, alpha: float = 0.20) -> TradeSignal:
+    return TradeSignal(
+        timestamp_utc=_NOW,
+        contract_id=contract_id,
+        city="Chicago",
+        target_date=_TOMORROW,
+        metric="high_temp_f",
+        threshold_f=45,
+        comparison_operator="ge",
+        market_probability=0.50,
+        model_probability=0.50 + alpha if side == "BUY" else 0.50 - alpha,
+        alpha=alpha if side == "BUY" else -alpha,
+        absolute_alpha=abs(alpha),
+        signal_side=side,
+        confidence_score=1.0,
+    )
+
+
+def test_attempt_paper_trades_executes_sell_signal():
+    """A SELL signal with room to trade is paper-executed."""
+    positions: dict = {}
+    signal = _make_signal("CONTRACT-A", "SELL")
+    trades, exp = scheduler_mod._attempt_paper_trades(
+        signals=[signal],
+        positions=positions,
+        daily_exposure=0.0,
+        quantity_per_trade=10.0,
+        max_position_per_contract=50.0,
+        max_daily_exposure=500.0,
+    )
+    assert len(trades) == 1
+    assert trades[0].side == "SELL"
+    assert trades[0].paper_trade_flag is True
+    assert positions["CONTRACT-A"] == -10.0
+    assert exp == pytest.approx(10.0 * 0.50)   # qty * price
+
+
+def test_attempt_paper_trades_skips_hold_signals():
+    """HOLD signals are skipped — no trade, no position change."""
+    positions: dict = {}
+    trades, exp = scheduler_mod._attempt_paper_trades(
+        signals=[_make_signal("CONTRACT-B", "HOLD")],
+        positions=positions,
+        daily_exposure=0.0,
+        quantity_per_trade=10.0,
+        max_position_per_contract=50.0,
+        max_daily_exposure=500.0,
+    )
+    assert trades == []
+    assert exp == 0.0
+    assert "CONTRACT-B" not in positions
+
+
+def test_attempt_paper_trades_respects_daily_exposure_cap():
+    """A trade that would breach max_daily_exposure is rejected."""
+    positions: dict = {}
+    trades, exp = scheduler_mod._attempt_paper_trades(
+        signals=[_make_signal("CONTRACT-C", "SELL")],
+        positions=positions,
+        daily_exposure=499.0,          # only $1 headroom
+        quantity_per_trade=10.0,       # 10 × $0.50 = $5 notional — over cap
+        max_position_per_contract=50.0,
+        max_daily_exposure=500.0,
+    )
+    assert trades == []
+    assert exp == 499.0   # unchanged
+
+
+def test_attempt_paper_trades_daily_exposure_resets_across_calls():
+    """Executed trades update exposure; subsequent calls see accumulated value."""
+    positions: dict = {}
+    _, exp = scheduler_mod._attempt_paper_trades(
+        signals=[_make_signal("CONTRACT-D", "SELL")],
+        positions=positions,
+        daily_exposure=0.0,
+        quantity_per_trade=10.0,
+        max_position_per_contract=50.0,
+        max_daily_exposure=500.0,
+    )
+    assert exp == pytest.approx(5.0)   # 10 × 0.50
+
+
+def test_run_loop_executes_paper_trades(monkeypatch):
+    """run_loop calls _attempt_paper_trades after each run_once cycle."""
+    calls: list = []
+
+    def fake_run_once(now_utc=None):
+        return [_make_signal("C-X", "SELL")]
+
+    def fake_attempt(signals, positions, daily_exposure, **kwargs):
+        calls.append(("attempt", len(signals)))
+        raise KeyboardInterrupt  # stop after first call
+
+    monkeypatch.setattr(scheduler_mod, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler_mod, "_attempt_paper_trades", fake_attempt)
+    monkeypatch.setattr(scheduler_mod.time, "sleep", lambda s: None)
+
+    with pytest.raises(KeyboardInterrupt):
+        scheduler_mod.run_loop(interval_seconds=1)
+
+    assert calls == [("attempt", 1)]
+
+
+# ---------------------------------------------------------------------------
 # run_loop
 # ---------------------------------------------------------------------------
 

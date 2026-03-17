@@ -96,9 +96,15 @@ logger = logging.getLogger(__name__)
 
 VALID_METRICS: Final[set[str]] = {"high_temp_f", "low_temp_f"}
 
-# Stub fallback parameters
-_STUB_BASE_TEMP_F: Final[float] = 55.0
-_STUB_RANGE_F: Final[float] = 40.0  # stub values span [base, base + range]
+# Stub fallback parameters — season-keyed (base, range) pairs so that
+# deterministic stub values stay within the realistic temperature band for the
+# target date's season rather than always falling in a summer-biased window.
+_STUB_SEASON_BOUNDS: Final[dict[str, tuple[float, float]]] = {
+    "winter": (15.0, 35.0),   # [15, 50]°F  — Dec / Jan / Feb
+    "spring": (30.0, 35.0),   # [30, 65]°F  — Mar / Apr / May
+    "summer": (60.0, 40.0),   # [60, 100]°F — Jun / Jul / Aug
+    "fall":   (35.0, 35.0),   # [35, 70]°F  — Sep / Oct / Nov
+}
 
 # HTTP
 _OPEN_METEO_BASE_URL: Final[str] = "https://api.open-meteo.com/v1/forecast"
@@ -183,6 +189,18 @@ def _compute_lead_hours(run_time_utc: datetime, target_date: date) -> int:
     return max(hours, 0)
 
 
+def _stub_season_bounds(target_date: date) -> tuple[float, float]:
+    """Return ``(base_f, range_f)`` for a deterministic stub value on *target_date*."""
+    month = target_date.month
+    if month in (12, 1, 2):
+        return _STUB_SEASON_BOUNDS["winter"]
+    if month in (3, 4, 5):
+        return _STUB_SEASON_BOUNDS["spring"]
+    if month in (6, 7, 8):
+        return _STUB_SEASON_BOUNDS["summer"]
+    return _STUB_SEASON_BOUNDS["fall"]
+
+
 def _compute_stub_forecast_value(
     city: str,
     model_name: str,
@@ -193,8 +211,9 @@ def _compute_stub_forecast_value(
 
     The value is derived from a SHA-256 hash of the input fields so that
     different combinations yield different—but fully reproducible—
-    temperatures.  Values fall in the range
-    ``[_STUB_BASE_TEMP_F, _STUB_BASE_TEMP_F + _STUB_RANGE_F]``.
+    temperatures.  The base and range are chosen from
+    :data:`_STUB_SEASON_BOUNDS` so values stay within the realistic band
+    for the target date's season.
 
     Args:
         city: City name.
@@ -208,7 +227,8 @@ def _compute_stub_forecast_value(
     seed = f"{city}|{model_name}|{target_date.isoformat()}|{metric}"
     digest = hashlib.sha256(seed.encode()).hexdigest()
     fraction = int(digest[:8], 16) / 0xFFFFFFFF
-    value = _STUB_BASE_TEMP_F + fraction * _STUB_RANGE_F
+    base_f, range_f = _stub_season_bounds(target_date)
+    value = base_f + fraction * range_f
     return round(value, 1)
 
 

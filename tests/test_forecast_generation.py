@@ -133,8 +133,19 @@ class TestComputeStubForecastValue:
         assert v_gfs != v_ecmwf
 
     def test_value_in_range(self) -> None:
+        # _TARGET_DATE is March (spring) → range [30, 65]°F
         val = _compute_stub_forecast_value("Denver", "NAM", _TARGET_DATE, "low_temp_f")
-        assert 55.0 <= val <= 95.0
+        assert 30.0 <= val <= 65.0
+
+    def test_value_in_range_summer(self) -> None:
+        summer_date = date(2026, 7, 15)
+        val = _compute_stub_forecast_value("Chicago", "GFS", summer_date, "high_temp_f")
+        assert 60.0 <= val <= 100.0
+
+    def test_value_in_range_winter(self) -> None:
+        winter_date = date(2026, 1, 15)
+        val = _compute_stub_forecast_value("Chicago", "GFS", winter_date, "high_temp_f")
+        assert 15.0 <= val <= 50.0
 
     def test_different_metrics_differ(self) -> None:
         v_high = _compute_stub_forecast_value("Chicago", "GFS", _TARGET_DATE, "high_temp_f")

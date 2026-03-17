@@ -43,7 +43,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from deep_isobar.config import get_setting
-from deep_isobar.core.types import TradeSignal
+from deep_isobar.core.types import ExecutedTrade, TradeSignal
 from deep_isobar.data.city_universe import get_city_profile
 from deep_isobar.market.kalshi_client import (
     fetch_live_contracts,
@@ -57,6 +57,8 @@ from deep_isobar.models.forecast_generation import fetch_forecasts_for_city
 from deep_isobar.models.kde_temperature_distribution import build_kde_distribution
 from deep_isobar.models.probability_surface import generate_probability_surface_kde
 from deep_isobar.models.temperature_ensemble import build_temperature_ensemble
+from deep_isobar.trading.risk_manager import approve_trade
+from deep_isobar.trading.trade_execution import execute_paper_trade
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,73 @@ _METRIC = "high_temp_f"
 _OPERATOR = "ge"
 _MODELS = ["GFS", "ECMWF", "NAM"]
 _MARKET_SOURCE = "Kalshi"
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _attempt_paper_trades(
+    signals: list[TradeSignal],
+    positions: dict[str, float],
+    daily_exposure: float,
+    quantity_per_trade: float,
+    max_position_per_contract: float,
+    max_daily_exposure: float,
+) -> tuple[list[ExecutedTrade], float]:
+    """Run each actionable signal through the risk gate and paper-execute approved trades.
+
+    Mutates *positions* in-place and returns the updated *daily_exposure*.
+
+    Args:
+        signals: Ranked trade signals from :func:`run_once`.
+        positions: Mutable mapping of ``contract_id → signed position``.
+            Updated in-place for every executed trade.
+        daily_exposure: Notional exposure already consumed today (dollars).
+        quantity_per_trade: Contracts to attempt per trade.
+        max_position_per_contract: Per-contract position cap.
+        max_daily_exposure: Daily notional cap across all contracts.
+
+    Returns:
+        ``(executed_trades, updated_daily_exposure)``
+    """
+    executed: list[ExecutedTrade] = []
+    for signal in signals:
+        if signal.signal_side == "HOLD":
+            continue
+
+        price = signal.market_probability
+        current_pos = positions.get(signal.contract_id, 0.0)
+
+        decision = approve_trade(
+            signal=signal,
+            proposed_quantity=quantity_per_trade,
+            proposed_price=price,
+            current_position=current_pos,
+            max_position_per_contract=max_position_per_contract,
+            daily_exposure_before=daily_exposure,
+            max_daily_exposure=max_daily_exposure,
+        )
+
+        if not decision.approved_flag:
+            logger.debug(
+                "_attempt_paper_trades: %s rejected — %s",
+                signal.contract_id,
+                decision.rejection_reason,
+            )
+            continue
+
+        trade = execute_paper_trade(signal, quantity_per_trade, price)
+        executed.append(trade)
+
+        if signal.signal_side == "BUY":
+            positions[signal.contract_id] = current_pos + quantity_per_trade
+        else:
+            positions[signal.contract_id] = current_pos - quantity_per_trade
+        daily_exposure = decision.daily_exposure_after
+
+    return executed, daily_exposure
 
 
 # ---------------------------------------------------------------------------
@@ -131,11 +200,24 @@ def run_once(now_utc: datetime | None = None) -> list[TradeSignal]:
     )
 
     # ── Step 3: Forecasts (for the contract target date) ──────────────────
+    # ECMWF (ecmwf_ifs04) is unavailable on Open-Meteo for same-day targets;
+    # its stub value would bias the ensemble.  Use GFS + NAM only for today.
+    today_utc = now_utc.date()
+    models = (
+        [m for m in _MODELS if m != "ECMWF"]
+        if target_date <= today_utc
+        else _MODELS
+    )
+    if models != _MODELS:
+        logger.info(
+            "run_once: target_date=%s is same-day — dropping ECMWF (unavailable on Open-Meteo)",
+            target_date,
+        )
     forecasts = fetch_forecasts_for_city(
         city=_CITY,
         target_date=target_date,
         metric=_METRIC,
-        model_names=_MODELS,
+        model_names=models,
     )
     logger.debug("run_once: fetched %d forecast points", len(forecasts))
 
@@ -225,10 +307,14 @@ def run_once(now_utc: datetime | None = None) -> list[TradeSignal]:
 def run_loop(interval_seconds: int = 300) -> None:
     """Run the scan loop indefinitely, sleeping between iterations.
 
-    Calls :func:`run_once` on each iteration.  Non-fatal exceptions are
-    logged and the loop continues.  A :exc:`KeyError` from a missing city
-    profile is re-raised immediately since it indicates a misconfigured
-    environment that will never recover without human intervention.
+    Each iteration calls :func:`run_once` then passes the ranked signals
+    through the risk manager and paper-executes any approved trades.
+    Session-level position and daily exposure state is maintained in memory;
+    daily exposure resets automatically at midnight UTC.
+
+    Non-fatal exceptions are logged and the loop continues.  A
+    :exc:`KeyError` from a missing city profile is re-raised immediately
+    since it indicates a misconfigured environment.
 
     Args:
         interval_seconds: Seconds to sleep between scan iterations.
@@ -239,14 +325,52 @@ def run_loop(interval_seconds: int = 300) -> None:
         # Start the paper-trading loop:
         run_loop(interval_seconds=300)
     """
-    logger.info("run_loop: starting — interval=%ds city=%s metric=%s", interval_seconds, _CITY, _METRIC)
+    from datetime import date
+
+    qty: float = float(get_setting("risk.quantity_per_trade", 10))
+    max_pos: float = float(get_setting("risk.max_position_per_contract", 50))
+    max_exp: float = float(get_setting("risk.max_daily_exposure", 500))
+
+    positions: dict[str, float] = {}
+    daily_exposure: float = 0.0
+    trade_day: date = datetime.now(timezone.utc).date()
+    session_trade_count: int = 0
+
+    logger.info(
+        "run_loop: starting — interval=%ds city=%s metric=%s qty=%.0f max_pos=%.0f max_exp=%.0f",
+        interval_seconds, _CITY, _METRIC, qty, max_pos, max_exp,
+    )
 
     while True:
-        try:
-            signals = run_once()
+        now_utc = datetime.now(timezone.utc)
+
+        # Reset daily exposure at UTC midnight.
+        if now_utc.date() != trade_day:
             logger.info(
-                "run_loop: cycle complete — %d signals returned",
+                "run_loop: new trading day %s — resetting daily_exposure (was %.2f)",
+                now_utc.date(), daily_exposure,
+            )
+            daily_exposure = 0.0
+            trade_day = now_utc.date()
+
+        try:
+            signals = run_once(now_utc=now_utc)
+            trades, daily_exposure = _attempt_paper_trades(
+                signals=signals,
+                positions=positions,
+                daily_exposure=daily_exposure,
+                quantity_per_trade=qty,
+                max_position_per_contract=max_pos,
+                max_daily_exposure=max_exp,
+            )
+            session_trade_count += len(trades)
+            logger.info(
+                "run_loop: cycle complete — %d signals, %d trades executed "
+                "(session total=%d, daily_exp=%.2f)",
                 len(signals),
+                len(trades),
+                session_trade_count,
+                daily_exposure,
             )
         except KeyError as exc:
             # Fatal: city not configured — nothing will fix this at runtime.
@@ -254,7 +378,7 @@ def run_loop(interval_seconds: int = 300) -> None:
             raise
         except Exception as exc:
             logger.error(
-                "run_loop: unhandled exception in run_once — %s: %s — continuing",
+                "run_loop: unhandled exception — %s: %s — continuing",
                 type(exc).__name__,
                 exc,
             )
