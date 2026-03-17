@@ -1,0 +1,22 @@
+Project: Deep Isobar
+
+Relevant docs:
+- ARCHITECTURE.md
+- INTERFACES.md
+- MODULE_DEPENDENCIES.md
+
+Follow these rules:
+
+Iterative Development:
+Build only the requested module.
+
+Prompt Engineering:
+Follow the interfaces exactly as defined in INTERFACES.md.
+
+Error Handling:
+Raise clear errors for invalid inputs.
+
+Testing:
+Include pytest tests.
+
+Now build:
