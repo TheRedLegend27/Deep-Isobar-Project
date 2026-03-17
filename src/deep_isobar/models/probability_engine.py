@@ -43,7 +43,7 @@ def probability_ge_normal(mean_f: float, std_f: float, threshold_f: float) -> fl
     if std_f <= 0:
         raise ValueError(f"std_f must be positive, got {std_f}")
 
-    prob = float(1.0 - norm.cdf(threshold_f, loc=mean_f, scale=std_f))
+    prob = float(max(0.0, min(1.0, 1.0 - norm.cdf(threshold_f, loc=mean_f, scale=std_f))))
     logger.debug(
         "probability_ge_normal  mean=%.1f std=%.2f threshold=%.1f → %.4f",
         mean_f, std_f, threshold_f, prob,
@@ -73,7 +73,7 @@ def probability_le_normal(mean_f: float, std_f: float, threshold_f: float) -> fl
     if std_f <= 0:
         raise ValueError(f"std_f must be positive, got {std_f}")
 
-    prob = float(norm.cdf(threshold_f, loc=mean_f, scale=std_f))
+    prob = float(max(0.0, min(1.0, norm.cdf(threshold_f, loc=mean_f, scale=std_f))))
     logger.debug(
         "probability_le_normal  mean=%.1f std=%.2f threshold=%.1f → %.4f",
         mean_f, std_f, threshold_f, prob,

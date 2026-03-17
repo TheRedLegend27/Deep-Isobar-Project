@@ -4,3 +4,7 @@ __pycache__/
 .env
 *.pyc
 data/
+
+# API credentials — never commit real keys
+keys/
+*.pem

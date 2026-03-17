@@ -31,7 +31,7 @@ models:
   default_metric: high_temp_f
   comparison_operator: ge
   probability_surface:
-    min_temp_f: 50
+    min_temp_f: 10
     max_temp_f: 120
   forecast_shift_significant_threshold_f: 2.0
   kde:
@@ -42,6 +42,18 @@ markets:
   enabled_sources:
     - Kalshi
     - Polymarket
+  kalshi:
+    # Base URL for the Kalshi v2 REST API.
+    # Despite the "elections" subdomain this endpoint serves all Kalshi markets.
+    base_url: "https://api.elections.kalshi.com/trade-api/v2"
+    # Kalshi series ticker for Chicago high-temperature contracts.
+    # Set credentials via env vars:
+    #   KALSHI_API_KEY_ID        — your API key ID (from kalshi.com/account/profile)
+    #   KALSHI_PRIVATE_KEY_PATH  — path to RSA private key PEM file
+    #   KALSHI_PRIVATE_KEY       — inline RSA PEM (alternative to path, \n-escaped ok)
+    series_ticker: "KXHIGHCHI"
+    # Force stub mode even when credentials are present (useful for local dev).
+    stub_mode: false
 
 logging:
   level: INFO

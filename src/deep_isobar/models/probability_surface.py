@@ -39,7 +39,7 @@ def generate_probability_surface_kde(
         else:
             raise ValueError("comparison_operator must be 'ge' or 'le'")
 
-        prob = np.trapz(pdf[mask], xs[mask]) if mask.any() else 0.0
+        prob = np.trapezoid(pdf[mask], xs[mask]) if mask.any() else 0.0
         surface[threshold] = float(max(0.0, min(1.0, prob)))
 
     return surface

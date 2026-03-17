@@ -1,0 +1,754 @@
+"""Kalshi prediction-market client for Deep Isobar.
+
+Supports two modes selected automatically at call time:
+
+**Live mode** — authenticated HTTP requests to the Kalshi v2 REST API.
+Active when all of the following are true:
+
+  1. ``KALSHI_API_KEY_ID`` environment variable is set.
+  2. ``KALSHI_PRIVATE_KEY_PATH`` (path to RSA PEM file) **or**
+     ``KALSHI_PRIVATE_KEY`` (inline PEM string) is set.
+  3. The ``cryptography`` package is installed.
+  4. ``markets.kalshi.stub_mode`` is not ``true`` in ``config/settings.yaml``.
+
+**Stub mode** — deterministic mock data, no network calls.
+Used when live-mode prerequisites are not met, or as an automatic
+fallback when a live API call fails.
+
+Canonical interface (from INTERFACES.md)::
+
+    fetch_live_contracts(market_source) -> list[MarketContract]
+    fetch_orderbook_for_contract(market_source, contract_id) -> OrderBookSnapshot
+
+Kalshi API reference
+--------------------
+Base URL:  https://api.elections.kalshi.com/trade-api/v2
+Auth:      RSA-PSS (SHA-256) — sign ``timestamp_ms + METHOD + path``
+           where *path* is the full API path **without query parameters**
+           e.g. ``/trade-api/v2/markets``, not ``/markets?status=open``.
+Headers:   KALSHI-ACCESS-KEY, KALSHI-ACCESS-TIMESTAMP, KALSHI-ACCESS-SIGNATURE
+Orderbook: ``GET /markets/{ticker}/orderbook`` returns ``orderbook_fp``
+           with ``yes_dollars`` and ``no_dollars`` arrays of
+           ``[price_str, count_str]`` pairs sorted **ascending**.
+           Best YES bid  = last element of ``yes_dollars``.
+           Best YES ask  = 1.0 − last element of ``no_dollars``.
+Prices:    Dollar strings with up to 6 decimal places (e.g. ``"0.4200"``).
+
+Weather market tickers
+----------------------
+Series: ``KXHIGHCHI`` (Chicago high temp), ``KXLOWCHI`` (Chicago low temp).
+Ticker: ``KXHIGHCHI-26MAR18-B51.5`` where ``B51.5`` is the bracket floor (°F).
+Markets are bracket-based (Kalshi scalar format).  Edge brackets map cleanly
+to the ">= T" / "<= T" binary model used by this system.
+
+Credential environment variables
+---------------------------------
+``KALSHI_API_KEY_ID``       — Key ID from kalshi.com/account/profile
+``KALSHI_PRIVATE_KEY_PATH`` — path to RSA private key PEM file
+``KALSHI_PRIVATE_KEY``      — inline PEM string (\\n-escaped newlines ok)
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+import os
+import re
+import time
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
+from urllib.parse import urlparse
+
+import requests
+
+from deep_isobar.config import get_setting
+from deep_isobar.core.types import MarketContract, OrderBookSnapshot
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Despite the "elections" subdomain this endpoint serves ALL Kalshi markets.
+_KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+_MARKET_SOURCE = "Kalshi"
+_TIMEOUT_SECONDS = 10
+_MAX_PAGES = 5  # guard against runaway pagination
+
+# Env var names for credentials
+_ENV_KEY_ID = "KALSHI_API_KEY_ID"
+_ENV_KEY_PATH = "KALSHI_PRIVATE_KEY_PATH"   # path to PEM file
+_ENV_KEY_INLINE = "KALSHI_PRIVATE_KEY"      # inline PEM (\\n-escaped ok)
+
+# ---------------------------------------------------------------------------
+# Series metadata: parsed series name → domain model fields
+# ---------------------------------------------------------------------------
+
+# Add new cities / metrics / operators here when expanding beyond Chicago.
+# Both KX-prefixed (current Kalshi naming) and bare names are included.
+_SERIES_METADATA: dict[str, dict[str, str]] = {
+    "KXHIGHCHI": {"city": "Chicago", "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
+    "KXLOWCHI":  {"city": "Chicago", "metric": "low_temp_f",   "comparison_operator": "le", "settlement_source": "NWS"},
+    "HIGHCHI":   {"city": "Chicago", "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
+    "LOWCHI":    {"city": "Chicago", "metric": "low_temp_f",   "comparison_operator": "le", "settlement_source": "NWS"},
+}
+
+# Month abbreviation → month number (Kalshi uses 3-letter uppercase abbrevs)
+_MONTH_MAP: dict[str, int] = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
+    "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
+    "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+# Ticker regex — matches e.g. KXHIGHCHI-26MAR18-B51.5 or HIGHCHI-26MAR18-B90
+# Groups: (series)(YY)(MMM)(DD)(threshold — may be decimal)
+_TICKER_RE = re.compile(
+    r"^([A-Z0-9]+)-(\d{2})([A-Z]{3})(\d{2})-B([\d.]+)$",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Stub constants
+# ---------------------------------------------------------------------------
+
+_STUB_THRESHOLDS = [60, 65, 70, 75, 80, 85, 90]
+_STUB_BID = 48.0   # cents (adapter normalises to 0.48)
+_STUB_ASK = 52.0   # cents (adapter normalises to 0.52)
+
+# ---------------------------------------------------------------------------
+# Optional dependency: cryptography (required for RSA-PSS auth)
+# ---------------------------------------------------------------------------
+
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding as _asym_padding
+    _CRYPTO_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _CRYPTO_AVAILABLE = False
+    logger.debug(
+        "kalshi_client: 'cryptography' not installed — live mode unavailable"
+    )
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+
+def _load_credentials() -> tuple[str, Any] | None:
+    """Load Kalshi RSA credentials from environment variables.
+
+    Returns:
+        ``(key_id, private_key)`` when credentials are present and valid,
+        ``None`` otherwise.
+    """
+    if not _CRYPTO_AVAILABLE:
+        return None
+
+    key_id = os.getenv(_ENV_KEY_ID, "").strip()
+    if not key_id:
+        return None
+
+    pem: str | None = None
+    key_path = os.getenv(_ENV_KEY_PATH, "").strip()
+    if key_path:
+        try:
+            with open(key_path, encoding="utf-8") as fh:
+                pem = fh.read()
+        except OSError as exc:
+            logger.warning(
+                "kalshi_client: cannot read private key from %r — %s", key_path, exc
+            )
+            return None
+    else:
+        inline = os.getenv(_ENV_KEY_INLINE, "").strip()
+        if inline:
+            pem = inline.replace("\\n", "\n")
+
+    if not pem:
+        logger.warning(
+            "kalshi_client: %s is set but no private key found; "
+            "set %s or %s", _ENV_KEY_ID, _ENV_KEY_PATH, _ENV_KEY_INLINE,
+        )
+        return None
+
+    try:
+        private_key = serialization.load_pem_private_key(pem.encode(), password=None)
+    except Exception as exc:
+        logger.warning("kalshi_client: failed to parse private key — %s", exc)
+        return None
+
+    logger.debug("kalshi_client: credentials loaded for key_id=%r", key_id)
+    return key_id, private_key
+
+
+def _use_stub_mode() -> bool:
+    """Return True if stub mode is forced via config."""
+    return bool(get_setting("markets.kalshi.stub_mode", False))
+
+
+# ---------------------------------------------------------------------------
+# HTTP client
+# ---------------------------------------------------------------------------
+
+
+def _make_auth_headers(
+    key_id: str,
+    private_key: Any,
+    method: str,
+    sign_path: str,
+) -> dict[str, str]:
+    """Build Kalshi v2 RSA-PSS authentication headers.
+
+    Signs ``timestamp_ms + METHOD + sign_path`` using RSA-PSS / SHA-256.
+
+    Args:
+        key_id: Kalshi API key ID.
+        private_key: RSA private key object from ``cryptography``.
+        method: HTTP method (``"GET"``, ``"POST"``, …).
+        sign_path: Full API path **without** query parameters, e.g.
+            ``"/trade-api/v2/markets"`` — not ``"/markets?status=open"``.
+    """
+    timestamp_ms = str(int(time.time() * 1000))
+    message = (timestamp_ms + method.upper() + sign_path).encode()
+    signature = private_key.sign(
+        message,
+        _asym_padding.PSS(
+            mgf=_asym_padding.MGF1(hashes.SHA256()),
+            salt_length=_asym_padding.PSS.MAX_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    return {
+        "KALSHI-ACCESS-KEY": key_id,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
+        "Content-Type": "application/json",
+    }
+
+
+def _kalshi_get(
+    path: str,
+    params: dict[str, Any] | None,
+    credentials: tuple[str, Any],
+) -> dict[str, Any]:
+    """Make an authenticated GET request to the Kalshi v2 REST API.
+
+    Constructs the signing path as ``/trade-api/v2{path}`` (the full API
+    path without query parameters) per Kalshi's signature requirements.
+
+    Args:
+        path: Endpoint path without base URL, e.g. ``"/markets"``.
+        params: Optional query parameters.
+        credentials: ``(key_id, private_key)`` from :func:`_load_credentials`.
+
+    Returns:
+        Parsed JSON response dict.
+
+    Raises:
+        RuntimeError: On network error or non-200 HTTP status.
+    """
+    key_id, private_key = credentials
+    base_url = get_setting("markets.kalshi.base_url", _KALSHI_BASE_URL)
+    url = f"{base_url}{path}"
+
+    # Signature uses the FULL path prefix (e.g. /trade-api/v2) without query string.
+    base_path = urlparse(base_url).path.rstrip("/")  # e.g. "/trade-api/v2"
+    sign_path = base_path + path                     # e.g. "/trade-api/v2/markets"
+
+    headers = _make_auth_headers(key_id, private_key, "GET", sign_path)
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params or {},
+            timeout=_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Kalshi API network error on GET {path}: {exc}") from exc
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Kalshi API error: GET {path} → HTTP {response.status_code}: "
+            f"{response.text[:200]}"
+        )
+
+    return response.json()
+
+
+# ---------------------------------------------------------------------------
+# Ticker and contract parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_ticker(ticker: str) -> dict[str, Any] | None:
+    """Extract structured fields from a Kalshi weather contract ticker.
+
+    Handles the current Kalshi format: ``KXHIGHCHI-26MAR18-B51.5``
+
+    The bracket suffix ``B51.5`` is a temperature floor in °F.  It is
+    rounded to the nearest integer to populate ``threshold_f`` so it fits
+    the existing ``MarketContract`` integer field.
+
+    Args:
+        ticker: Raw Kalshi exchange ticker string.
+
+    Returns:
+        Dict with ``series`` (str), ``target_date`` (date),
+        ``threshold_f`` (int) on success, or ``None`` on parse failure.
+
+    Example::
+
+        _parse_ticker("KXHIGHCHI-26MAR18-B51.5")
+        # → {"series": "KXHIGHCHI", "target_date": date(2026, 3, 18), "threshold_f": 52}
+    """
+    match = _TICKER_RE.match(ticker.upper().strip())
+    if not match:
+        logger.debug("_parse_ticker: no match for ticker %r", ticker)
+        return None
+
+    series = match.group(1)
+    year = 2000 + int(match.group(2))
+    month_str = match.group(3).upper()
+    day = int(match.group(4))
+
+    month = _MONTH_MAP.get(month_str)
+    if month is None:
+        logger.debug("_parse_ticker: unknown month %r in ticker %r", month_str, ticker)
+        return None
+
+    try:
+        target_date = date(year, month, day)
+    except ValueError as exc:
+        logger.debug("_parse_ticker: invalid date in ticker %r — %s", ticker, exc)
+        return None
+
+    try:
+        threshold_f = round(float(match.group(5)))
+    except ValueError:
+        logger.debug("_parse_ticker: unparseable threshold in ticker %r", ticker)
+        return None
+
+    return {"series": series, "target_date": target_date, "threshold_f": threshold_f}
+
+
+def _parse_contract(market: dict[str, Any], now_utc: datetime) -> MarketContract | None:
+    """Parse a single Kalshi market API dict into a :class:`MarketContract`.
+
+    Skips markets whose ticker cannot be parsed or whose series is not
+    in :data:`_SERIES_METADATA`.
+
+    Args:
+        market: One element from the ``markets`` list in a Kalshi API response.
+        now_utc: Reference timestamp (unused currently, reserved for future use).
+
+    Returns:
+        A populated :class:`~deep_isobar.core.types.MarketContract`,
+        or ``None`` if the market cannot be mapped to the Deep Isobar schema.
+    """
+    ticker: str = market.get("ticker", "")
+    parsed = _parse_ticker(ticker)
+    if parsed is None:
+        logger.debug("_parse_contract: skipping unparseable ticker %r", ticker)
+        return None
+
+    meta = _SERIES_METADATA.get(parsed["series"])
+    if meta is None:
+        logger.debug(
+            "_parse_contract: unknown series %r — skipping %r", parsed["series"], ticker
+        )
+        return None
+
+    status: str = market.get("status", "active")
+    active = status.lower() in ("active", "open", "")
+
+    # Parse optional ISO-8601 timestamps.
+    # Kalshi v2 field names: created_time → listed_at, latest_expiration_time → expires_at
+    listed_at_utc: datetime | None = None
+    expires_at_utc: datetime | None = None
+    for api_field, target in (
+        ("created_time", "listed"),
+        ("latest_expiration_time", "expires"),
+    ):
+        raw = market.get(api_field)
+        if raw:
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if target == "listed":
+                    listed_at_utc = dt
+                else:
+                    expires_at_utc = dt
+            except ValueError:
+                pass
+
+    return MarketContract(
+        contract_id=ticker,
+        market_source=_MARKET_SOURCE,
+        city=meta["city"],
+        metric=meta["metric"],
+        comparison_operator=meta["comparison_operator"],
+        threshold_f=parsed["threshold_f"],
+        target_date=parsed["target_date"],
+        settlement_source=meta["settlement_source"],
+        raw_title=market.get("rules_primary") or market.get("title"),
+        listed_at_utc=listed_at_utc,
+        expires_at_utc=expires_at_utc,
+        active=active,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orderbook parsing
+# ---------------------------------------------------------------------------
+
+
+def _best_bid_from_yes(yes_levels: list) -> float | None:
+    """Return the best YES bid (dollars, 0–1) from Kalshi YES orderbook levels.
+
+    Kalshi returns ``yes_dollars`` as ``[price_str, count_str]`` pairs
+    sorted **ascending** — the highest (best) bid is the **last** element.
+
+    Args:
+        yes_levels: List of ``[price_str, count_str]`` pairs from the API.
+
+    Returns:
+        Best bid as a float in [0, 1], or ``None`` if no levels exist.
+    """
+    if not yes_levels:
+        return None
+    try:
+        return float(max(float(level[0]) for level in yes_levels))
+    except (IndexError, TypeError, ValueError):
+        logger.debug("_best_bid_from_yes: malformed yes_levels: %r", yes_levels)
+        return None
+
+
+def _best_ask_from_no(no_levels: list) -> float | None:
+    """Derive best YES ask (dollars) from Kalshi NO orderbook levels.
+
+    In Kalshi's complementary-pricing model:
+    ``YES_ask = $1.00 − best_NO_bid``
+
+    Kalshi returns ``no_dollars`` sorted **ascending** — best NO bid is last.
+
+    Args:
+        no_levels: List of ``[price_str, count_str]`` pairs for the NO side.
+
+    Returns:
+        Implied YES ask as a float in [0, 1], or ``None`` if no levels exist.
+    """
+    if not no_levels:
+        return None
+    try:
+        best_no_bid = max(float(level[0]) for level in no_levels)
+        return round(1.0 - best_no_bid, 10)  # avoid float drift
+    except (IndexError, TypeError, ValueError):
+        logger.debug("_best_ask_from_no: malformed no_levels: %r", no_levels)
+        return None
+
+
+def _parse_orderbook_response(
+    contract_id: str,
+    data: dict[str, Any],
+    now_utc: datetime,
+) -> OrderBookSnapshot:
+    """Parse a Kalshi orderbook API response into an :class:`OrderBookSnapshot`.
+
+    Response key is ``orderbook_fp`` with sub-fields ``yes_dollars`` and
+    ``no_dollars``.  Prices are dollar strings in [0, 1] — they are stored
+    as-is so :func:`~deep_isobar.market.market_price_adapter.compute_market_probability`
+    receives values ≤ 1.0 and uses them directly.
+
+    Arrays are sorted ascending; best bid is the last element.
+
+    Args:
+        contract_id: Exchange ticker used to populate ``contract_id``.
+        data: Parsed JSON from ``GET /markets/{ticker}/orderbook``.
+        now_utc: Snapshot timestamp.
+
+    Returns:
+        An :class:`~deep_isobar.core.types.OrderBookSnapshot`.
+    """
+    ob = data.get("orderbook_fp", {})
+    yes_levels: list = ob.get("yes_dollars") or []
+    no_levels: list = ob.get("no_dollars") or []
+
+    best_bid = _best_bid_from_yes(yes_levels)
+    best_ask = _best_ask_from_no(no_levels)
+
+    # Guard: crossed market (bad data) — drop ask rather than raise
+    if best_bid is not None and best_ask is not None and best_bid > best_ask:
+        logger.warning(
+            "_parse_orderbook_response: crossed market for %r "
+            "(bid=%.4f > ask=%.4f) — dropping ask",
+            contract_id, best_bid, best_ask,
+        )
+        best_ask = None
+
+    # Sizes: arrays sorted ascending so best bid/ask size is at [-1]
+    bid_size: float | None = None
+    ask_size: float | None = None
+    try:
+        if yes_levels:
+            bid_size = float(yes_levels[-1][1])
+    except (IndexError, TypeError, ValueError):
+        pass
+    try:
+        if no_levels:
+            ask_size = float(no_levels[-1][1])
+    except (IndexError, TypeError, ValueError):
+        pass
+
+    return OrderBookSnapshot(
+        timestamp_utc=now_utc,
+        contract_id=contract_id,
+        market_source=_MARKET_SOURCE,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live API calls
+# ---------------------------------------------------------------------------
+
+
+def _fetch_live_contracts_from_api(credentials: tuple[str, Any]) -> list[MarketContract]:
+    """Fetch and parse open Chicago weather contracts from the Kalshi API.
+
+    Paginates automatically (up to :data:`_MAX_PAGES` pages).
+
+    Args:
+        credentials: ``(key_id, private_key)`` from :func:`_load_credentials`.
+
+    Returns:
+        List of parsed :class:`~deep_isobar.core.types.MarketContract` objects.
+    """
+    series_ticker = get_setting("markets.kalshi.series_ticker", "KXHIGHCHI")
+    now_utc = datetime.now(timezone.utc)
+    contracts: list[MarketContract] = []
+    cursor: str | None = None
+
+    for page in range(_MAX_PAGES):
+        params: dict[str, Any] = {
+            "series_ticker": series_ticker,
+            "status": "open",
+            "limit": 100,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        logger.debug(
+            "_fetch_live_contracts_from_api: GET /markets series=%s page=%d",
+            series_ticker, page + 1,
+        )
+
+        data = _kalshi_get("/markets", params, credentials)
+
+        for market in data.get("markets", []):
+            contract = _parse_contract(market, now_utc)
+            if contract is not None:
+                contracts.append(contract)
+
+        cursor = data.get("cursor") or None
+        if not cursor:
+            break
+
+    logger.info(
+        "_fetch_live_contracts_from_api: parsed %d contracts", len(contracts)
+    )
+    return contracts
+
+
+def _fetch_orderbook_from_api(
+    contract_id: str,
+    credentials: tuple[str, Any],
+) -> OrderBookSnapshot:
+    """Fetch the live order book for a single contract from the Kalshi API.
+
+    Args:
+        contract_id: Kalshi exchange ticker, e.g. ``"KXHIGHCHI-26MAR18-B51.5"``.
+        credentials: ``(key_id, private_key)`` from :func:`_load_credentials`.
+
+    Returns:
+        Parsed :class:`~deep_isobar.core.types.OrderBookSnapshot`.
+
+    Raises:
+        RuntimeError: If the API call fails.
+    """
+    now_utc = datetime.now(timezone.utc)
+    path = f"/markets/{contract_id}/orderbook"
+    logger.debug("_fetch_orderbook_from_api: GET %s", path)
+    data = _kalshi_get(path, {"depth": 1}, credentials)
+    return _parse_orderbook_response(contract_id, data, now_utc)
+
+
+# ---------------------------------------------------------------------------
+# Stub implementations
+# ---------------------------------------------------------------------------
+
+
+def _stub_fetch_live_contracts() -> list[MarketContract]:
+    """Return deterministic mock Chicago high_temp_f contracts (stub mode).
+
+    Returns 7 contracts at thresholds [60, 65, 70, 75, 80, 85, 90]°F
+    for tomorrow's date, using the internal contract ID format.
+    """
+    target_date = date.today() + timedelta(days=1)
+    logger.info(
+        "fetch_live_contracts [STUB]: target_date=%s thresholds=%s",
+        target_date, _STUB_THRESHOLDS,
+    )
+    return [
+        MarketContract(
+            contract_id=f"CHI_HIGH_TEMP_F_GE_{t}_{target_date.strftime('%Y%m%d')}",
+            market_source=_MARKET_SOURCE,
+            city="Chicago",
+            metric="high_temp_f",
+            comparison_operator="ge",
+            threshold_f=t,
+            target_date=target_date,
+            settlement_source="NWS",
+            raw_title=f"Chicago High >= {t}°F on {target_date.isoformat()}",
+            active=True,
+        )
+        for t in _STUB_THRESHOLDS
+    ]
+
+
+def _stub_fetch_orderbook(contract_id: str) -> OrderBookSnapshot:
+    """Return a synthetic order-book snapshot (stub mode).
+
+    Prices are in cents (48/52) so the mid is 50 → market probability 0.50
+    after normalisation by :func:`~deep_isobar.market.market_price_adapter`.
+    """
+    logger.debug("fetch_orderbook_for_contract [STUB]: contract=%s", contract_id)
+    return OrderBookSnapshot(
+        timestamp_utc=datetime.now(timezone.utc),
+        contract_id=contract_id,
+        market_source=_MARKET_SOURCE,
+        best_bid=_STUB_BID,
+        best_ask=_STUB_ASK,
+        last_trade_price=(_STUB_BID + _STUB_ASK) / 2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public interface
+# ---------------------------------------------------------------------------
+
+
+def fetch_live_contracts(market_source: str) -> list[MarketContract]:
+    """Return live temperature contracts for the given market source.
+
+    In **live mode** (credentials present and valid), calls
+    ``GET /markets`` filtered to the configured Chicago weather series.
+    Falls back to stub data automatically on any API error.
+
+    In **stub mode**, returns 7 deterministic Chicago ``high_temp_f >= T``
+    contracts for tomorrow without any network call.
+
+    Args:
+        market_source: Exchange identifier.  Only ``"Kalshi"`` (case-
+            insensitive) is accepted; any other value raises immediately.
+
+    Returns:
+        List of :class:`~deep_isobar.core.types.MarketContract` objects.
+
+    Raises:
+        RuntimeError: If ``market_source`` is not ``"Kalshi"``.
+
+    Example::
+
+        contracts = fetch_live_contracts("Kalshi")
+        for c in contracts:
+            print(c.contract_id, c.threshold_f)
+    """
+    if market_source.lower() != "kalshi":
+        raise RuntimeError(
+            f"market_source {market_source!r} is not supported by this client. "
+            "Only 'Kalshi' is accepted."
+        )
+
+    if _use_stub_mode():
+        logger.info("fetch_live_contracts: stub_mode=true in config — using stub")
+        return _stub_fetch_live_contracts()
+
+    credentials = _load_credentials()
+    if credentials is None:
+        logger.info(
+            "fetch_live_contracts: no usable credentials found — using stub mode"
+        )
+        return _stub_fetch_live_contracts()
+
+    logger.info("fetch_live_contracts: live mode — calling Kalshi API")
+    try:
+        contracts = _fetch_live_contracts_from_api(credentials)
+        if not contracts:
+            logger.warning(
+                "fetch_live_contracts: API returned 0 parseable contracts — "
+                "falling back to stub"
+            )
+            return _stub_fetch_live_contracts()
+        return contracts
+    except Exception as exc:
+        logger.warning(
+            "fetch_live_contracts: live API call failed (%s: %s) — "
+            "falling back to stub",
+            type(exc).__name__, exc,
+        )
+        return _stub_fetch_live_contracts()
+
+
+def fetch_orderbook_for_contract(
+    market_source: str,
+    contract_id: str,
+) -> OrderBookSnapshot:
+    """Return the current order-book snapshot for a contract.
+
+    In **live mode**, calls ``GET /markets/{ticker}/orderbook`` and parses
+    the Kalshi v2 ``orderbook_fp`` response (dollar-denominated prices).
+    Falls back to stub data on any API failure.
+
+    In **stub mode**, returns bid=48¢, ask=52¢ → mid=50¢ → market
+    probability 0.50.
+
+    Args:
+        market_source: Exchange identifier.  Only ``"Kalshi"`` accepted.
+        contract_id: Kalshi ticker (live) or internal ID (stub).
+
+    Returns:
+        An :class:`~deep_isobar.core.types.OrderBookSnapshot`.
+
+    Raises:
+        RuntimeError: If ``market_source`` is not ``"Kalshi"``.
+
+    Example::
+
+        ob = fetch_orderbook_for_contract("Kalshi", "KXHIGHCHI-26MAR18-B51.5")
+        print(ob.best_bid, ob.best_ask)   # → 0.48, 0.52  (live example)
+    """
+    if market_source.lower() != "kalshi":
+        raise RuntimeError(
+            f"market_source {market_source!r} is not supported by this client."
+        )
+
+    if _use_stub_mode():
+        return _stub_fetch_orderbook(contract_id)
+
+    credentials = _load_credentials()
+    if credentials is None:
+        return _stub_fetch_orderbook(contract_id)
+
+    try:
+        return _fetch_orderbook_from_api(contract_id, credentials)
+    except Exception as exc:
+        logger.warning(
+            "fetch_orderbook_for_contract: live API call failed for %r "
+            "(%s: %s) — falling back to stub",
+            contract_id, type(exc).__name__, exc,
+        )
+        return _stub_fetch_orderbook(contract_id)

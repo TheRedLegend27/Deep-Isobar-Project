@@ -99,7 +99,7 @@ class TestGetSetting:
         assert get_setting("risk.alpha_threshold") == 0.10
 
     def test_deep_dot_path(self):
-        assert get_setting("models.probability_surface.min_temp_f") == 50
+        assert get_setting("models.probability_surface.min_temp_f") == 10
 
     def test_missing_key_returns_none(self):
         assert get_setting("nonexistent.path") is None

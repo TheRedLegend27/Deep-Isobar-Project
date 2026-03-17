@@ -20,3 +20,12 @@ Testing:
 Include pytest tests.
 
 Now build:
+
+
+Now review the module you just wrote for:
+- interface drift
+- hidden bugs
+- edge-case failures
+- unnecessary complexity
+
+If needed, make a minimal cleanup pass only.
