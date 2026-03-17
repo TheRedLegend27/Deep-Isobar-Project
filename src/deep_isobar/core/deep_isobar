@@ -1,0 +1,64 @@
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Optional
+
+
+@dataclass
+class CityProfile:
+    city: str
+    city_code: str
+    station_id: str
+    timezone: str
+    settlement_source: str
+    variance_multiplier: float
+    mean_bias_correction_f: float
+    kde_bandwidth: float
+    tail_multiplier: float = 1.0
+    model_weight_gfs: Optional[float] = None
+    model_weight_ecmwf: Optional[float] = None
+    model_weight_nam: Optional[float] = None
+    heat_bias_adjustment_f: float = 0.0
+    cold_bias_adjustment_f: float = 0.0
+
+
+@dataclass
+class ForecastPoint:
+    city: str
+    station_id: str
+    model_name: str
+    run_time_utc: datetime
+    target_date: date
+    metric: str
+    forecast_value_f: float
+    lead_hours: int
+    source_name: str
+
+
+@dataclass
+class MarketContract:
+    contract_id: str
+    market_source: str
+    city: str
+    metric: str
+    comparison_operator: str
+    threshold_f: int
+    target_date: date
+    settlement_source: str
+    active: bool = True
+
+
+@dataclass
+class TradeSignal:
+    timestamp_utc: datetime
+    contract_id: str
+    city: str
+    target_date: date
+    metric: str
+    threshold_f: int
+    comparison_operator: str
+    market_probability: float
+    model_probability: float
+    alpha: float
+    absolute_alpha: float
+    signal_side: str
+    confidence_score: float

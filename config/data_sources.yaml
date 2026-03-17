@@ -1,0 +1,42 @@
+sources:
+  NWS:
+    source_type: observation
+    authority_level: 10
+    active: true
+    notes: Official settlement-aligned observation source for Kalshi weather markets
+
+  GFS:
+    source_type: forecast_model
+    authority_level: 8
+    active: true
+    notes: Global Forecast System model data
+
+  ECMWF:
+    source_type: forecast_model
+    authority_level: 9
+    active: true
+    notes: European forecast model
+
+  NAM:
+    source_type: forecast_model
+    authority_level: 7
+    active: true
+    notes: North American Mesoscale model
+
+  Kalshi:
+    source_type: market
+    authority_level: 10
+    active: true
+    notes: Regulated prediction market exchange
+
+  Polymarket:
+    source_type: market
+    authority_level: 8
+    active: true
+    notes: Crypto prediction market platform
+
+  WeatherUnderground:
+    source_type: settlement_reference
+    authority_level: 6
+    active: true
+    notes: Secondary reference for markets that use Wunderground

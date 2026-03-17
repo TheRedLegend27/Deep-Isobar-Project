@@ -1,0 +1,47 @@
+project:
+  name: deep-isobar
+  environment: development
+  timezone: America/New_York
+
+paths:
+  data_dir: data
+  raw_dir: data/raw
+  normalized_dir: data/normalized
+  forecasts_dir: data/forecasts
+  features_dir: data/features
+  markets_dir: data/markets
+  backtests_dir: data/backtests
+  logs_dir: data/logs
+
+runtime:
+  paper_trade: true
+  scheduler_interval_seconds: 300
+  model_scan_priority_windows_et:
+    - "07:00-09:00"
+    - "13:00-14:00"
+    - "19:00-21:00"
+    - "21:00-22:00"
+
+risk:
+  alpha_threshold: 0.10
+  max_position_per_contract: 100
+  max_daily_exposure: 1000
+
+models:
+  default_metric: high_temp_f
+  comparison_operator: ge
+  probability_surface:
+    min_temp_f: 50
+    max_temp_f: 120
+  forecast_shift_significant_threshold_f: 2.0
+  kde:
+    default_bandwidth: 1.0
+    min_points: 2
+
+markets:
+  enabled_sources:
+    - Kalshi
+    - Polymarket
+
+logging:
+  level: INFO

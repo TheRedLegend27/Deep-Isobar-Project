@@ -1,0 +1,10 @@
+pandas
+numpy
+scipy
+requests
+pyarrow
+pytest
+pydantic
+PyYAML
+loguru
+python-dateutil
