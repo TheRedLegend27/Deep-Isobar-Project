@@ -1,76 +1,110 @@
+"""Forecast Volatility — ensemble spread metrics for Deep Isobar.
+
+Measures the spread and uncertainty across a set of model forecast values.
+For the MVP, :func:`compute_forecast_volatility_score` equals the sample
+standard deviation.  This is clearly documented so future enhancements
+(e.g. interquartile range, weighted spread) can be added without breaking
+the interface.
+
+All functions require a non-empty list and raise :exc:`ValueError` otherwise.
+
+Typical usage::
+
+    from deep_isobar.models.forecast_volatility import (
+        compute_forecast_std,
+        compute_forecast_variance,
+        compute_forecast_volatility_score,
+    )
+
+    values = [72.0, 74.5, 71.0, 76.2, 73.8]
+    std   = compute_forecast_std(values)           # sample std
+    var   = compute_forecast_variance(values)      # sample variance
+    score = compute_forecast_volatility_score(values)  # == std for MVP
+"""
+
+from __future__ import annotations
+
 import logging
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
 def compute_forecast_std(forecast_values_f: list[float]) -> float:
-    """
-    Computes the sample standard deviation of a list of forecast temperatures.
+    """Compute the sample standard deviation of forecast temperatures.
+
+    Uses Bessel's correction (``ddof=1``).  Returns ``0.0`` for a
+    single-element list (no spread possible).
 
     Args:
-        forecast_values_f (list[float]): A list of forecast temperatures in Fahrenheit.
+        forecast_values_f: Forecast temperatures in °F.  Must be non-empty.
 
     Returns:
-        float: The sample standard deviation of the forecast values.
+        Sample standard deviation as a float.
 
     Raises:
-        ValueError: If the input list is empty.
+        ValueError: If the list is empty.
     """
     if not forecast_values_f:
-        logger.error("Empty list provided to compute_forecast_std")
         raise ValueError("forecast_values_f cannot be empty")
-        
+
     if len(forecast_values_f) == 1:
-        logger.debug("Only one forecast value provided; standard deviation is 0.0")
+        logger.debug("compute_forecast_std: single value, returning 0.0")
         return 0.0
-        
+
     std_val = float(np.std(forecast_values_f, ddof=1))
-    logger.debug(f"Computed forecast standard deviation: {std_val:.4f}")
+    logger.debug("compute_forecast_std: n=%d std=%.4f", len(forecast_values_f), std_val)
     return std_val
 
+
 def compute_forecast_variance(forecast_values_f: list[float]) -> float:
-    """
-    Computes the sample variance of a list of forecast temperatures.
+    """Compute the sample variance of forecast temperatures.
+
+    Uses Bessel's correction (``ddof=1``).  Returns ``0.0`` for a
+    single-element list.
 
     Args:
-        forecast_values_f (list[float]): A list of forecast temperatures in Fahrenheit.
+        forecast_values_f: Forecast temperatures in °F.  Must be non-empty.
 
     Returns:
-        float: The sample variance of the forecast values.
+        Sample variance as a float.
 
     Raises:
-        ValueError: If the input list is empty.
+        ValueError: If the list is empty.
     """
     if not forecast_values_f:
-        logger.error("Empty list provided to compute_forecast_variance")
         raise ValueError("forecast_values_f cannot be empty")
-        
+
     if len(forecast_values_f) == 1:
-        logger.debug("Only one forecast value provided; variance is 0.0")
+        logger.debug("compute_forecast_variance: single value, returning 0.0")
         return 0.0
-        
+
     var_val = float(np.var(forecast_values_f, ddof=1))
-    logger.debug(f"Computed forecast variance: {var_val:.4f}")
+    logger.debug("compute_forecast_variance: n=%d var=%.4f", len(forecast_values_f), var_val)
     return var_val
 
+
 def compute_forecast_volatility_score(forecast_values_f: list[float]) -> float:
-    """
-    Computes a volatility score for the forecast values.
-    For the MVP, this is equivalent to the standard deviation.
+    """Compute a volatility score for ensemble forecast spread.
+
+    **MVP behaviour**: returns the sample standard deviation (identical to
+    :func:`compute_forecast_std`).  Future versions may incorporate
+    additional factors such as run-to-run shift history or model
+    disagreement weighting.
 
     Args:
-        forecast_values_f (list[float]): A list of forecast temperatures in Fahrenheit.
+        forecast_values_f: Forecast temperatures in °F.  Must be non-empty.
 
     Returns:
-        float: The computed volatility score.
+        Volatility score as a float.
 
     Raises:
-        ValueError: If the input list is empty.
+        ValueError: If the list is empty.
     """
     if not forecast_values_f:
-        logger.error("Empty list provided to compute_forecast_volatility_score")
         raise ValueError("forecast_values_f cannot be empty")
-        
+
     score = compute_forecast_std(forecast_values_f)
-    logger.debug(f"Computed forecast volatility score: {score:.4f}")
+    logger.debug("compute_forecast_volatility_score: n=%d score=%.4f", len(forecast_values_f), score)
     return score

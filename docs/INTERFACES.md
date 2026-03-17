@@ -102,8 +102,11 @@ class CityProfile:
     model_weight_nam: Optional[float] = None
     heat_bias_adjustment_f: float = 0.0
     cold_bias_adjustment_f: float = 0.0
+```
 
-ForecastPoint
+## ForecastPoint
+
+```python
 from dataclasses import dataclass
 from datetime import datetime, date
 
@@ -118,7 +121,11 @@ class ForecastPoint:
     forecast_value_f: float
     lead_hours: int
     source_name: str
-ForecastShiftEvent
+```
+
+## ForecastShiftEvent
+
+```python
 from dataclasses import dataclass
 from datetime import datetime, date
 
@@ -136,7 +143,11 @@ class ForecastShiftEvent:
     absolute_shift_f: float
     shift_direction: str
     significant_shift_flag: bool
-EnsembleSummary
+```
+
+## EnsembleSummary
+
+```python
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import List
@@ -155,7 +166,11 @@ class EnsembleSummary:
     adjusted_std_f: float
     bias_corrected_mean_f: float
     methodology: str
-TemperatureDistributionSnapshot
+```
+
+## TemperatureDistributionSnapshot
+
+```python
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import List
@@ -171,7 +186,11 @@ class TemperatureDistributionSnapshot:
     min_temp_f: float
     max_temp_f: float
     methodology: str
-OrderBookSnapshot
+```
+
+## OrderBookSnapshot
+
+```python
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -188,7 +207,11 @@ class OrderBookSnapshot:
     ask_size: Optional[float] = None
     volume_24h: Optional[float] = None
     open_interest: Optional[float] = None
-MarketContract
+```
+
+## MarketContract
+
+```python
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
@@ -207,7 +230,11 @@ class MarketContract:
     listed_at_utc: Optional[datetime] = None
     expires_at_utc: Optional[datetime] = None
     active: bool = True
-TradeSignal
+```
+
+## TradeSignal
+
+```python
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional
@@ -233,7 +260,11 @@ class TradeSignal:
     microstructure_score: Optional[float] = None
     rank_score: Optional[float] = None
     model_version: str = "v1"
-RiskDecision
+```
+
+## RiskDecision
+
+```python
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -251,7 +282,11 @@ class RiskDecision:
     projected_position: Optional[float] = None
     daily_exposure_before: Optional[float] = None
     daily_exposure_after: Optional[float] = None
-ExecutedTrade
+```
+
+## ExecutedTrade
+
+```python
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -272,6 +307,7 @@ class ExecutedTrade:
     exchange_order_id: Optional[str] = None
     paper_trade_flag: bool = True
     notes: Optional[str] = None
+```
 Module Interfaces
 1. Config
 
