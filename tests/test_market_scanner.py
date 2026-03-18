@@ -6,8 +6,11 @@ Covers:
 - evaluate_contract_opportunity: bad orderbook raises ValueError
 - evaluate_contract_opportunity: timestamp defaults to now when not supplied
 - evaluate_contract_opportunity: confidence_score == abs(alpha)
-- rank_trade_signals: descending order by absolute_alpha
-- rank_trade_signals: stable sort on equal absolute_alpha
+- evaluate_contract_opportunity: returned signal has a rank_score
+- rank_trade_signals: rank_score used as primary key when available
+- rank_trade_signals: fallback to absolute_alpha when rank_score is None
+- rank_trade_signals: tie-breaking by absolute_alpha then contract_id
+- rank_trade_signals: deterministic output regardless of input order
 - rank_trade_signals: empty list handled
 - rank_trade_signals: single-element list handled
 """
@@ -55,7 +58,11 @@ def _make_orderbook(bid: float | None, ask: float | None, contract_id: str = "CH
     )
 
 
-def _make_signal(absolute_alpha: float, contract_id: str = "X") -> TradeSignal:
+def _make_signal(
+    absolute_alpha: float,
+    contract_id: str = "X",
+    rank_score: float | None = None,
+) -> TradeSignal:
     """Convenience: build a minimal TradeSignal with a known absolute_alpha."""
     alpha = absolute_alpha  # positive alpha
     return TradeSignal(
@@ -72,6 +79,7 @@ def _make_signal(absolute_alpha: float, contract_id: str = "X") -> TradeSignal:
         absolute_alpha=absolute_alpha,
         signal_side="BUY" if alpha > _THRESHOLD else "HOLD",
         confidence_score=absolute_alpha,
+        rank_score=rank_score,
     )
 
 
@@ -317,13 +325,13 @@ def test_rank_single_element():
     assert ranked[0].contract_id == "A"
 
 
-def test_rank_stable_on_equal_alpha():
-    """Signals with equal absolute_alpha preserve relative input order."""
-    # All three have identical absolute_alpha=0.15
+def test_rank_tie_broken_by_contract_id():
+    """Equal rank_score and absolute_alpha → tie-broken by contract_id ascending."""
+    # All three have identical absolute_alpha=0.15, no rank_score
     signals = [
+        _make_signal(0.15, "C"),
         _make_signal(0.15, "A"),
         _make_signal(0.15, "B"),
-        _make_signal(0.15, "C"),
     ]
     ranked = rank_trade_signals(signals)
     assert [s.contract_id for s in ranked] == ["A", "B", "C"]
@@ -343,3 +351,235 @@ def test_rank_hold_and_buy_mixed():
     # HOLDs at the end
     assert ranked[2].contract_id in ("HOLD_1", "HOLD_2")
     assert ranked[3].contract_id in ("HOLD_1", "HOLD_2")
+
+
+# ---------------------------------------------------------------------------
+# rank_trade_signals — rank_score-based ranking
+# ---------------------------------------------------------------------------
+
+
+def test_rank_by_rank_score_overrides_absolute_alpha():
+    """rank_score takes priority over absolute_alpha when present."""
+    # C has the smallest absolute_alpha but the largest rank_score → should be first
+    signals = [
+        _make_signal(0.30, "A", rank_score=0.30),
+        _make_signal(0.20, "B", rank_score=0.25),
+        _make_signal(0.10, "C", rank_score=0.40),
+    ]
+    ranked = rank_trade_signals(signals)
+    assert [s.contract_id for s in ranked] == ["C", "A", "B"]
+
+
+def test_rank_fallback_to_absolute_alpha_when_rank_score_none():
+    """When all rank_scores are None, falls back to absolute_alpha ordering."""
+    signals = [
+        _make_signal(0.10, "A"),  # rank_score=None
+        _make_signal(0.30, "B"),
+        _make_signal(0.20, "C"),
+    ]
+    ranked = rank_trade_signals(signals)
+    assert [s.contract_id for s in ranked] == ["B", "C", "A"]
+
+
+def test_rank_rank_score_tie_broken_by_absolute_alpha():
+    """Equal rank_scores → fall back to absolute_alpha descending."""
+    signals = [
+        _make_signal(0.10, "A", rank_score=0.50),
+        _make_signal(0.30, "B", rank_score=0.50),
+        _make_signal(0.20, "C", rank_score=0.50),
+    ]
+    ranked = rank_trade_signals(signals)
+    # rank_scores equal → sort by absolute_alpha desc: B(0.30) > C(0.20) > A(0.10)
+    assert [s.contract_id for s in ranked] == ["B", "C", "A"]
+
+
+def test_rank_all_equal_broken_by_contract_id():
+    """Equal rank_score and equal absolute_alpha → alphabetical contract_id."""
+    signals = [
+        _make_signal(0.20, "Z", rank_score=0.50),
+        _make_signal(0.20, "A", rank_score=0.50),
+        _make_signal(0.20, "M", rank_score=0.50),
+    ]
+    ranked = rank_trade_signals(signals)
+    assert [s.contract_id for s in ranked] == ["A", "M", "Z"]
+
+
+def test_rank_deterministic_regardless_of_input_order():
+    """Ranked output is the same regardless of how inputs are ordered."""
+    base = [
+        _make_signal(0.30, "B", rank_score=0.30),
+        _make_signal(0.10, "A", rank_score=0.50),
+        _make_signal(0.20, "C", rank_score=0.20),
+    ]
+    import random
+    shuffled = list(base)
+    random.shuffle(shuffled)
+    assert [s.contract_id for s in rank_trade_signals(base)] == \
+           [s.contract_id for s in rank_trade_signals(shuffled)]
+
+
+# ---------------------------------------------------------------------------
+# evaluate_contract_opportunity — rank_score integration
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_produces_rank_score():
+    """evaluate_contract_opportunity returns a signal with a non-None rank_score."""
+    surface = {80: 0.70}
+    ob = _make_orderbook(bid=40.0, ask=42.0)
+    signal = evaluate_contract_opportunity(
+        contract=_make_contract(80),
+        probability_surface=surface,
+        orderbook=ob,
+        signal_threshold=_THRESHOLD,
+        timestamp_utc=_TS,
+    )
+    assert signal.rank_score is not None
+    assert signal.rank_score >= 0.0
+
+
+def test_evaluate_rank_score_equals_abs_alpha_with_no_flags():
+    """Without feature flags, rank_score == abs(alpha) (no bonuses applied)."""
+    surface = {80: 0.70}
+    ob = _make_orderbook(bid=40.0, ask=42.0)
+    signal = evaluate_contract_opportunity(
+        contract=_make_contract(80),
+        probability_surface=surface,
+        orderbook=ob,
+        signal_threshold=_THRESHOLD,
+        timestamp_utc=_TS,
+    )
+    # No feature flags → rank_score is just abs(alpha)
+    assert signal.rank_score == pytest.approx(signal.absolute_alpha)
+
+
+# ---------------------------------------------------------------------------
+# evaluate_contract_opportunity — enhancement flag pass-through
+# ---------------------------------------------------------------------------
+# Shared setup for all enhancement tests:
+#   model_probability = 0.70, market mid = (40+42)/2 = 41¢ → 0.41
+#   alpha = 0.29, abs_alpha = 0.29
+
+
+def test_evaluate_passes_forecast_shift_flag():
+    """forecast_shift_flag=True is stored on the signal and adds shift_bonus to rank_score."""
+    surface = {80: 0.70}
+    ob = _make_orderbook(bid=40.0, ask=42.0)
+    signal = evaluate_contract_opportunity(
+        contract=_make_contract(80),
+        probability_surface=surface,
+        orderbook=ob,
+        signal_threshold=_THRESHOLD,
+        timestamp_utc=_TS,
+        forecast_shift_flag=True,
+    )
+    assert signal.forecast_shift_flag is True
+    # abs(alpha)=0.29 + shift_bonus=0.05 → 0.34
+    assert signal.rank_score == pytest.approx(0.34, abs=1e-6)
+
+
+def test_evaluate_passes_stale_market_flag():
+    """stale_market_flag=True is stored on the signal and adds lag_bonus to rank_score."""
+    surface = {80: 0.70}
+    ob = _make_orderbook(bid=40.0, ask=42.0)
+    signal = evaluate_contract_opportunity(
+        contract=_make_contract(80),
+        probability_surface=surface,
+        orderbook=ob,
+        signal_threshold=_THRESHOLD,
+        timestamp_utc=_TS,
+        stale_market_flag=True,
+    )
+    assert signal.stale_market_flag is True
+    # abs(alpha)=0.29 + lag_bonus=0.05 → 0.34
+    assert signal.rank_score == pytest.approx(0.34, abs=1e-6)
+
+
+def test_evaluate_passes_microstructure_score():
+    """microstructure_score is stored on the signal and contributes to rank_score."""
+    surface = {80: 0.70}
+    ob = _make_orderbook(bid=40.0, ask=42.0)
+    signal = evaluate_contract_opportunity(
+        contract=_make_contract(80),
+        probability_surface=surface,
+        orderbook=ob,
+        signal_threshold=_THRESHOLD,
+        timestamp_utc=_TS,
+        microstructure_score=0.80,
+    )
+    assert signal.microstructure_score == pytest.approx(0.80)
+    # abs(alpha)=0.29 + 0.80*0.10=0.08 → 0.37
+    assert signal.rank_score == pytest.approx(0.37, abs=1e-6)
+
+
+def test_evaluate_tail_flag_boosts_rank_score():
+    """tail_opportunity_flag=True with tail_multiplier=1.5 boosts rank_score.
+
+    tail_rank_score = 0.29 * 1.5 = 0.435
+    rank_score = max(0.29, 0.435) = 0.435
+    """
+    surface = {80: 0.70}
+    ob = _make_orderbook(bid=40.0, ask=42.0)
+    signal = evaluate_contract_opportunity(
+        contract=_make_contract(80),
+        probability_surface=surface,
+        orderbook=ob,
+        signal_threshold=_THRESHOLD,
+        timestamp_utc=_TS,
+        tail_opportunity_flag=True,
+        tail_multiplier=1.5,
+    )
+    assert signal.tail_opportunity_flag is True
+    assert signal.rank_score == pytest.approx(0.435, abs=1e-6)
+
+
+def test_evaluate_tail_does_not_alter_alpha():
+    """Tail boost must not change alpha, absolute_alpha, or signal_side."""
+    surface = {80: 0.70}
+    ob = _make_orderbook(bid=40.0, ask=42.0)
+    signal = evaluate_contract_opportunity(
+        contract=_make_contract(80),
+        probability_surface=surface,
+        orderbook=ob,
+        signal_threshold=_THRESHOLD,
+        timestamp_utc=_TS,
+        tail_opportunity_flag=True,
+        tail_multiplier=3.0,
+    )
+    assert signal.alpha == pytest.approx(0.29, abs=1e-6)
+    assert signal.absolute_alpha == pytest.approx(0.29, abs=1e-6)
+    assert signal.signal_side == "BUY"
+
+
+def test_evaluate_all_enhancement_flags_combined():
+    """All enhancement flags active: rank_score accumulates all bonuses.
+
+    alpha=0.29, tail_multiplier=1.5:
+      tail_rank_score = 0.29 * 1.5 = 0.435
+      base            = max(0.29, 0.435) = 0.435
+      + shift_bonus   = 0.05
+      + lag_bonus     = 0.05
+      + micro_score*w = 0.80 * 0.10 = 0.08
+      rank_score      = 0.615
+    """
+    surface = {80: 0.70}
+    ob = _make_orderbook(bid=40.0, ask=42.0)
+    signal = evaluate_contract_opportunity(
+        contract=_make_contract(80),
+        probability_surface=surface,
+        orderbook=ob,
+        signal_threshold=_THRESHOLD,
+        timestamp_utc=_TS,
+        forecast_shift_flag=True,
+        stale_market_flag=True,
+        microstructure_score=0.80,
+        tail_opportunity_flag=True,
+        tail_multiplier=1.5,
+    )
+    assert signal.forecast_shift_flag is True
+    assert signal.stale_market_flag is True
+    assert signal.microstructure_score == pytest.approx(0.80)
+    assert signal.tail_opportunity_flag is True
+    assert signal.rank_score == pytest.approx(0.615, abs=1e-6)
+    # Raw alpha unchanged
+    assert signal.alpha == pytest.approx(0.29, abs=1e-6)

@@ -167,6 +167,15 @@ class TestComputeForecastErrorJoin:
         result = compute_forecast_error(_forecast_df(), actual)
         assert result.empty
 
+    def test_no_match_empty_result_has_required_columns(self):
+        # When the join produces zero rows the result must still carry the
+        # required error columns so downstream code can inspect .columns safely.
+        actual = _actual_df(target_date=[_D2])  # no overlap with forecast _D1
+        result = compute_forecast_error(_forecast_df(), actual)
+        assert result.empty
+        for col in ["error_f", "absolute_error_f", "squared_error", "actual_value_f"]:
+            assert col in result.columns, f"Missing column in empty result: {col}"
+
     def test_extra_forecast_columns_preserved(self):
         fc = _forecast_df()
         fc["run_time_utc"] = datetime(2026, 1, 1, 0, tzinfo=timezone.utc)
@@ -243,16 +252,37 @@ class TestComputeForecastErrorEdgeCases:
         assert not result.empty
         assert (result["actual_value_f"] == 33.0).all()
 
-    def test_actual_df_with_metric_column_raises(self):
-        # actual_df already in long format (has 'metric' column) — ambiguous input
-        bad = pd.DataFrame({
+    def test_actual_df_long_form_is_accepted(self):
+        # actual_df already in long format (metric + actual_value_f) — should work
+        long_actual = pd.DataFrame({
             "city": ["Chicago"],
             "target_date": [_D1],
             "metric": ["high_temp_f"],
             "actual_value_f": [33.0],
         })
-        with pytest.raises(ValueError, match="already has a 'metric' column"):
-            compute_forecast_error(_forecast_df(), bad)
+        result = compute_forecast_error(_forecast_df(), long_actual)
+        assert not result.empty
+        assert (result["actual_value_f"] == 33.0).all()
+
+    def test_actual_df_long_form_error_values_correct(self):
+        # GFS forecast 35, actual 33 → error 2; ECMWF forecast 38 → error 5
+        long_actual = pd.DataFrame({
+            "city": ["Chicago"],
+            "target_date": [_D1],
+            "metric": ["high_temp_f"],
+            "actual_value_f": [33.0],
+        })
+        result = compute_forecast_error(_forecast_df(), long_actual)
+        gfs = result[result["model_name"] == "GFS"].iloc[0]
+        ecmwf = result[result["model_name"] == "ECMWF"].iloc[0]
+        assert gfs["error_f"] == pytest.approx(2.0)
+        assert ecmwf["error_f"] == pytest.approx(5.0)
+
+    def test_unsupported_metric_raises(self):
+        # metric not in {high_temp_f, low_temp_f} → ValueError
+        bad_fc = _forecast_df(metric=["feels_like_f", "feels_like_f"])
+        with pytest.raises(ValueError, match="unsupported metric"):
+            compute_forecast_error(bad_fc, _actual_df())
 
     def test_duplicate_actual_rows_do_not_fan_out_merge(self):
         # actual_df has two identical rows for Chicago/_D1 — output must not double

@@ -6,13 +6,14 @@ produce per-row error metrics and per-city/model aggregate summaries.
 Join strategy
 -------------
 ``compute_forecast_error`` joins ``forecast_df`` (long, one row per
-model/run/target/metric) to ``actual_df`` (wide, one row per city/target_date
-with ``high_temp_f`` and/or ``low_temp_f`` columns) on the composite key::
+model/run/target/metric) to ``actual_df`` on the composite key::
 
     (city, target_date, metric)
 
-``actual_df`` is melted to long format internally before the join; the caller
-does not need to reshape it.
+``actual_df`` may be supplied in either wide form (``high_temp_f`` /
+``low_temp_f`` columns) or long form (``metric`` + ``actual_value_f``
+columns).  Both are normalised internally; the caller does not need to
+reshape.
 
 Duplicate handling
 ------------------
@@ -67,6 +68,7 @@ _FORECAST_REQUIRED: frozenset[str] = frozenset(
 )
 _ACTUAL_REQUIRED: frozenset[str] = frozenset({"city", "target_date"})
 _ACTUAL_VALUE_COLS: frozenset[str] = frozenset({"high_temp_f", "low_temp_f"})
+_VALID_METRICS: frozenset[str] = frozenset({"high_temp_f", "low_temp_f"})
 _ERROR_REQUIRED: frozenset[str] = frozenset(
     {"city", "model_name", "metric", "error_f", "absolute_error_f", "squared_error"}
 )
@@ -114,70 +116,77 @@ def _validate_columns(
         )
 
 
-def _melt_actual_df(actual_df: pd.DataFrame) -> pd.DataFrame:
-    """Convert *actual_df* from wide to long format.
+def _normalize_actual_df(actual_df: pd.DataFrame) -> pd.DataFrame:
+    """Return *actual_df* in long format with ``metric`` and ``actual_value_f`` columns.
 
-    Wide format (one row per city/target_date with ``high_temp_f`` and/or
-    ``low_temp_f``) is melted into long format with columns ``metric`` and
-    ``actual_value_f``.  Rows where ``actual_value_f`` is NaN are dropped.
+    Accepts two input forms:
 
-    Duplicate rows on ``(city, target_date, metric)`` after melting are
-    deduplicated (first occurrence kept) with a warning.
+    **Wide form** — one row per ``(city, target_date)`` with ``high_temp_f``
+    and/or ``low_temp_f`` value columns.  These are melted into long format.
+
+    **Long form** — already has ``metric`` and ``actual_value_f`` columns.
+    Returned as-is after deduplication.
+
+    In both cases, rows where ``actual_value_f`` is NaN are dropped, and
+    duplicate ``(city, target_date, metric)`` rows are deduplicated (first
+    occurrence kept) with a warning.
 
     Args:
-        actual_df: Wide actual observations.
+        actual_df: Actual observations in wide or long form.
 
     Returns:
-        Long DataFrame with columns from *actual_df* plus ``metric`` and
-        ``actual_value_f``, guaranteed unique on ``(city, target_date, metric)``.
+        Long DataFrame guaranteed unique on ``(city, target_date, metric)``.
 
     Raises:
-        ValueError: If *actual_df* already has a ``metric`` column (ambiguous —
-            it would conflict with the melt output column of the same name).
-        ValueError: If *actual_df* contains none of the expected temperature
-            columns.
+        ValueError: If *actual_df* is neither recognisable form (no temperature
+            value columns and no ``metric`` / ``actual_value_f`` columns).
     """
-    if "metric" in actual_df.columns:
-        raise ValueError(
-            "actual_df already has a 'metric' column; it must be in wide format "
-            "with 'high_temp_f' / 'low_temp_f' value columns, not pre-melted"
+    is_long = "metric" in actual_df.columns and "actual_value_f" in actual_df.columns
+
+    if is_long:
+        logger.debug("_normalize_actual_df: long-form actual_df detected")
+        long = actual_df.copy()
+    else:
+        value_cols = [c for c in actual_df.columns if c in _ACTUAL_VALUE_COLS]
+        if not value_cols:
+            raise ValueError(
+                "actual_df must contain at least one of: "
+                + ", ".join(sorted(_ACTUAL_VALUE_COLS))
+                + " (wide form), or 'metric' and 'actual_value_f' columns (long form)"
+            )
+        logger.debug(
+            "_normalize_actual_df: wide-form actual_df detected — melting columns %s",
+            value_cols,
+        )
+        id_vars = [c for c in actual_df.columns if c not in _ACTUAL_VALUE_COLS]
+        long = actual_df.melt(
+            id_vars=id_vars,
+            value_vars=value_cols,
+            var_name="metric",
+            value_name="actual_value_f",
         )
 
-    value_cols = [c for c in actual_df.columns if c in _ACTUAL_VALUE_COLS]
-    if not value_cols:
-        raise ValueError(
-            "actual_df must contain at least one of: "
-            + ", ".join(sorted(_ACTUAL_VALUE_COLS))
-        )
-
-    id_vars = [c for c in actual_df.columns if c not in _ACTUAL_VALUE_COLS]
-    melted = actual_df.melt(
-        id_vars=id_vars,
-        value_vars=value_cols,
-        var_name="metric",
-        value_name="actual_value_f",
-    )
-    n_before = len(melted)
-    melted = melted.dropna(subset=["actual_value_f"]).reset_index(drop=True)
-    n_dropped = n_before - len(melted)
+    n_before = len(long)
+    long = long.dropna(subset=["actual_value_f"]).reset_index(drop=True)
+    n_dropped = n_before - len(long)
     if n_dropped:
         logger.debug(
-            "_melt_actual_df: dropped %d rows with null actual_value_f", n_dropped
+            "_normalize_actual_df: dropped %d rows with null actual_value_f", n_dropped
         )
 
     # Guard against fan-out in the merge caused by duplicate actual rows
-    dup_mask = melted.duplicated(subset=_JOIN_KEYS)
+    dup_mask = long.duplicated(subset=_JOIN_KEYS)
     n_dups = dup_mask.sum()
     if n_dups:
         logger.warning(
-            "_melt_actual_df: actual_df has %d duplicate rows on %s after melting — "
+            "_normalize_actual_df: actual_df has %d duplicate rows on %s — "
             "keeping first occurrence to prevent fan-out in the merge",
             n_dups,
             _JOIN_KEYS,
         )
-        melted = melted[~dup_mask].reset_index(drop=True)
+        long = long[~dup_mask].reset_index(drop=True)
 
-    return melted
+    return long
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +202,10 @@ def compute_forecast_error(
 
     Join key: ``(city, target_date, metric)``.
 
-    ``actual_df`` should be in **wide** format with ``high_temp_f`` and/or
-    ``low_temp_f`` columns alongside ``city`` and ``target_date``.  The
-    function melts it to long format automatically before joining.
+        ``actual_df`` may be in **wide** format (``high_temp_f`` / ``low_temp_f``
+    columns alongside ``city`` and ``target_date``) or **long** format
+    (``metric`` + ``actual_value_f`` columns).  Either form is normalised
+    to long format automatically before joining.
 
     Forecast rows with no matching actual are dropped and counted in a warning
     log.  Multiple forecast runs for the same
@@ -207,9 +217,10 @@ def compute_forecast_error(
             ``city``, ``model_name``, ``target_date``, ``metric``,
             ``forecast_value_f``.  Additional columns (e.g. ``run_time_utc``,
             ``lead_hours``) are preserved in the output.
-        actual_df: Settled daily observations.  Required columns:
-            ``city``, ``target_date`` and at least one of
-            ``high_temp_f`` / ``low_temp_f``.
+        actual_df: Settled daily observations in wide form
+            (``city``, ``target_date``, and at least one of
+            ``high_temp_f`` / ``low_temp_f``) or long form
+            (``city``, ``target_date``, ``metric``, ``actual_value_f``).
 
     Returns:
         DataFrame with one row per matched forecast/actual pair containing all
@@ -247,6 +258,14 @@ def compute_forecast_error(
     _validate_columns(forecast_df, _FORECAST_REQUIRED, "forecast_df")
     _validate_columns(actual_df, _ACTUAL_REQUIRED, "actual_df")
 
+    # Validate metric values
+    bad_metrics = set(forecast_df["metric"].unique()) - _VALID_METRICS
+    if bad_metrics:
+        raise ValueError(
+            f"forecast_df contains unsupported metric value(s): {sorted(bad_metrics)}. "
+            f"Valid metrics: {sorted(_VALID_METRICS)}"
+        )
+
     # Warn on true duplicates within forecast_df
     dup_key_candidates = ["city", "model_name", "run_time_utc", "target_date", "metric"]
     dup_keys = [c for c in dup_key_candidates if c in forecast_df.columns]
@@ -259,7 +278,7 @@ def compute_forecast_error(
             dup_keys,
         )
 
-    actual_long = _melt_actual_df(actual_df)
+    actual_long = _normalize_actual_df(actual_df)
 
     logger.debug(
         "compute_forecast_error: joining %d forecast rows to %d actual rows on %s",
@@ -286,7 +305,6 @@ def compute_forecast_error(
         logger.warning(
             "compute_forecast_error: no rows matched after join — returning empty DataFrame"
         )
-        return merged
 
     merged["error_f"] = merged["forecast_value_f"] - merged["actual_value_f"]
     merged["absolute_error_f"] = merged["error_f"].abs()

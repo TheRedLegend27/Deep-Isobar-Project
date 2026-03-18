@@ -16,6 +16,7 @@ from deep_isobar.trading.alpha_engine import (
     build_trade_signal,
     classify_signal,
     compute_alpha,
+    compute_rank_score,
 )
 
 # ---------------------------------------------------------------------------
@@ -238,7 +239,7 @@ def test_build_trade_signal_field_mapping():
 
 
 def test_build_trade_signal_optional_flags_default():
-    """Optional boolean flags default to False and Nones."""
+    """Optional boolean flags default to False; rank_score is auto-computed."""
     signal = build_trade_signal(
         timestamp_utc=_TS,
         contract=_make_contract(),
@@ -251,7 +252,8 @@ def test_build_trade_signal_optional_flags_default():
     assert signal.forecast_shift_flag is False
     assert signal.stale_market_flag is False
     assert signal.microstructure_score is None
-    assert signal.rank_score is None
+    # rank_score is now auto-computed from abs(alpha) = abs(0.65 - 0.50) = 0.15
+    assert signal.rank_score == pytest.approx(0.15)
     assert signal.model_version == "v1"
 
 
@@ -313,3 +315,296 @@ def test_build_trade_signal_invalid_threshold():
             signal_threshold=0.0,
             confidence_score=0.70,
         )
+
+
+# ---------------------------------------------------------------------------
+# compute_rank_score
+# ---------------------------------------------------------------------------
+
+
+def test_compute_rank_score_base_is_abs_alpha():
+    """No extras → score == abs(alpha)."""
+    assert compute_rank_score(alpha=0.20) == pytest.approx(0.20)
+    assert compute_rank_score(alpha=-0.20) == pytest.approx(0.20)
+
+
+def test_compute_rank_score_zero_alpha():
+    """alpha == 0 with no bonuses → score == 0."""
+    assert compute_rank_score(alpha=0.0) == pytest.approx(0.0)
+
+
+def test_compute_rank_score_tail_rank_score_larger_wins():
+    """tail_rank_score > abs(alpha) → tail score is the base."""
+    score = compute_rank_score(alpha=0.20, tail_rank_score=0.40)
+    assert score == pytest.approx(0.40)
+
+
+def test_compute_rank_score_tail_rank_score_smaller_ignored():
+    """tail_rank_score < abs(alpha) → abs(alpha) is still the base."""
+    score = compute_rank_score(alpha=0.50, tail_rank_score=0.30)
+    assert score == pytest.approx(0.50)
+
+
+def test_compute_rank_score_tail_rank_score_equal():
+    """tail_rank_score == abs(alpha) → no change."""
+    score = compute_rank_score(alpha=0.30, tail_rank_score=0.30)
+    assert score == pytest.approx(0.30)
+
+
+def test_compute_rank_score_shift_bonus_added():
+    """forecast_shift_flag=True adds shift_bonus to the base."""
+    score = compute_rank_score(alpha=0.20, forecast_shift_flag=True, shift_bonus=0.05)
+    assert score == pytest.approx(0.25)
+
+
+def test_compute_rank_score_lag_bonus_added():
+    """stale_market_flag=True adds lag_bonus."""
+    score = compute_rank_score(alpha=0.20, stale_market_flag=True, lag_bonus=0.05)
+    assert score == pytest.approx(0.25)
+
+
+def test_compute_rank_score_both_flags_additive():
+    """Both flags active → both bonuses stack."""
+    score = compute_rank_score(
+        alpha=0.20,
+        forecast_shift_flag=True,
+        stale_market_flag=True,
+        shift_bonus=0.05,
+        lag_bonus=0.05,
+    )
+    assert score == pytest.approx(0.30)
+
+
+def test_compute_rank_score_microstructure_contribution():
+    """microstructure_score adds microstructure_score * weight."""
+    # 0.20 + 0.80 * 0.10 = 0.28
+    score = compute_rank_score(alpha=0.20, microstructure_score=0.80, microstructure_weight=0.10)
+    assert score == pytest.approx(0.28)
+
+
+def test_compute_rank_score_all_components():
+    """All components combine correctly."""
+    # base = max(0.20, 0.30) = 0.30
+    # + 0.05 (shift) + 0.05 (lag) + 0.60 * 0.10 (micro) = 0.46
+    score = compute_rank_score(
+        alpha=0.20,
+        tail_rank_score=0.30,
+        microstructure_score=0.60,
+        forecast_shift_flag=True,
+        stale_market_flag=True,
+        shift_bonus=0.05,
+        lag_bonus=0.05,
+        microstructure_weight=0.10,
+    )
+    assert score == pytest.approx(0.46)
+
+
+def test_compute_rank_score_zero_bonuses_no_effect():
+    """Bonuses set to 0 and flags True → no change from base."""
+    score = compute_rank_score(
+        alpha=0.20,
+        forecast_shift_flag=True,
+        stale_market_flag=True,
+        shift_bonus=0.0,
+        lag_bonus=0.0,
+    )
+    assert score == pytest.approx(0.20)
+
+
+def test_compute_rank_score_invalid_shift_bonus():
+    with pytest.raises(ValueError, match="shift_bonus"):
+        compute_rank_score(alpha=0.20, shift_bonus=-0.01)
+
+
+def test_compute_rank_score_invalid_lag_bonus():
+    with pytest.raises(ValueError, match="lag_bonus"):
+        compute_rank_score(alpha=0.20, lag_bonus=-0.01)
+
+
+def test_compute_rank_score_invalid_microstructure_weight():
+    with pytest.raises(ValueError, match="microstructure_weight"):
+        compute_rank_score(alpha=0.20, microstructure_weight=-0.01)
+
+
+def test_compute_rank_score_invalid_microstructure_score():
+    with pytest.raises(ValueError, match="microstructure_score"):
+        compute_rank_score(alpha=0.20, microstructure_score=-0.01)
+
+
+# ---------------------------------------------------------------------------
+# build_trade_signal rank_score integration
+# ---------------------------------------------------------------------------
+
+
+def test_build_trade_signal_auto_rank_score_equals_abs_alpha():
+    """Without flags, auto rank_score == abs(alpha)."""
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+    )
+    assert signal.rank_score == pytest.approx(abs(signal.alpha))
+
+
+def test_build_trade_signal_auto_rank_score_with_shift_flag():
+    """forecast_shift_flag=True boosts auto rank_score by default shift_bonus (0.05)."""
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+        forecast_shift_flag=True,
+    )
+    # abs(alpha)=0.20, + 0.05 shift bonus = 0.25
+    assert signal.rank_score == pytest.approx(0.25)
+
+
+def test_build_trade_signal_explicit_rank_score_preserved():
+    """Explicitly supplied rank_score is not overridden."""
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+        rank_score=9.99,
+    )
+    assert signal.rank_score == pytest.approx(9.99)
+
+
+def test_build_trade_signal_rank_score_does_not_alter_alpha():
+    """rank_score computation must never change alpha or signal_side."""
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+        forecast_shift_flag=True,
+        stale_market_flag=True,
+        microstructure_score=0.90,
+    )
+    assert signal.alpha == pytest.approx(0.20)
+    assert signal.absolute_alpha == pytest.approx(0.20)
+    assert signal.signal_side == "BUY"
+
+
+# ---------------------------------------------------------------------------
+# build_trade_signal — tail_multiplier integration
+# ---------------------------------------------------------------------------
+
+
+def test_build_trade_signal_tail_flag_boosts_rank_score():
+    """tail_opportunity_flag=True with tail_multiplier=1.5 boosts rank_score.
+
+    alpha = 0.70 - 0.50 = 0.20
+    tail_rank_score = 0.20 * 1.5 = 0.30
+    compute_rank_score base = max(0.20, 0.30) = 0.30
+    rank_score = 0.30
+    """
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+        tail_opportunity_flag=True,
+        tail_multiplier=1.5,
+    )
+    assert signal.rank_score == pytest.approx(0.30)
+    assert signal.tail_opportunity_flag is True
+
+
+def test_build_trade_signal_tail_multiplier_one_no_extra_boost():
+    """tail_multiplier=1.0 with tail_flag=True leaves rank_score == abs(alpha).
+
+    abs(alpha)*1.0 == abs(alpha), so max(abs(alpha), abs(alpha)) = abs(alpha).
+    """
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+        tail_opportunity_flag=True,
+        tail_multiplier=1.0,
+    )
+    assert signal.rank_score == pytest.approx(abs(signal.alpha))
+
+
+def test_build_trade_signal_tail_flag_false_no_boost():
+    """tail_opportunity_flag=False (default): tail_multiplier has no effect."""
+    signal_no_tail = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+        tail_opportunity_flag=False,
+        tail_multiplier=2.0,  # ignored because flag is False
+    )
+    assert signal_no_tail.rank_score == pytest.approx(abs(signal_no_tail.alpha))
+
+
+def test_build_trade_signal_tail_and_shift_combined():
+    """Tail boost and shift bonus stack correctly.
+
+    alpha = 0.20, tail_multiplier=1.5 → tail_rank_score=0.30
+    base = max(0.20, 0.30) = 0.30
+    + shift_bonus 0.05 → rank_score = 0.35
+    """
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+        tail_opportunity_flag=True,
+        tail_multiplier=1.5,
+        forecast_shift_flag=True,
+    )
+    assert signal.rank_score == pytest.approx(0.35)
+
+
+def test_build_trade_signal_tail_does_not_alter_alpha():
+    """Tail boost must never modify raw alpha or signal_side."""
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+        tail_opportunity_flag=True,
+        tail_multiplier=3.0,
+    )
+    assert signal.alpha == pytest.approx(0.20)
+    assert signal.absolute_alpha == pytest.approx(0.20)
+    assert signal.signal_side == "BUY"
+
+
+def test_build_trade_signal_explicit_rank_score_overrides_tail():
+    """Explicit rank_score skips all auto-computation including tail boost."""
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.70,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.80,
+        tail_opportunity_flag=True,
+        tail_multiplier=1.5,
+        rank_score=0.99,
+    )
+    assert signal.rank_score == pytest.approx(0.99)

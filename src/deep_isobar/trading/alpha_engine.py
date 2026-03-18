@@ -8,12 +8,23 @@ Canonical interface (from INTERFACES.md)::
 
     compute_alpha(model_probability, market_probability) -> float
     classify_signal(alpha, threshold) -> str          # "BUY" | "SELL" | "HOLD"
+    compute_rank_score(alpha, ...) -> float
     build_trade_signal(timestamp_utc, contract, ...) -> TradeSignal
 
 Signal rules:
     alpha > threshold  → BUY
     alpha < -threshold → SELL
     otherwise          → HOLD
+
+Alpha vs rank_score
+-------------------
+``alpha`` is the raw mispricing signal: ``model_probability − market_probability``.
+It is never modified by any ranking logic.
+
+``rank_score`` is a composite prioritisation score used only to order
+opportunities.  It starts from ``abs(alpha)`` and can be boosted by tail
+position, forecast shifts, market lag, and microstructure quality.  Raw alpha
+and signal-side classification are always preserved unchanged.
 
 All probability arguments must be in [0.0, 1.0].
 """
@@ -24,6 +35,7 @@ import logging
 from datetime import datetime
 
 from deep_isobar.core.types import MarketContract, TradeSignal
+from deep_isobar.trading.distribution_tail_alpha import compute_tail_alpha_boost
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +130,107 @@ def classify_signal(alpha: float, threshold: float) -> str:
     return signal
 
 
+def compute_rank_score(
+    alpha: float,
+    tail_rank_score: float | None = None,
+    microstructure_score: float | None = None,
+    forecast_shift_flag: bool = False,
+    stale_market_flag: bool = False,
+    shift_bonus: float = 0.05,
+    lag_bonus: float = 0.05,
+    microstructure_weight: float = 0.10,
+) -> float:
+    """Compute a composite ranking score for opportunity prioritisation.
+
+    The rank score is used **only** to order signals — it does not alter raw
+    alpha or the BUY / SELL / HOLD classification.
+
+    Computation::
+
+        base  = max(abs(alpha), tail_rank_score)   # if tail_rank_score provided
+              = abs(alpha)                          # otherwise
+        score = base
+              + shift_bonus   (if forecast_shift_flag)
+              + lag_bonus     (if stale_market_flag)
+              + microstructure_score * microstructure_weight  (if provided)
+
+    The final score is clamped to be non-negative.
+
+    Args:
+        alpha: Raw signed alpha from :func:`compute_alpha`.  Used as the
+            baseline via ``abs(alpha)``.
+        tail_rank_score: Optional boosted score from
+            ``distribution_tail_alpha.compute_tail_alpha_boost``.  When
+            provided, ``max(abs(alpha), tail_rank_score)`` is used as the base
+            so a tail boost never reduces the score below ``abs(alpha)``.
+        microstructure_score: Optional market-quality score.  Added as
+            ``microstructure_score * microstructure_weight``.  Must be >= 0.
+        forecast_shift_flag: Add *shift_bonus* when ``True``.
+        stale_market_flag: Add *lag_bonus* when ``True`` (market price lags
+            the latest forecast shift).
+        shift_bonus: Fixed additive bonus for detected forecast shifts.
+            Must be >= 0.  Default 0.05.
+        lag_bonus: Fixed additive bonus for stale market prices.
+            Must be >= 0.  Default 0.05.
+        microstructure_weight: Weight applied to *microstructure_score*.
+            Must be >= 0.  Default 0.10.
+
+    Returns:
+        Non-negative composite ranking score.
+
+    Raises:
+        ValueError: If *shift_bonus*, *lag_bonus*, or *microstructure_weight*
+            is negative.
+        ValueError: If *microstructure_score* is provided and is negative.
+
+    Example::
+
+        score = compute_rank_score(
+            alpha=0.25,
+            tail_rank_score=0.375,   # from compute_tail_alpha_boost
+            forecast_shift_flag=True,
+            microstructure_score=0.8,
+        )
+        # base  = max(0.25, 0.375) = 0.375
+        # +0.05 (shift bonus)
+        # +0.8 × 0.10 = 0.08
+        # score = 0.505
+    """
+    if shift_bonus < 0:
+        raise ValueError(f"shift_bonus must be >= 0, got {shift_bonus}")
+    if lag_bonus < 0:
+        raise ValueError(f"lag_bonus must be >= 0, got {lag_bonus}")
+    if microstructure_weight < 0:
+        raise ValueError(f"microstructure_weight must be >= 0, got {microstructure_weight}")
+    if microstructure_score is not None and microstructure_score < 0:
+        raise ValueError(f"microstructure_score must be >= 0, got {microstructure_score}")
+
+    base = abs(alpha)
+    if tail_rank_score is not None:
+        base = max(base, tail_rank_score)
+
+    score = base
+    if forecast_shift_flag:
+        score += shift_bonus
+    if stale_market_flag:
+        score += lag_bonus
+    if microstructure_score is not None:
+        score += microstructure_score * microstructure_weight
+
+    score = max(0.0, score)
+
+    logger.debug(
+        "compute_rank_score: alpha=%.4f base=%.4f shift=%s lag=%s micro=%s → %.4f",
+        alpha,
+        base,
+        forecast_shift_flag,
+        stale_market_flag,
+        microstructure_score,
+        score,
+    )
+    return score
+
+
 def build_trade_signal(
     timestamp_utc: datetime,
     contract: MarketContract,
@@ -130,12 +243,26 @@ def build_trade_signal(
     stale_market_flag: bool = False,
     microstructure_score: float | None = None,
     rank_score: float | None = None,
+    tail_multiplier: float = 1.0,
     model_version: str = "v1",
 ) -> TradeSignal:
     """Assemble a fully-populated :class:`~deep_isobar.core.types.TradeSignal`.
 
     Calls :func:`compute_alpha` and :func:`classify_signal` internally and
     attaches all metadata from the contract and optional feature flags.
+
+    When ``rank_score`` is not supplied the score is auto-computed by wiring
+    all available enhancement signals into :func:`compute_rank_score`:
+
+    - ``tail_opportunity_flag`` + ``tail_multiplier`` →
+      :func:`~deep_isobar.trading.distribution_tail_alpha.compute_tail_alpha_boost`
+      → ``tail_rank_score`` base
+    - ``forecast_shift_flag`` → shift bonus
+    - ``stale_market_flag``   → lag bonus
+    - ``microstructure_score`` → quality additive
+
+    Raw alpha and BUY / SELL / HOLD classification are never altered by
+    ranking logic.
 
     Args:
         timestamp_utc: When this signal was generated.
@@ -146,13 +273,27 @@ def build_trade_signal(
         signal_threshold: Minimum |alpha| to trigger BUY or SELL.  Must be
             positive.
         confidence_score: Caller-supplied confidence score for this signal.
-        tail_opportunity_flag: True when the threshold lies in a distribution
-            tail.
-        forecast_shift_flag: True when a recent model forecast shift was
-            detected.
-        stale_market_flag: True when the market price appears lagged.
-        microstructure_score: Optional market-microstructure quality score.
-        rank_score: Optional composite rank score for signal ordering.
+        tail_opportunity_flag: ``True`` when the threshold lies in the tail
+            of the forecast distribution (as determined by
+            :func:`~deep_isobar.trading.distribution_tail_alpha.is_tail_threshold`).
+            Activates the tail-boost path in rank_score computation.
+        forecast_shift_flag: ``True`` when a recent model forecast shift was
+            detected (as determined by
+            :func:`~deep_isobar.models.forecast_shift.compute_forecast_shift`).
+        stale_market_flag: ``True`` when the market price appears lagged
+            behind the latest forecast (as determined by
+            :func:`~deep_isobar.market.market_lag_detection.detect_market_lag`).
+        microstructure_score: Composite market-quality score from
+            :func:`~deep_isobar.market.microstructure_scanner.compute_microstructure_score`.
+            Must be >= 0 when provided.
+        rank_score: Override for the composite rank score.  When ``None``
+            (the default) the score is auto-computed from all available
+            enhancement signals.  Pass an explicit value to bypass
+            auto-computation entirely.
+        tail_multiplier: Multiplier applied to ``|alpha|`` when
+            ``tail_opportunity_flag`` is ``True``.  Sourced from
+            :attr:`~deep_isobar.core.types.CityProfile.tail_multiplier`.
+            Must be >= 0.  Default ``1.0`` leaves the base unchanged.
         model_version: Identifier for the model version that produced the
             probability estimate.
 
@@ -161,8 +302,8 @@ def build_trade_signal(
         populated.
 
     Raises:
-        ValueError: If probabilities are out of [0, 1] or threshold is not
-            positive.
+        ValueError: If probabilities are out of [0, 1], threshold is not
+            positive, or tail_multiplier is negative.
 
     Example::
 
@@ -173,20 +314,46 @@ def build_trade_signal(
             market_probability=0.55,
             signal_threshold=0.10,
             confidence_score=0.85,
+            tail_opportunity_flag=True,
+            tail_multiplier=1.5,
         )
         # signal.signal_side → "BUY"
-        # signal.alpha       → 0.17
+        # signal.alpha       → 0.17   (unchanged)
+        # signal.rank_score  → 0.255  (0.17 × 1.5)
     """
     alpha = compute_alpha(model_probability, market_probability)
     signal_side = classify_signal(alpha, signal_threshold)
 
+    # Auto-compute rank_score from all available enhancement signals when not
+    # supplied explicitly.  When tail_opportunity_flag is True, derive a
+    # tail-boosted base score via compute_tail_alpha_boost before passing it
+    # to compute_rank_score.  All other enhancement flags add on top of that
+    # base.  Raw alpha is never modified.
+    effective_rank_score = rank_score
+    if effective_rank_score is None:
+        tail_rank_score: float | None = None
+        if tail_opportunity_flag:
+            tail_rank_score = compute_tail_alpha_boost(
+                alpha=alpha,
+                tail_multiplier=tail_multiplier,
+                tail_flag=True,
+            )
+        effective_rank_score = compute_rank_score(
+            alpha=alpha,
+            tail_rank_score=tail_rank_score,
+            microstructure_score=microstructure_score,
+            forecast_shift_flag=forecast_shift_flag,
+            stale_market_flag=stale_market_flag,
+        )
+
     logger.info(
-        "build_trade_signal: contract=%s side=%s alpha=%.4f model=%.4f market=%.4f",
+        "build_trade_signal: contract=%s side=%s alpha=%.4f model=%.4f market=%.4f rank=%.4f",
         contract.contract_id,
         signal_side,
         alpha,
         model_probability,
         market_probability,
+        effective_rank_score,
     )
 
     return TradeSignal(
@@ -207,7 +374,7 @@ def build_trade_signal(
         forecast_shift_flag=forecast_shift_flag,
         stale_market_flag=stale_market_flag,
         microstructure_score=microstructure_score,
-        rank_score=rank_score,
+        rank_score=effective_rank_score,
         model_version=model_version,
     )
 

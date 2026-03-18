@@ -8,3 +8,4 @@ pydantic
 PyYAML
 loguru
 python-dateutil
+cryptography

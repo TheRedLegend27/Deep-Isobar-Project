@@ -3,7 +3,8 @@
     "allow": [
       "WebFetch(domain:docs.kalshi.com)",
       "Bash(python -m pytest tests/test_kalshi_client.py -v)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "WebSearch"
     ]
   }
 }
