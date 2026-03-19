@@ -300,25 +300,32 @@ def _fetch_candlesticks(
     start_ts: int,
     end_ts: int,
     credentials: tuple[str, Any],
+    series_ticker: str = "KXHIGHCHI",
     period_interval_min: int = _CANDLE_INTERVAL_MIN,
     request_delay_s: float = _REQUEST_DELAY_S,
 ) -> list[dict[str, Any]]:
     """Fetch hourly candlestick data for one contract.
 
-    ``GET /markets/{ticker}/candlesticks``
+    ``GET /series/{series_ticker}/markets/{ticker}/candlesticks``
 
     Args:
         ticker: Kalshi exchange ticker.
         start_ts: Unix timestamp (seconds) for window start.
         end_ts: Unix timestamp (seconds) for window end.
         credentials: ``(key_id, private_key)`` pair.
+        series_ticker: Parent series ticker (e.g. ``"KXHIGHCHI"``).
         period_interval_min: Candle width in minutes (default 60 = hourly).
 
     Returns:
         List of candlestick dicts.  Empty list if the API returns no data
         or if the endpoint responds with a non-fatal error.
     """
-    path = f"/markets/{ticker}/candlesticks"
+    # Derive series prefix from the contract ticker itself (e.g. HIGHCHI- or KXHIGHCHI-)
+    # so old and new ticker formats both resolve to the right API path.
+    import re as _re
+    _m = _re.match(r"^([A-Z]+)-\d{2}[A-Z]{3}\d{2}-", ticker)
+    effective_series = _m.group(1) if _m else series_ticker
+    path = f"/series/{effective_series}/markets/{ticker}/candlesticks"
     params: dict[str, Any] = {
         "start_ts": start_ts,
         "end_ts": end_ts,
@@ -346,19 +353,19 @@ def _build_order_book_snapshots(
 ) -> list[dict[str, Any]]:
     """Convert raw candlestick records to ``order_book_snapshot`` rows.
 
-    Bid/ask proxy
-    ~~~~~~~~~~~~~
-    Kalshi candlestick prices are in **cents** (0–100).  Within each
-    hourly window:
+    Bid/ask mapping
+    ~~~~~~~~~~~~~~~
+    Kalshi candlestick prices are returned in the ``yes_bid`` / ``yes_ask``
+    sub-dicts with ``close_dollars``, ``high_dollars``, ``low_dollars`` fields
+    already in the 0–1 probability (dollar) range.
 
-    - ``best_bid`` ← ``low_price / 100``  (hourly low as bid proxy)
-    - ``best_ask`` ← ``high_price / 100`` (hourly high as ask proxy)
-    - ``mid_price`` ← ``close_price / 100``
-    - ``last_trade_price`` ← ``close_price / 100``
+    - ``best_bid``         ← ``yes_bid.close_dollars``
+    - ``best_ask``         ← ``yes_ask.close_dollars``
+    - ``mid_price``        ← ``(bid + ask) / 2``
+    - ``last_trade_price`` ← ``mid_price``
 
-    When ``low_price == high_price`` (no spread, thin market), a nominal
-    half-spread of 0.01 (1 cent) is applied symmetrically around the
-    close price.
+    When the candle has zero spread (thin market), a nominal half-spread of
+    0.01 is applied symmetrically around mid.
 
     ``volume_24h`` is computed as a rolling 24-candle cumulative sum and
     is applied after all rows are built.
@@ -379,31 +386,30 @@ def _build_order_book_snapshots(
 
         timestamp_utc = datetime.fromtimestamp(end_ts, tz=timezone.utc)
 
-        # Prices in cents; convert to probability (0–1).
-        # Use explicit None checks so a legitimate 0-cent price is preserved.
-        close_raw = candle.get("close_price")
-        close_c: float = float(close_raw) if close_raw is not None else 0.0
-        low_raw = candle.get("low_price")
-        low_c: float   = float(low_raw)   if low_raw   is not None else close_c
-        high_raw = candle.get("high_price")
-        high_c: float  = float(high_raw)  if high_raw  is not None else close_c
+        # Prices are in the yes_bid / yes_ask sub-dicts, already in 0–1 scale.
+        yes_bid: dict[str, Any] = candle.get("yes_bid") or {}
+        yes_ask: dict[str, Any] = candle.get("yes_ask") or {}
 
-        mid = round(close_c / 100.0, 6)
-        bid = round(low_c  / 100.0, 6)
-        ask = round(high_c / 100.0, 6)
+        bid_raw = yes_bid.get("close_dollars")
+        ask_raw = yes_ask.get("close_dollars")
 
-        # Apply nominal spread when the candle is a single point
+        bid: float = round(float(bid_raw), 6) if bid_raw is not None else 0.0
+        ask: float = round(float(ask_raw), 6) if ask_raw is not None else bid
+
+        # Apply nominal spread when the candle has no spread
         if bid == ask:
             half_spread = 0.01
-            bid = max(0.01, round(mid - half_spread, 6))
-            ask = min(0.99, round(mid + half_spread, 6))
+            bid = max(0.01, round(bid - half_spread, 6))
+            ask = min(0.99, round(ask + half_spread, 6))
 
-        # Guard: ensure bid ≤ ask after rounding
+        # Guard: ensure bid ≤ ask
         if bid > ask:
             bid, ask = ask, bid
 
-        volume: float | None = candle.get("volume")
-        oi: float | None = candle.get("open_interest")
+        mid = round((bid + ask) / 2.0, 6)
+
+        volume_raw = candle.get("volume_fp")
+        oi_raw = candle.get("open_interest_fp")
 
         rows.append({
             "timestamp_utc":     timestamp_utc,
@@ -415,8 +421,8 @@ def _build_order_book_snapshots(
             "last_trade_price":  mid,
             "bid_size":          None,
             "ask_size":          None,
-            "_volume":           float(volume) if volume is not None else 0.0,
-            "open_interest":     float(oi) if oi is not None else None,
+            "_volume":           float(volume_raw) if volume_raw is not None else 0.0,
+            "open_interest":     float(oi_raw) if oi_raw is not None else None,
             "snapshot_latency_ms": None,
             "raw_payload_hash":  None,
         })
@@ -627,6 +633,7 @@ def fetch_historical_market_data(
 
         candles = _fetch_candlesticks(
             ticker, cand_start_ts, cand_end_ts, credentials,
+            series_ticker=series_ticker,
             request_delay_s=request_delay_s,
         )
         if not candles:
@@ -678,6 +685,12 @@ def save_to_parquet(df: pd.DataFrame, output_path: str | Path) -> Path:
 if __name__ == "__main__":
     import argparse
     import sys
+
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        _load_dotenv()
+    except ImportError:
+        pass  # python-dotenv not installed; rely on shell env
 
     logging.basicConfig(
         level=logging.INFO,

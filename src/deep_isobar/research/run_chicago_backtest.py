@@ -100,6 +100,9 @@ SIGNAL_THRESHOLD = 0.08    # minimum |alpha| to generate BUY/SELL
 COMPARISON_OPERATOR = "ge"
 METRIC           = "high_temp_f"
 THRESHOLDS       = [80, 90]
+# Minimum ensemble std when only one GFS run covers a date (single-point → σ=0).
+# 3 °F represents a conservative short-range uncertainty floor for Chicago summer.
+_MIN_ENSEMBLE_STD_F = 3.0
 
 # Use the shortest lead available up to this many hours for the GFS forecast.
 # 48 h = day+1 (00z f042 / 12z f030). Falls back to 72 h if day+1 absent.
@@ -358,10 +361,13 @@ def run_backtest() -> dict:
         )
 
         # ── Probability surface ────────────────────────────────────────────
+        # Guard: a single GFS run produces std=0; apply a minimum floor so
+        # the probability engine can still compute a useful estimate.
+        effective_std = max(ensemble.adjusted_std_f, _MIN_ENSEMBLE_STD_F)
         probability_surface: dict[int, float] = {
             thr: probability_ge_normal(
                 mean_f=ensemble.bias_corrected_mean_f,
-                std_f=ensemble.adjusted_std_f,
+                std_f=effective_std,
                 threshold_f=float(thr),
             )
             for thr in THRESHOLDS

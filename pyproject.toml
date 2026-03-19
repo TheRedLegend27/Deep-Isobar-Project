@@ -20,6 +20,7 @@ dependencies = [
     "loguru",
     "python-dateutil",
     "cryptography",
+    "python-dotenv",
 ]
 
 [tool.pytest.ini_options]
