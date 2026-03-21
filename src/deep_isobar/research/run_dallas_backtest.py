@@ -1,60 +1,58 @@
-"""Chicago (CHI) backtest driver for Deep Isobar — real historical data.
+"""Dallas (DFW) backtest driver for Deep Isobar — real historical data.
 
-Replaces the synthetic simulation with three real archived data sources:
+Mirrors the Chicago backtest framework (run_chicago_backtest.py) but targets
+Dallas/Fort Worth using KDFW observations and KXHIGHDFW Kalshi contracts.
+
+Data sources required (same pipeline as Chicago):
 
   - **NOAA/ACIS settlement observations**
-    ``data/historical/settlement/chicago_2023.parquet``
-    → daily realized high_temp_f (the truth)
+    ``data/historical/settlement/dallas_2023.parquet``
+    → daily realized high_temp_f for KDFW
 
   - **GFS archived forecast runs** (AWS Open Data)
-    ``data/historical/forecasts/gfs_chicago_2023.parquet``
-    → what the model was actually predicting at 1–5 day lead times
+    ``data/historical/forecasts/gfs_dallas_2023.parquet``
+    → GFS predictions at 1–5 day lead times for KDFW grid point
 
   - **Kalshi order-book snapshots**
-    ``data/historical/markets/kalshi_kxhighchi_2023.parquet``
-    → actual bid/ask prices for KXHIGHCHI contracts
+    ``data/historical/markets/kalshi_kxhightdal_2023.parquet``
+    → bid/ask prices for KXHIGHTDAL contracts
 
   - **Kalshi contract metadata**
-    ``data/historical/markets/kalshi_kxhighchi_2023_contracts.parquet``
+    ``data/historical/markets/kalshi_kxhightdal_2023_contracts.parquet``
     → threshold_f and target_date per contract_id
 
 Generate the parquet files before running::
 
     python -m deep_isobar.data.historical_noaa_ingest \\
-        --city Chicago --start 2023-05-01 --end 2023-09-30 \\
-        --out data/historical/settlement/chicago_2023.parquet
+        --city Dallas --start 2023-06-01 --end 2023-09-30 \\
+        --out data/historical/settlement/dallas_2023.parquet
 
     python -m deep_isobar.data.historical_forecast_ingest \\
-        --city Chicago --year 2023 --month 8 \\
-        --out data/historical/forecasts/gfs_chicago_2023.parquet
+        --city Dallas --year 2023 --month 8 \\
+        --out data/historical/forecasts/gfs_dallas_2023.parquet
 
     python -m deep_isobar.market.historical_kalshi_ingest \\
-        --series KXHIGHCHI --start 2023-05-01 --end 2023-09-30 \\
-        --out data/historical/markets/kalshi_kxhighchi_2023.parquet
+        --series KXHIGHTDAL --start 2023-06-01 --end 2023-09-30 \\
+        --out data/historical/markets/kalshi_kxhightdal_2023.parquet
 
-Pipeline per (target_date, threshold_f)
------------------------------------------
-1. Realized high_temp_f from settlement parquet  (truth)
-2. Best GFS forecast for target_date (shortest lead ≤ 48 h, else ≤ 72 h)
-3. Build EnsembleSummary via ``temperature_ensemble``
-4. Compute P(high ≥ threshold) via ``probability_engine``
-5. Last Kalshi snapshot before decision cutoff (noon UTC on target_date)
-6. Evaluate contract opportunity → TradeSignal
-7. Settle with actual high_temp_f from NOAA
+Dallas-specific design choices vs. Chicago:
+  - Thresholds are [100, 105] °F — 80/90°F are almost always exceeded in
+    DFW August, so those contracts carry negligible signal.
+  - _MIN_ENSEMBLE_STD_F = 5.5°F (same conservative floor as Chicago).
+  - Decision cutoff is noon UTC = 7 am CDT, before the afternoon peak.
 
 Usage::
 
-    python -m deep_isobar.research.run_chicago_backtest
+    python -m deep_isobar.research.run_dallas_backtest
 
 or::
 
-    python src/deep_isobar/research/run_chicago_backtest.py
+    python src/deep_isobar/research/run_dallas_backtest.py
 """
 
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -85,7 +83,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("run_chicago_backtest")
+logger = logging.getLogger("run_dallas_backtest")
 
 # ---------------------------------------------------------------------------
 # Paths and configuration
@@ -93,28 +91,29 @@ logger = logging.getLogger("run_chicago_backtest")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-_SETTLEMENT_PATH = _PROJECT_ROOT / "data/historical/settlement/chicago_2023.parquet"
-_FORECAST_PATH   = _PROJECT_ROOT / "data/historical/forecasts/gfs_chicago_2023.parquet"
-_SNAPSHOTS_PATH  = _PROJECT_ROOT / "data/historical/markets/kalshi_kxhighchi_2023.parquet"
-_CONTRACTS_PATH  = _PROJECT_ROOT / "data/historical/markets/kalshi_kxhighchi_2023_contracts.parquet"
+_SETTLEMENT_PATH = _PROJECT_ROOT / "data/historical/settlement/dallas_2023.parquet"
+_FORECAST_PATH   = _PROJECT_ROOT / "data/historical/forecasts/gfs_dallas_2023.parquet"
+_SNAPSHOTS_PATH  = _PROJECT_ROOT / "data/historical/markets/kalshi_kxhightdal_2023.parquet"
+_CONTRACTS_PATH  = _PROJECT_ROOT / "data/historical/markets/kalshi_kxhightdal_2023_contracts.parquet"
 
-QUANTITY         = 10.0    # contracts per trade
-SIGNAL_THRESHOLD = 0.25    # minimum |alpha| to generate BUY/SELL
+QUANTITY            = 10.0    # contracts per trade
+SIGNAL_THRESHOLD    = 0.08    # minimum |alpha| to generate BUY/SELL
 COMPARISON_OPERATOR = "ge"
-METRIC           = "high_temp_f"
-THRESHOLDS       = [80, 90]
+METRIC              = "high_temp_f"
+# 100°F and 105°F — the relevant Kalshi thresholds for DFW summer.
+# 80/90°F contracts are almost always ITM in August and carry little edge.
+THRESHOLDS          = [100, 105]
+
 # Minimum ensemble std when only one GFS run covers a date (single-point → σ=0).
-# 5.5 °F represents a conservative short-range uncertainty floor for Chicago summer.
+# 5.5 °F is a conservative short-range uncertainty floor for DFW summer.
 _MIN_ENSEMBLE_STD_F = 5.5
 
 # Use the shortest lead available up to this many hours for the GFS forecast.
-# 48 h = day+1 (00z f042 / 12z f030). Falls back to 72 h if day+1 absent.
 _PRIMARY_MAX_LEAD   = 48
 _FALLBACK_MAX_LEAD  = 72
 
-# Decision cutoff: the last Kalshi snapshot before this UTC hour on target_date
-# is used as the entry price. 12:00 UTC = ~7 am CDT, well before the daily
-# high temperature is observed (typically 14:00–19:00 CDT).
+# Decision cutoff: last Kalshi snapshot before noon UTC on target_date.
+# Noon UTC = 7 am CDT — well before the afternoon high is observed.
 _DECISION_CUTOFF_HOUR_UTC = 12
 
 
@@ -133,15 +132,14 @@ def _require(path: Path, script_hint: str) -> None:
 
 
 def _load_settlement() -> pd.DataFrame:
-    """Load and validate the NOAA settlement parquet."""
+    """Load and validate the NOAA settlement parquet for Dallas."""
     _require(
         _SETTLEMENT_PATH,
         "python -m deep_isobar.data.historical_noaa_ingest "
-        "--city Chicago --start 2023-05-01 --end 2023-09-30 "
+        "--city Dallas --start 2023-06-01 --end 2023-09-30 "
         f"--out {_SETTLEMENT_PATH}",
     )
     df = pd.read_parquet(_SETTLEMENT_PATH)
-    # Normalise target_date to datetime.date
     if pd.api.types.is_datetime64_any_dtype(df["target_date"]):
         df["target_date"] = df["target_date"].dt.date
     df = df[df["quality_flag"] != "missing"].copy()
@@ -150,17 +148,16 @@ def _load_settlement() -> pd.DataFrame:
 
 
 def _load_forecasts() -> pd.DataFrame:
-    """Load and validate the GFS forecast parquet."""
+    """Load and validate the GFS forecast parquet for Dallas."""
     _require(
         _FORECAST_PATH,
         "python -m deep_isobar.data.historical_forecast_ingest "
-        "--city Chicago --year 2023 --month 8 "
+        "--city Dallas --year 2023 --month 8 "
         f"--out {_FORECAST_PATH}",
     )
     df = pd.read_parquet(_FORECAST_PATH)
     if pd.api.types.is_datetime64_any_dtype(df["target_date"]):
         df["target_date"] = df["target_date"].dt.date
-    # Ensure run_time_utc is timezone-aware
     if df["run_time_utc"].dt.tz is None:
         df["run_time_utc"] = df["run_time_utc"].dt.tz_localize("UTC")
     logger.info("Forecasts: %d rows loaded", len(df))
@@ -168,14 +165,14 @@ def _load_forecasts() -> pd.DataFrame:
 
 
 def _load_market_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load Kalshi snapshots and contract metadata.
+    """Load Kalshi snapshots and contract metadata for KXHIGHDFW.
 
     Returns ``(snapshots_df, contracts_df)``.
     """
     _require(
         _SNAPSHOTS_PATH,
         "python -m deep_isobar.market.historical_kalshi_ingest "
-        "--series KXHIGHCHI --start 2023-05-01 --end 2023-09-30 "
+        "--series KXHIGHTDAL --start 2023-06-01 --end 2023-09-30 "
         f"--out {_SNAPSHOTS_PATH}",
     )
     snapshots = pd.read_parquet(_SNAPSHOTS_PATH)
@@ -191,33 +188,14 @@ def _load_market_data() -> tuple[pd.DataFrame, pd.DataFrame]:
         )
     else:
         logger.warning(
-            "Contracts parquet not found at %s — deriving contract metadata "
-            "from T-format contract_ids in snapshots.",
+            "Contracts metadata not found at %s — threshold_f will be parsed "
+            "from contract_id strings. Results may be incomplete.",
             _CONTRACTS_PATH,
         )
-        # Derive contracts table from T-format snapshot contract_ids.
-        # Format: HIGHCHI-23AUG08-T80 or KXHIGHCHI-23AUG08-T80
-        t_snaps = snapshots[
-            snapshots["contract_id"].str.contains(r"-T\d", regex=True, na=False)
-        ][["contract_id"]].drop_duplicates().copy()
-        t_snaps["threshold_f"] = (
-            t_snaps["contract_id"].str.extract(r"-T(\d+)")[0].astype(float)
-        )
-        # Parse target_date from the date component (e.g. 23AUG08 -> 2023-08-08)
-        t_snaps["target_date"] = pd.to_datetime(
-            t_snaps["contract_id"].str.extract(r"-(\d{2}[A-Z]{3}\d{2})-")[0],
-            format="%y%b%d",
-        ).dt.date
-        contracts = t_snaps.dropna(subset=["threshold_f", "target_date"]).copy()
-
-    # Keep only T-format contracts
-    if "contract_id" in contracts.columns and not contracts.empty:
-        contracts = contracts[
-            contracts["contract_id"].str.contains(r"-T\d", regex=True, na=False)
-        ].copy()
+        contracts = pd.DataFrame()
 
     logger.info(
-        "Market: %d snapshot rows, %d T-format contract rows loaded",
+        "Market: %d snapshot rows, %d contract rows loaded",
         len(snapshots),
         len(contracts),
     )
@@ -235,10 +213,8 @@ def _select_forecast(
 ) -> list[ForecastPoint]:
     """Return the best available GFS ForecastPoints for *target_date*.
 
-    Prefers the shortest lead ≤ 48 h (day+1).  Falls back to ≤ 72 h.
+    Prefers the shortest lead ≤ 48 h.  Falls back to ≤ 72 h.
     Returns an empty list when no qualifying forecast exists.
-    When multiple cycles (00z / 12z) are available at the same lead tier,
-    all qualifying rows are returned so the ensemble can weight them.
     """
     day_rows = forecasts_df[forecasts_df["target_date"] == target_date]
     if day_rows.empty:
@@ -247,7 +223,6 @@ def _select_forecast(
     for max_lead in (_PRIMARY_MAX_LEAD, _FALLBACK_MAX_LEAD):
         candidates = day_rows[day_rows["lead_hours"] <= max_lead]
         if not candidates.empty:
-            # Keep only the rows at the minimum lead hour available
             min_lead = candidates["lead_hours"].min()
             best = candidates[candidates["lead_hours"] == min_lead]
             return [_row_to_forecast_point(row) for _, row in best.iterrows()]
@@ -291,12 +266,7 @@ def _build_contracts_index(
     contracts_df: pd.DataFrame,
     thresholds: list[int],
 ) -> pd.DataFrame:
-    """Return a DataFrame with columns [contract_id, target_date, threshold_f].
-
-    Filters the contract metadata to only the requested thresholds.
-    Returns an empty DataFrame when *contracts_df* is empty or contains
-    no rows matching *thresholds*.
-    """
+    """Return a DataFrame with columns [contract_id, target_date, threshold_f]."""
     if contracts_df.empty:
         return pd.DataFrame(columns=["contract_id", "target_date", "threshold_f"])
     return contracts_df[
@@ -310,27 +280,21 @@ def _build_contracts_index(
 
 
 def run_backtest() -> dict:
-    """Execute the full Chicago backtest on real historical data."""
+    """Execute the full Dallas backtest on real historical data."""
     # ── Load all data ──────────────────────────────────────────────────────
     settlement_df  = _load_settlement()
     forecasts_df   = _load_forecasts()
     snapshots_df, contracts_df = _load_market_data()
 
     # ── City profile (calibrated values from config/cities.yaml) ──────────
-    city_profile = get_city_profile("Chicago")
+    city_profile = get_city_profile("Dallas")
 
-    # ── Build contract index (dynamic thresholds per date) ────────────────
-    idx_map: dict[tuple, str] = {}
-    date_thresholds: dict[date, list[int]] = defaultdict(list)
-    for _, row in contracts_df.iterrows():
-        td  = row["target_date"]
-        thr = row["threshold_f"]
-        cid = row["contract_id"]
-        if pd.notna(thr) and pd.notna(td):
-            key = (td, int(thr))
-            idx_map[key] = cid
-            date_thresholds[td].append(int(thr))
-    date_thresholds = {td: sorted(thrs) for td, thrs in date_thresholds.items()}
+    # ── Build contract index ───────────────────────────────────────────────
+    contract_index = _build_contracts_index(contracts_df, THRESHOLDS)
+    idx_map: dict[tuple, str] = {
+        (row["target_date"], int(row["threshold_f"])): row["contract_id"]
+        for _, row in contract_index.iterrows()
+    }
 
     # ── Identify overlapping target dates ─────────────────────────────────
     settlement_dates = set(settlement_df["target_date"].unique())
@@ -344,11 +308,11 @@ def run_backtest() -> dict:
         )
 
     logger.info("=" * 60)
-    logger.info("Deep Isobar — Chicago (CHI) Backtest  [REAL DATA]")
+    logger.info("Deep Isobar — Dallas (DFW) Backtest  [REAL DATA]")
     logger.info("Settlement dates : %d", len(settlement_dates))
     logger.info("Forecast dates   : %d", len(forecast_dates))
     logger.info("Overlapping      : %d", len(active_dates))
-    logger.info("Thresholds       : dynamic (derived from contracts)")
+    logger.info("Thresholds       : %s °F", THRESHOLDS)
     logger.info("Signal threshold : %.2f  |  Quantity : %.0f contracts",
                 SIGNAL_THRESHOLD, QUANTITY)
     logger.info("=" * 60)
@@ -358,7 +322,6 @@ def run_backtest() -> dict:
     skipped_no_snapshot  = 0
     evaluated_count      = 0
 
-    # Index settlement by date for O(1) lookup (active_dates guarantees presence).
     settlement_by_date: dict[date, float] = {
         row["target_date"]: float(row["high_temp_f"])
         for _, row in settlement_df.iterrows()
@@ -370,12 +333,10 @@ def run_backtest() -> dict:
         # ── GFS forecast → ensemble ────────────────────────────────────────
         forecast_points = _select_forecast(forecasts_df, target_date)
         if not forecast_points:
-            skipped_no_forecast += len(date_thresholds.get(target_date, [1]))
+            skipped_no_forecast += len(THRESHOLDS)
             logger.debug("No GFS forecast for %s — skipping", target_date)
             continue
 
-        # Use the run_time_utc of the first (shortest-lead) forecast as
-        # the ensemble run time.
         ensemble_run_time = forecast_points[0].run_time_utc
 
         ensemble = build_temperature_ensemble(
@@ -387,43 +348,28 @@ def run_backtest() -> dict:
         )
 
         # ── Probability surface ────────────────────────────────────────────
-        # Guard: a single GFS run produces std=0; apply a minimum floor so
-        # the probability engine can still compute a useful estimate.
         effective_std = max(ensemble.adjusted_std_f, _MIN_ENSEMBLE_STD_F)
-
-        # Derive thresholds for this date from contracts (dynamic per Kalshi listing)
-        day_thresholds = date_thresholds.get(target_date, [])
-        if not day_thresholds:
-            logger.debug("No T-format contracts for %s — skipping", target_date)
-            continue
-
         probability_surface: dict[int, float] = {
             thr: probability_ge_normal(
                 mean_f=ensemble.bias_corrected_mean_f,
                 std_f=effective_std,
                 threshold_f=float(thr),
             )
-            for thr in day_thresholds
+            for thr in THRESHOLDS
         }
 
-        # Decision cutoff: noon UTC on target_date
         decision_cutoff = datetime(
             target_date.year, target_date.month, target_date.day,
             _DECISION_CUTOFF_HOUR_UTC, 0, 0, tzinfo=timezone.utc,
         )
 
         # ── Evaluate each threshold ────────────────────────────────────────
-        for threshold_f in day_thresholds:
-            # Look up the Kalshi contract_id
+        for threshold_f in THRESHOLDS:
             contract_id = idx_map.get((target_date, threshold_f))
             if contract_id is None:
-                # No contract metadata — try to find any snapshot with a
-                # parseable contract_id for this date (best-effort fallback).
-                # This path is hit when the contracts parquet is absent.
                 skipped_no_snapshot += 1
                 continue
 
-            # Fetch the last market price before the decision cutoff
             price = _select_market_snapshot(snapshots_df, contract_id, decision_cutoff)
             if price is None:
                 skipped_no_snapshot += 1
@@ -440,7 +386,7 @@ def run_backtest() -> dict:
             contract = MarketContract(
                 contract_id=contract_id,
                 market_source="Kalshi",
-                city="Chicago",
+                city="Dallas",
                 metric=METRIC,
                 comparison_operator=COMPARISON_OPERATOR,
                 threshold_f=threshold_f,
@@ -456,7 +402,6 @@ def run_backtest() -> dict:
                 best_ask=best_ask,
             )
 
-            # Enhancement signals computable from data we already have.
             micro_score = compute_microstructure_score(snapshot, decision_cutoff)
             tail_flag = is_tail_threshold(
                 ensemble_mean_f=ensemble.bias_corrected_mean_f,
@@ -481,17 +426,17 @@ def run_backtest() -> dict:
             realized_outcome = int(true_high_f >= threshold_f)
 
             opportunity_rows.append({
-                "contract_id":       contract_id,
-                "target_date":       target_date,
-                "threshold_f":       threshold_f,
-                "side":              signal.signal_side,
-                "model_probability": signal.model_probability,
+                "contract_id":        contract_id,
+                "target_date":        target_date,
+                "threshold_f":        threshold_f,
+                "side":               signal.signal_side,
+                "model_probability":  signal.model_probability,
                 "market_probability": signal.market_probability,
-                "alpha":             signal.alpha,
-                "absolute_alpha":    signal.absolute_alpha,
-                "rank_score":        signal.rank_score,
-                "simulated_price":   simulated_price,
-                "realized_outcome":  realized_outcome,
+                "alpha":              signal.alpha,
+                "absolute_alpha":     signal.absolute_alpha,
+                "rank_score":         signal.rank_score,
+                "simulated_price":    simulated_price,
+                "realized_outcome":   realized_outcome,
             })
 
     # ── Coverage report ────────────────────────────────────────────────────
@@ -528,7 +473,7 @@ def run_backtest() -> dict:
 
     # ── Print summary ──────────────────────────────────────────────────────
     logger.info("-" * 60)
-    logger.info("BACKTEST SUMMARY  (real historical data)")
+    logger.info("BACKTEST SUMMARY  (real historical data — Dallas DFW)")
     logger.info("  total_trades     : %d", summary["total_trades"])
     logger.info("  win_rate         : %.1f%%", summary["win_rate"] * 100)
     logger.info(
@@ -538,16 +483,14 @@ def run_backtest() -> dict:
     logger.info("  max_drawdown     : %.4f", summary["max_drawdown"])
     logger.info("-" * 60)
 
-    for thr in sorted(opportunities_df["threshold_f"].unique()):
-        sub = trades_df[trades_df["contract_id"].str.contains(
-            f"-T{int(thr)}$", regex=True, na=False
-        )]
+    for thr in THRESHOLDS:
+        sub = trades_df[trades_df["contract_id"].str.contains(f"T{thr}|_{thr}_", regex=True)]
         if sub.empty:
             continue
         sub_summary = summarize_backtest_results(sub)
         logger.info(
-            "  >= %d F  trades=%d  win_rate=%.1f%%  gross_pnl=%.4f",
-            int(thr),
+            "  >= %d°F  trades=%d  win_rate=%.1f%%  gross_pnl=%.4f",
+            thr,
             sub_summary["total_trades"],
             sub_summary["win_rate"] * 100,
             sub_summary["gross_pnl"],

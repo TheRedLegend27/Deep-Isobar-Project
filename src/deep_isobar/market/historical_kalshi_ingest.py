@@ -673,7 +673,7 @@ def save_to_parquet(df: pd.DataFrame, output_path: str | Path) -> Path:
     path = Path(output_path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
-    logger.info("Saved %d rows → %s", len(df), path)
+    logger.info("Saved %d rows -> %s", len(df), path)
     return path
 
 
@@ -739,8 +739,8 @@ if __name__ == "__main__":
     snap_path = save_to_parquet(snapshots, args.out)
     cont_path = save_to_parquet(contracts, args.contracts_out)
 
-    print(f"\nSnapshots  : {len(snapshots):>6,} rows → {snap_path}")
-    print(f"Contracts  : {len(contracts):>6,} rows → {cont_path}")
+    print(f"\nSnapshots  : {len(snapshots):>6,} rows -> {snap_path}")
+    print(f"Contracts  : {len(contracts):>6,} rows -> {cont_path}")
     print(f"\nSnapshot columns : {list(snapshots.columns)}")
     print(f"\nFirst 5 snapshot rows:")
     print(snapshots.head(5).to_string(index=False))

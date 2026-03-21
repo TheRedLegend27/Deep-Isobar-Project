@@ -1,0 +1,75 @@
+# Dallas (DFW) City Profile
+# CityProfile schema — matches deep_isobar.core.types.CityProfile
+#
+# These are the pre-calibration defaults derived from Texas summer
+# climatology and known GFS biases.  After running the first DFW backtest,
+# run analyze_mispriced_markets("Dallas") to generate calibrated values.
+#
+# ── Meteorological rationale ─────────────────────────────────────────────
+#
+# Station: KDFW (Dallas/Fort Worth International Airport, 32.9°N 97.0°W)
+#
+# Summer climate (June–September):
+#   • August mean high: ~98°F;  typical range 88–110°F
+#   • July is the hottest month; extended heat waves (≥100°F for 5+ days)
+#     occur in most summers and drive the primary trading edge
+#   • Convective cold fronts ("blue northers") can drop highs 10–15°F
+#     in a single day — the main source of day-to-day variance
+#
+# GFS warm bias:
+#   • GFS consistently overshoots DFW afternoon highs by +1.5–2.0°F in
+#     hot/humid regimes due to boundary-layer mixing parameterisation
+#   • mean_bias_correction_f = -1.5 removes the systematic overestimate
+#   • heat_bias_adjustment_f = -0.5 adds an additional correction when
+#     the uncorrected forecast is already in the extreme-heat range
+#
+# Model weight rationale:
+#   • ECMWF (0.45): best overall skill for DFW; edge in medium-range
+#   • GFS   (0.35): high temporal resolution; necessary for day+1 coverage
+#   • NAM   (0.20): captures mesoscale convective outflow better than
+#                   GFS in the 12–36 h window
+#
+# variance_multiplier = 1.25:
+#   • Inflates the ensemble spread to account for convective uncertainty
+#     not fully captured in a single GFS run
+#   • Lower than Chicago (1.36) because DFW summer is more persistently
+#     hot — the bimodal distribution (heat-wave vs. front-break) widens
+#     the raw std more than Chicago's moderate-climate variability
+#
+# kde_bandwidth = 1.8:
+#   • Slightly wider than Chicago (1.5) to smooth the bimodal temperature
+#     distribution created by heat-wave vs. cold-front alternation
+#
+# tail_multiplier = 1.25:
+#   • 100°F+ tail events carry outsized Kalshi edge because the market
+#     often underweights extreme-heat persistence
+#
+# ─────────────────────────────────────────────────────────────────────────
+
+city: Dallas
+city_code: DAL
+station_id: KDFW
+timezone: America/Chicago
+settlement_source: NWS
+
+# Core calibration parameters
+variance_multiplier: 1.25
+mean_bias_correction_f: -1.5
+kde_bandwidth: 1.8
+tail_multiplier: 1.25
+
+# Model ensemble weights (must sum to ≤ 1.0; residual is unweighted)
+model_weight_gfs: 0.35
+model_weight_ecmwf: 0.45
+model_weight_nam: 0.20
+
+# Seasonal bias adjustments (applied on top of mean_bias_correction_f)
+heat_bias_adjustment_f: -0.5   # GFS extra-warm in 100°F+ regimes
+cold_bias_adjustment_f: 0.0    # no systematic cold-season bias for summer
+
+# Kalshi series
+kalshi_series_high: KXHIGHTDAL
+
+# Recommended backtest thresholds for DFW summer (August):
+#   100°F and 105°F — nearly always above 80°F/90°F in Dallas summer
+backtest_thresholds: [100, 105]

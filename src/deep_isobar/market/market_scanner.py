@@ -178,6 +178,11 @@ def evaluate_contract_opportunity(
     alpha = model_probability - market_probability
     confidence_score = abs(alpha)
 
+    # Pass raw spread so alpha_engine can apply the wide-spread hard filter.
+    raw_spread: float | None = None
+    if orderbook.best_bid is not None and orderbook.best_ask is not None:
+        raw_spread = orderbook.best_ask - orderbook.best_bid
+
     return build_trade_signal(
         timestamp_utc=timestamp_utc,
         contract=contract,
@@ -188,6 +193,7 @@ def evaluate_contract_opportunity(
         forecast_shift_flag=forecast_shift_flag,
         stale_market_flag=stale_market_flag,
         microstructure_score=microstructure_score,
+        spread=raw_spread,
         tail_opportunity_flag=tail_opportunity_flag,
         tail_multiplier=tail_multiplier,
     )

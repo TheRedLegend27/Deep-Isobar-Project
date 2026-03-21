@@ -92,6 +92,10 @@ _SERIES_METADATA: dict[str, dict[str, str]] = {
     "KXLOWCHI":  {"city": "Chicago", "metric": "low_temp_f",   "comparison_operator": "le", "settlement_source": "NWS"},
     "HIGHCHI":   {"city": "Chicago", "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
     "LOWCHI":    {"city": "Chicago", "metric": "low_temp_f",   "comparison_operator": "le", "settlement_source": "NWS"},
+    "KXHIGHTDAL": {"city": "Dallas",  "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
+    "HIGHDAL":    {"city": "Dallas",   "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
+    "KXHIGHNY":   {"city": "New York", "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
+    "HIGHNY":     {"city": "New York", "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
 }
 
 # Month abbreviation → month number (Kalshi uses 3-letter uppercase abbrevs)

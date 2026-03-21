@@ -26,6 +26,28 @@ opportunities.  It starts from ``abs(alpha)`` and can be boosted by tail
 position, forecast shifts, market lag, and microstructure quality.  Raw alpha
 and signal-side classification are always preserved unchanged.
 
+Enhancement integration
+-----------------------
+``build_trade_signal`` integrates four optional enhancement signals produced by
+the upstream modules:
+
+- **market_lag_detection** → ``stale_market_flag``
+- **microstructure_scanner** → ``microstructure_score``
+- **distribution_tail_alpha** → ``tail_opportunity_flag`` + ``tail_multiplier``
+- **forecast_shift** → ``forecast_shift_flag``
+
+Hard filters (forced HOLD):
+    1. ``stale_market_flag=True`` — market price has not reacted to a
+       significant forecast shift; observed price may not be executable.
+    2. ``microstructure_score < _MIN_LIQUIDITY_THRESHOLD`` — market is too
+       thin or stale to trade reliably.
+
+Confidence adjustments (applied before the hard filter):
+    - ``forecast_shift_flag=True``  → +``_SHIFT_CONFIDENCE_BOOST``
+    - ``tail_opportunity_flag=True`` → +``_TAIL_CONFIDENCE_BOOST``
+    Hard filter triggers → confidence multiplied by the corresponding
+    penalty factor so the signal carries a truthful score even as HOLD.
+
 All probability arguments must be in [0.0, 1.0].
 """
 
@@ -42,6 +64,36 @@ logger = logging.getLogger(__name__)
 _SIGNAL_BUY = "BUY"
 _SIGNAL_SELL = "SELL"
 _SIGNAL_HOLD = "HOLD"
+
+# ---------------------------------------------------------------------------
+# Enhancement integration constants
+# ---------------------------------------------------------------------------
+
+#: Microstructure score below this threshold forces the signal to HOLD.
+#: Below 0.30 the spread, freshness, and liquidity combination is too poor
+#: to rely on the observed price as executable.
+_MIN_LIQUIDITY_THRESHOLD: float = 0.30
+
+#: Confidence multiplier when stale_market_flag is True.  Heavy penalty
+#: because the market price has not absorbed the latest forecast shift, so
+#: we cannot trust it as a reliable fill price.
+_STALE_CONFIDENCE_FACTOR: float = 0.15
+
+#: Confidence multiplier when microstructure_score < _MIN_LIQUIDITY_THRESHOLD.
+_LOW_LIQUIDITY_CONFIDENCE_FACTOR: float = 0.20
+
+#: Bid-ask spread above this threshold forces HOLD regardless of composite score.
+#: A 40-cent spread means the fill cost alone would consume most of any edge.
+_MAX_SPREAD_THRESHOLD: float = 0.40
+
+#: Additive confidence boost when a significant forecast shift is confirmed.
+#: A shift in the same direction as our alpha strengthens conviction.
+_SHIFT_CONFIDENCE_BOOST: float = 0.05
+
+#: Additive confidence boost for tail-threshold contracts.
+#: Tail opportunities are rarer but when they align with alpha they tend to
+#: be more decisively mispriced.
+_TAIL_CONFIDENCE_BOOST: float = 0.03
 
 
 def compute_alpha(model_probability: float, market_probability: float) -> float:
@@ -242,6 +294,7 @@ def build_trade_signal(
     forecast_shift_flag: bool = False,
     stale_market_flag: bool = False,
     microstructure_score: float | None = None,
+    spread: float | None = None,
     rank_score: float | None = None,
     tail_multiplier: float = 1.0,
     model_version: str = "v1",
@@ -261,8 +314,10 @@ def build_trade_signal(
     - ``stale_market_flag``   → lag bonus
     - ``microstructure_score`` → quality additive
 
-    Raw alpha and BUY / SELL / HOLD classification are never altered by
-    ranking logic.
+    Raw alpha is never modified.  Signal side may be overridden to ``"HOLD"``
+    by the hard filter logic in :func:`_apply_enhancement_adjustments` when
+    ``stale_market_flag`` is ``True`` or ``microstructure_score`` is below
+    :data:`_MIN_LIQUIDITY_THRESHOLD`.
 
     Args:
         timestamp_utc: When this signal was generated.
@@ -324,13 +379,30 @@ def build_trade_signal(
     alpha = compute_alpha(model_probability, market_probability)
     signal_side = classify_signal(alpha, signal_threshold)
 
-    # Auto-compute rank_score from all available enhancement signals when not
-    # supplied explicitly.  When tail_opportunity_flag is True, derive a
-    # tail-boosted base score via compute_tail_alpha_boost before passing it
-    # to compute_rank_score.  All other enhancement flags add on top of that
-    # base.  Raw alpha is never modified.
-    effective_rank_score = rank_score
-    if effective_rank_score is None:
+    # ── Enhancement integration ────────────────────────────────────────────
+    # 1. Adjust confidence_score based on enhancement signal quality.
+    # 2. Apply hard filters: stale market or low liquidity → force HOLD.
+    # Raw alpha and absolute_alpha are never modified by this step.
+    signal_side, adjusted_confidence, filter_reason = _apply_enhancement_adjustments(
+        signal_side=signal_side,
+        confidence_score=confidence_score,
+        stale_market_flag=stale_market_flag,
+        forecast_shift_flag=forecast_shift_flag,
+        tail_opportunity_flag=tail_opportunity_flag,
+        microstructure_score=microstructure_score,
+        spread=spread,
+    )
+
+    # ── Rank score ─────────────────────────────────────────────────────────
+    # Hard-filtered signals (forced HOLD) get rank_score=0.0 so they never
+    # compete with legitimate opportunities in downstream ranking.
+    # For tradeable signals, auto-compute from all enhancement signals when
+    # not supplied explicitly.
+    if filter_reason is not None:
+        effective_rank_score = 0.0
+    elif rank_score is not None:
+        effective_rank_score = rank_score
+    else:
         tail_rank_score: float | None = None
         if tail_opportunity_flag:
             tail_rank_score = compute_tail_alpha_boost(
@@ -347,13 +419,16 @@ def build_trade_signal(
         )
 
     logger.info(
-        "build_trade_signal: contract=%s side=%s alpha=%.4f model=%.4f market=%.4f rank=%.4f",
+        "build_trade_signal: contract=%s side=%s alpha=%.4f model=%.4f market=%.4f "
+        "rank=%.4f confidence=%.4f filter=%s",
         contract.contract_id,
         signal_side,
         alpha,
         model_probability,
         market_probability,
         effective_rank_score,
+        adjusted_confidence,
+        filter_reason or "none",
     )
 
     return TradeSignal(
@@ -369,7 +444,7 @@ def build_trade_signal(
         alpha=alpha,
         absolute_alpha=abs(alpha),
         signal_side=signal_side,
-        confidence_score=confidence_score,
+        confidence_score=adjusted_confidence,
         tail_opportunity_flag=tail_opportunity_flag,
         forecast_shift_flag=forecast_shift_flag,
         stale_market_flag=stale_market_flag,
@@ -382,6 +457,91 @@ def build_trade_signal(
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _apply_enhancement_adjustments(
+    signal_side: str,
+    confidence_score: float,
+    stale_market_flag: bool,
+    forecast_shift_flag: bool,
+    tail_opportunity_flag: bool,
+    microstructure_score: float | None,
+    spread: float | None = None,
+) -> tuple[str, float, str | None]:
+    """Apply hard filters and confidence adjustments from enhancement signals.
+
+    Confidence adjustments are applied first (they are always valid).  Hard
+    filters are checked afterwards and override the signal side to HOLD when
+    triggered; the already-adjusted confidence is then penalised further so
+    the returned confidence truthfully reflects the quality of the signal.
+
+    Hard filter rules (checked in order; first match wins):
+        0. ``spread > _MAX_SPREAD_THRESHOLD`` → HOLD (fill cost consumes edge)
+        1. ``stale_market_flag=True`` → HOLD + ``_STALE_CONFIDENCE_FACTOR``
+        2. ``microstructure_score < _MIN_LIQUIDITY_THRESHOLD`` → HOLD +
+           ``_LOW_LIQUIDITY_CONFIDENCE_FACTOR``
+
+    Confidence boosts (additive, clamped to 1.0):
+        - ``forecast_shift_flag=True`` → +``_SHIFT_CONFIDENCE_BOOST``
+        - ``tail_opportunity_flag=True`` → +``_TAIL_CONFIDENCE_BOOST``
+
+    Args:
+        signal_side: Initial classification from :func:`classify_signal`.
+        confidence_score: Caller-supplied confidence, typically ``|alpha|``.
+        stale_market_flag: From ``market_lag_detection.detect_market_lag``.
+        forecast_shift_flag: From ``forecast_shift.compute_forecast_shift``.
+        tail_opportunity_flag: From ``distribution_tail_alpha.is_tail_threshold``.
+        microstructure_score: From ``microstructure_scanner.compute_microstructure_score``.
+        spread: Raw bid-ask spread (``best_ask - best_bid``) in [0, 1].  When
+            provided and above :data:`_MAX_SPREAD_THRESHOLD`, forces HOLD.
+
+    Returns:
+        ``(effective_signal_side, effective_confidence, filter_reason)``
+        where *filter_reason* is ``None`` when no hard filter triggered, or a
+        short description string when HOLD was forced.
+    """
+    effective = confidence_score
+
+    # ── Positive confidence adjustments ───────────────────────────────────
+    if forecast_shift_flag:
+        effective = min(1.0, effective + _SHIFT_CONFIDENCE_BOOST)
+    if tail_opportunity_flag:
+        effective = min(1.0, effective + _TAIL_CONFIDENCE_BOOST)
+
+    # ── Hard filter 0: wide spread ─────────────────────────────────────────
+    if spread is not None and spread > _MAX_SPREAD_THRESHOLD:
+        effective *= _LOW_LIQUIDITY_CONFIDENCE_FACTOR
+        reason = f"wide_spread({spread:.3f}>{_MAX_SPREAD_THRESHOLD})"
+        logger.warning(
+            "_apply_enhancement_adjustments: spread=%.3f > %.3f — "
+            "forcing HOLD, confidence %.4f → %.4f",
+            spread, _MAX_SPREAD_THRESHOLD, confidence_score, effective,
+        )
+        return _SIGNAL_HOLD, round(effective, 6), reason
+
+    # ── Hard filter 1: stale market ───────────────────────────────────────
+    if stale_market_flag:
+        effective *= _STALE_CONFIDENCE_FACTOR
+        logger.warning(
+            "_apply_enhancement_adjustments: stale_market_flag=True — "
+            "forcing HOLD, confidence %.4f → %.4f",
+            confidence_score, effective,
+        )
+        return _SIGNAL_HOLD, round(effective, 6), "stale_market"
+
+    # ── Hard filter 2: insufficient liquidity ─────────────────────────────
+    if microstructure_score is not None and microstructure_score < _MIN_LIQUIDITY_THRESHOLD:
+        effective *= _LOW_LIQUIDITY_CONFIDENCE_FACTOR
+        reason = f"low_liquidity(score={microstructure_score:.3f}<{_MIN_LIQUIDITY_THRESHOLD})"
+        logger.warning(
+            "_apply_enhancement_adjustments: microstructure_score=%.3f < %.3f — "
+            "forcing HOLD, confidence %.4f → %.4f",
+            microstructure_score, _MIN_LIQUIDITY_THRESHOLD,
+            confidence_score, effective,
+        )
+        return _SIGNAL_HOLD, round(effective, 6), reason
+
+    return signal_side, round(effective, 6), None
 
 
 def _validate_probability(value: float, name: str) -> None:

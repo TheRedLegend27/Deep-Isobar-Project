@@ -13,9 +13,9 @@ cities:
     # Error analysis: GFS mean_error=+1.50°F rmse=3.16°F;
     #                 ECMWF mean_error=+0.44°F rmse=1.87°F
     # Weighted bias (GFS×0.35 + ECMWF×0.50): +0.87°F warm → correction -0.9°F
-    variance_multiplier: 1.35
-    mean_bias_correction_f: -0.9
-    kde_bandwidth: 1.7
+    variance_multiplier: 1.36
+    mean_bias_correction_f: 2.04
+    kde_bandwidth: 5.5
     tail_multiplier: 1.3
     model_weight_gfs: 0.35
     model_weight_ecmwf: 0.50
@@ -31,9 +31,13 @@ cities:
     station_id: KJFK
     settlement_source: NWS
     active: true
-    variance_multiplier: 1.1
-    mean_bias_correction_f: 0.0
-    kde_bandwidth: 1.2
+    # --- Calibrated 2026-03-20 from NYC backtest run (Aug 2023) ---
+    # GFS mean warm bias = +0.91°F over 32 dates → mean_bias_correction_f = -0.91
+    # Brier-optimal sigma = 2.75°F → variance_multiplier = 2.75 / GFS_RMSE(3.23) = 0.85
+    # kde_bandwidth = 2.75 (Brier-optimal sigma; Silverman rule gives 1.46°F)
+    variance_multiplier: 0.85
+    mean_bias_correction_f: -0.91
+    kde_bandwidth: 2.75
     tail_multiplier: 1.0
     model_weight_gfs: 0.4
     model_weight_ecmwf: 0.4
@@ -85,12 +89,21 @@ cities:
     station_id: KDFW
     settlement_source: NWS
     active: true
-    variance_multiplier: 1.2
-    mean_bias_correction_f: 0.0
-    kde_bandwidth: 1.3
-    tail_multiplier: 1.1
+    # --- Texas summer meteorological defaults (DFW) — pre-calibration ---
+    # Dallas/Fort Worth avg August high ~98°F (range ~88–110°F).
+    # GFS runs consistently warm in hot/humid Texas summers: +1.5–2.0°F bias.
+    # Higher variance_multiplier reflects convective breaks (cold fronts can
+    # drop highs 10–15°F in a day) vs. persistent multi-day heat waves.
+    # ECMWF slightly outperforms GFS for DFW; NAM captures outflow better.
+    # heat_bias_adjustment_f: extra GFS warm correction during heat-wave regimes.
+    # Run analyze_mispriced_markets("Dallas") after the first backtest to
+    # derive calibrated values from the actual error distribution.
+    variance_multiplier: 1.25
+    mean_bias_correction_f: -1.5
+    kde_bandwidth: 1.8
+    tail_multiplier: 1.25
     model_weight_gfs: 0.35
-    model_weight_ecmwf: 0.4
-    model_weight_nam: 0.25
-    heat_bias_adjustment_f: 0.0
+    model_weight_ecmwf: 0.45
+    model_weight_nam: 0.20
+    heat_bias_adjustment_f: -0.5
     cold_bias_adjustment_f: 0.0
