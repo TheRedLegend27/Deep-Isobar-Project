@@ -381,6 +381,23 @@ def _parse_contract(market: dict[str, Any], now_utc: datetime) -> MarketContract
         logger.debug("_parse_contract: skipping unparseable ticker %r", ticker)
         return None
 
+    # Read strike_type from the API response.  Kalshi returns "less", "greater",
+    # or "between".  Skip "between" (bracket) contracts — they require a range
+    # probability function that doesn't exist yet.
+    strike_type: str = (market.get("strike_type") or "").lower()
+    if not strike_type:
+        logger.debug("_parse_contract: missing strike_type for %r — skipping", ticker)
+        return None
+    if strike_type == "between":
+        logger.debug("_parse_contract: skipping between/bracket contract %r", ticker)
+        return None
+
+    # Parse floor/cap strike boundaries from the API response (integers or null).
+    floor_strike_raw = market.get("floor_strike")
+    cap_strike_raw   = market.get("cap_strike")
+    floor_strike: int | None = int(floor_strike_raw) if floor_strike_raw is not None else None
+    cap_strike:   int | None = int(cap_strike_raw)   if cap_strike_raw   is not None else None
+
     meta = _SERIES_METADATA.get(parsed["series"])
     if meta is None:
         logger.debug(
@@ -410,15 +427,22 @@ def _parse_contract(market: dict[str, Any], now_utc: datetime) -> MarketContract
             except ValueError:
                 pass
 
+    # Map strike_type → legacy comparison_operator kept for TradeSignal compat.
+    _OP_MAP: dict[str, str] = {"less": "lt", "greater": "gt"}
+    comparison_operator = _OP_MAP.get(strike_type, strike_type)
+
     return MarketContract(
         contract_id=ticker,
         market_source=_MARKET_SOURCE,
         city=meta["city"],
         metric=meta["metric"],
-        comparison_operator=meta["comparison_operator"],
+        comparison_operator=comparison_operator,
         threshold_f=parsed["threshold_f"],
         target_date=parsed["target_date"],
         settlement_source=meta["settlement_source"],
+        strike_type=strike_type,
+        floor_strike=floor_strike,
+        cap_strike=cap_strike,
         raw_title=market.get("rules_primary") or market.get("title"),
         listed_at_utc=listed_at_utc,
         expires_at_utc=expires_at_utc,
@@ -637,15 +661,18 @@ def _stub_fetch_live_contracts() -> list[MarketContract]:
     )
     return [
         MarketContract(
-            contract_id=f"CHI_HIGH_TEMP_F_GE_{t}_{target_date.strftime('%Y%m%d')}",
+            contract_id=f"CHI_HIGH_TEMP_F_GT_{t}_{target_date.strftime('%Y%m%d')}",
             market_source=_MARKET_SOURCE,
             city="Chicago",
             metric="high_temp_f",
-            comparison_operator="ge",
+            comparison_operator="gt",
             threshold_f=t,
             target_date=target_date,
             settlement_source="NWS",
-            raw_title=f"Chicago High >= {t}°F on {target_date.isoformat()}",
+            strike_type="greater",
+            floor_strike=t,
+            cap_strike=None,
+            raw_title=f"Chicago High > {t}°F on {target_date.isoformat()}",
             active=True,
         )
         for t in thresholds

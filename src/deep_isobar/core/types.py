@@ -172,6 +172,11 @@ class MarketContract:
     threshold_f: int
     target_date: date
     settlement_source: str
+    # Kalshi strike fields — populated from the live API; empty string / None
+    # for stub contracts and legacy backtesting code that pre-dates this field.
+    strike_type: str = ""           # "less" | "greater" | "between"
+    floor_strike: Optional[int] = None   # lower boundary in °F (None for "less")
+    cap_strike: Optional[int] = None     # upper boundary in °F (None for "greater")
     raw_title: Optional[str] = None
     listed_at_utc: Optional[datetime] = None
     expires_at_utc: Optional[datetime] = None

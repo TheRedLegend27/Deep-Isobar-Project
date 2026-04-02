@@ -47,6 +47,12 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, etc.
 
 from deep_isobar.data.historical_noaa_ingest import fetch_settlement_observations
+from deep_isobar.notifications.discord_notifier import (
+    COLOR_GREEN,
+    COLOR_RED,
+    COLOR_BLUE,
+    post_embed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,11 +178,20 @@ def _settle_open_trades(
         & (df["status"] == "OPEN")
     )
 
+    def _parse_optional_int(val) -> int | None:
+        """Parse an integer from a CSV cell that may be empty or NaN."""
+        try:
+            s = str(val).strip()
+            if s in ("", "nan", "None"):
+                return None
+            return int(float(s))
+        except (ValueError, TypeError):
+            return None
+
     n_settled = 0
     for idx in df[open_mask].index:
         row = df.loc[idx]
 
-        threshold_f = float(row["threshold_f"])
         entry_price = float(row["entry_price"])
         direction = str(row["direction"])
         position_size = (
@@ -185,8 +200,61 @@ def _settle_open_trades(
             else _DEFAULT_POSITION_SIZE
         )
 
-        # Kalshi KXHIGHCHI: YES settles at 1 if actual_high >= threshold_f
-        realized_outcome = 1 if settled_temp >= threshold_f else 0
+        # Determine the YES-settlement outcome from strike_type.
+        # Rows written before this fix may lack strike_type; fall back to
+        # parsing the ticker for the bracket letter.
+        strike_type = str(row.get("strike_type", "") or "").lower().strip()
+        if not strike_type:
+            # Legacy fallback: infer from ticker name
+            ticker = str(row.get("contract_ticker", ""))
+            import re as _re
+            m = _re.search(r"-([BT])[\d.]+$", ticker, _re.IGNORECASE)
+            if m and m.group(1).upper() == "T":
+                # T-contracts: lower T = "less" edge, upper T = "greater" edge.
+                # Without cap/floor data we can't distinguish; default to "less"
+                # (T66 was a "less" contract) and log a warning.
+                strike_type = "less"
+                logger.warning(
+                    "settle: missing strike_type for %r — inferred 'less'; "
+                    "verify settlement is correct.",
+                    ticker,
+                )
+            else:
+                logger.warning(
+                    "settle: cannot determine strike_type for %r — skipping.",
+                    row.get("contract_ticker"),
+                )
+                continue
+
+        floor_strike = _parse_optional_int(row.get("floor_strike"))
+        cap_strike   = _parse_optional_int(row.get("cap_strike"))
+
+        # Kalshi settlement rules by strike_type:
+        #   less    → YES if actual < cap_strike    (e.g. T66: actual < 66)
+        #   greater → YES if actual > floor_strike  (e.g. T67: actual > 67)
+        if strike_type == "less":
+            if cap_strike is None:
+                # Legacy fallback: use threshold_f as cap_strike
+                cap_strike = int(float(row["threshold_f"]))
+                logger.warning(
+                    "settle: missing cap_strike for %r — using threshold_f=%s",
+                    row.get("contract_ticker"), cap_strike,
+                )
+            realized_outcome = 1 if settled_temp < cap_strike else 0
+        elif strike_type == "greater":
+            if floor_strike is None:
+                floor_strike = int(float(row["threshold_f"]))
+                logger.warning(
+                    "settle: missing floor_strike for %r — using threshold_f=%s",
+                    row.get("contract_ticker"), floor_strike,
+                )
+            realized_outcome = 1 if settled_temp > floor_strike else 0
+        else:
+            logger.warning(
+                "settle: unexpected strike_type %r for %r — skipping.",
+                strike_type, row.get("contract_ticker"),
+            )
+            continue
 
         pnl = _compute_pnl(direction, entry_price, realized_outcome, position_size)
 
@@ -283,8 +351,21 @@ def settle(settle_date: date) -> None:
         dtype={"threshold_f": float, "position_size": float},
     )
 
+    # Safety net: warn about any B-type contracts that slipped into the CSV
+    # before the _parse_contract fix.  Do not attempt to settle them.
+    b_contracts = df[df["contract_ticker"].str.contains(r"-B", na=False)]
+    if not b_contracts.empty:
+        for _, b_row in b_contracts.iterrows():
+            logger.warning(
+                "settle: skipping bracket contract %r (status=%s) — "
+                "B-type settlement logic is not implemented; mark manually.",
+                b_row["contract_ticker"], b_row["status"],
+            )
+
     open_today = df[
-        (df["date"].astype(str) == str(settle_date)) & (df["status"] == "OPEN")
+        (df["date"].astype(str) == str(settle_date))
+        & (df["status"] == "OPEN")
+        & ~df["contract_ticker"].str.contains(r"-B", na=False)
     ]
 
     if open_today.empty:
@@ -330,6 +411,42 @@ def settle(settle_date: date) -> None:
                 f"{trade_row['status']:<4}  "
                 f"pnl={float(trade_row['realized_pnl']):+.4f}"
             )
+
+        # ── Per-trade Discord embeds ───────────────────────────────────────
+        for _, trade_row in newly_settled.iterrows():
+            is_win = trade_row["status"] == "WIN"
+            pnl = float(trade_row["realized_pnl"])
+            post_embed(
+                title=f"{'WIN' if is_win else 'LOSS'} \u2014 {trade_row['contract_ticker']}",
+                color=COLOR_GREEN if is_win else COLOR_RED,
+                fields=[
+                    {"name": "Settled temp",  "value": f"{settled_temp:.1f}\u00b0F"},
+                    {"name": "Threshold",     "value": f"{trade_row['threshold_f']:.0f}\u00b0F"},
+                    {"name": "Realized P&L",  "value": f"{pnl:+.4f}"},
+                    {"name": "Entry price",   "value": f"{float(trade_row['entry_price']):.4f}"},
+                ],
+            )
+
+        # ── Summary embed ─────────────────────────────────────────────────
+        all_settled = df[df["status"].isin(["WIN", "LOSS"])].copy()
+        all_settled["realized_pnl"] = pd.to_numeric(
+            all_settled["realized_pnl"], errors="coerce"
+        ).fillna(0.0)
+        n_total = len(all_settled)
+        n_wins  = int((all_settled["status"] == "WIN").sum())
+        session_pnl    = float(newly_settled["realized_pnl"].astype(float).sum())
+        cumulative_pnl = float(all_settled["realized_pnl"].sum())
+        post_embed(
+            title=f"Settlement complete \u2014 {settle_date}",
+            color=COLOR_BLUE,
+            fields=[
+                {"name": "Trades settled",  "value": str(n_settled)},
+                {"name": "Wins",            "value": str(n_wins)},
+                {"name": "Losses",          "value": str(n_total - n_wins)},
+                {"name": "Session P&L",     "value": f"{session_pnl:+.4f}"},
+                {"name": "Cumulative P&L",  "value": f"{cumulative_pnl:+.4f}"},
+            ],
+        )
 
     _print_pnl_summary(df)
 

@@ -65,9 +65,15 @@ from deep_isobar.market.kalshi_client import (
 )
 from deep_isobar.market.market_scanner import evaluate_contract_opportunity
 from deep_isobar.market.microstructure_scanner import compute_microstructure_score
-from deep_isobar.models.probability_engine import probability_ge_normal
+from deep_isobar.models.probability_engine import probability_for_contract
 from deep_isobar.models.temperature_ensemble import build_temperature_ensemble
 from deep_isobar.trading.distribution_tail_alpha import is_tail_threshold
+from deep_isobar.notifications.discord_notifier import (
+    COLOR_AMBER,
+    COLOR_BLUE,
+    COLOR_GRAY,
+    post_embed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +91,6 @@ CITY = "Chicago"
 SIGNAL_THRESHOLD = 0.25     # minimum |alpha| to generate a trade
 POSITION_SIZE = 10.0        # contracts per trade (paper)
 METRIC = "high_temp_f"
-COMPARISON_OPERATOR = "ge"
 # Minimum ensemble std applied when only one GFS run is available.
 # Matches the floor used in the Chicago backtest.
 _MIN_ENSEMBLE_STD_F = 5.5
@@ -103,6 +108,9 @@ _CSV_COLUMNS = [
     "realized_pnl",
     "settled_temp",
     "threshold_f",
+    "strike_type",
+    "floor_strike",
+    "cap_strike",
 ]
 
 
@@ -132,7 +140,7 @@ def _fetch_live_gfs_t24(city_profile, run_date: date) -> list[ForecastPoint]:
 
     station_id = city_profile.station_id
     city_lat, city_lon_360 = _STATION_COORDS.get(
-        station_id, (41.9803, 272.0911)  # KORD fallback
+        station_id, (41.7868, 272.2478)  # KMDW fallback
     )
     tomorrow = run_date + timedelta(days=1)
     points: list[ForecastPoint] = []
@@ -204,9 +212,20 @@ def _print_signal(row: dict, signal, orderbook) -> None:
     tag = ">>> TRADE SIGNAL (would be logged)" if is_trade else "    no trade"
     bid = orderbook.best_bid
     ask = orderbook.best_ask
+
+    st = row.get("strike_type", "")
+    cap = row.get("cap_strike", "")
+    flr = row.get("floor_strike", "")
+    if st == "less":
+        condition = f"YES if actual < {cap}\u00b0F"
+    elif st == "greater":
+        condition = f"YES if actual > {flr}\u00b0F"
+    else:
+        condition = "unknown"
+
     print(
         f"\n  Contract    : {row['contract_ticker']}\n"
-        f"  Threshold   : {row['threshold_f']}°F\n"
+        f"  Condition   : {condition}\n"
         f"  Direction   : {row['direction']}\n"
         f"  Alpha       : {float(row['alpha']):+.4f}\n"
         f"  Model prob  : {float(row['model_prob']):.4f}\n"
@@ -277,13 +296,25 @@ def run_session(dry_run: bool = False) -> int:
         effective_std,
     )
 
+    if not dry_run:
+        post_embed(
+            title="Deep Isobar \u2014 Morning run started",
+            color=COLOR_BLUE,
+            fields=[
+                {"name": "Target date",        "value": str(tomorrow)},
+                {"name": "GFS raw mean",       "value": f"{ensemble.ensemble_mean_f:.1f}\u00b0F"},
+                {"name": "Bias-corrected mean","value": f"{ensemble.bias_corrected_mean_f:.1f}\u00b0F"},
+                {"name": "Effective std",      "value": f"{effective_std:.1f}\u00b0F"},
+            ],
+        )
+
     # ── Live Kalshi contracts for tomorrow ────────────────────────────────
     all_contracts = fetch_live_contracts("Kalshi")
     tomorrow_contracts = [
         c for c in all_contracts
         if c.target_date == tomorrow
         and c.metric == METRIC
-        and c.comparison_operator == COMPARISON_OPERATOR
+        and c.strike_type in ("less", "greater")
     ]
 
     if not tomorrow_contracts:
@@ -302,18 +333,30 @@ def run_session(dry_run: bool = False) -> int:
     )
 
     # ── Probability surface ────────────────────────────────────────────────
-    thresholds = sorted({c.threshold_f for c in tomorrow_contracts})
-    probability_surface: dict[int, float] = {
-        thr: probability_ge_normal(
+    # Compute one model probability per contract using the correct formula
+    # for each strike_type.  The dict is keyed by threshold_f (unique after
+    # "between" contracts are filtered) for consumption by market_scanner.
+    probability_surface: dict[int, float] = {}
+    for _c in tomorrow_contracts:
+        probability_surface[_c.threshold_f] = probability_for_contract(
+            strike_type=_c.strike_type,
+            floor_strike=_c.floor_strike,
+            cap_strike=_c.cap_strike,
             mean_f=ensemble.bias_corrected_mean_f,
             std_f=effective_std,
-            threshold_f=float(thr),
         )
-        for thr in thresholds
-    }
+
+    def _surface_label(c) -> str:
+        if c.strike_type == "less":
+            return f"P(T<{c.cap_strike})"
+        if c.strike_type == "greater":
+            return f"P(T>{c.floor_strike})"
+        return f"P(?{c.threshold_f})"
+
     logger.info(
         "Probability surface: %s",
-        {thr: f"{p:.3f}" for thr, p in probability_surface.items()},
+        {_surface_label(_c): f"{probability_surface[_c.threshold_f]:.3f}"
+         for _c in sorted(tomorrow_contracts, key=lambda x: x.threshold_f)},
     )
 
     # ── Prepare CSV files ──────────────────────────────────────────────────
@@ -328,6 +371,7 @@ def run_session(dry_run: bool = False) -> int:
 
     for contract in sorted(tomorrow_contracts, key=lambda c: c.threshold_f):
         orderbook = fetch_orderbook_for_contract("Kalshi", contract.contract_id)
+        now_utc = datetime.now(timezone.utc)  # refresh after network call
 
         micro_score = compute_microstructure_score(orderbook, now_utc)
         tail_flag = is_tail_threshold(
@@ -377,6 +421,9 @@ def run_session(dry_run: bool = False) -> int:
             "realized_pnl": "",
             "settled_temp": "",
             "threshold_f": contract.threshold_f,
+            "strike_type": contract.strike_type,
+            "floor_strike": contract.floor_strike if contract.floor_strike is not None else "",
+            "cap_strike":   contract.cap_strike   if contract.cap_strike   is not None else "",
         }
 
         all_rows.append(row)
@@ -425,6 +472,30 @@ def run_session(dry_run: bool = False) -> int:
             if row["status"] == "OPEN":
                 signals_logged += 1
         return signals_logged
+
+    # ── Discord notifications ──────────────────────────────────────────────
+    open_rows = [r for r in all_rows if r["status"] == "OPEN"]
+    if open_rows:
+        for row in open_rows:
+            entry_str = f"{row['entry_price']}" if row["entry_price"] != "" else "—"
+            post_embed(
+                title=f"Signal: {row['contract_ticker']}",
+                color=COLOR_AMBER,
+                fields=[
+                    {"name": "Direction",    "value": row["direction"]},
+                    {"name": "Alpha",        "value": f"{row['alpha']:+.4f}"},
+                    {"name": "Model prob",   "value": f"{row['model_prob']:.4f}"},
+                    {"name": "Market prob",  "value": f"{row['market_prob']:.4f}"},
+                    {"name": "Entry price",  "value": entry_str},
+                    {"name": "Threshold",    "value": f"{row['threshold_f']:.0f}\u00b0F"},
+                ],
+            )
+    else:
+        post_embed(
+            title="No signals today",
+            description=f"No contracts met the |alpha| \u2265 {SIGNAL_THRESHOLD} threshold for {tomorrow}.",
+            color=COLOR_GRAY,
+        )
 
     # ── Write to CSV files ─────────────────────────────────────────────────
     signals_logged = 0

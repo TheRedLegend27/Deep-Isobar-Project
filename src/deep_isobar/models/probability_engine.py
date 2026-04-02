@@ -9,12 +9,24 @@ Canonical interface (from INTERFACES.md)::
     probability_ge_normal(mean_f, std_f, threshold_f) -> float  # P(T >= threshold)
     probability_le_normal(mean_f, std_f, threshold_f) -> float  # P(T <= threshold)
 
+Kalshi strike-type aware interface::
+
+    probability_for_contract(strike_type, floor_strike, cap_strike, mean_f, std_f)
+
 Both functions require ``std_f > 0`` and return values in ``[0.0, 1.0]``.
+
+Continuity corrections
+----------------------
+NWS Climatological Reports record daily high temperatures as whole integers
+(°F).  All contract boundary probabilities therefore apply a ±0.5°F
+continuity correction so that, e.g., P(T < 66) is computed as
+``norm.cdf(65.5, mean, std)`` rather than ``norm.cdf(66, mean, std)``.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from scipy.stats import norm
 
@@ -47,6 +59,81 @@ def probability_ge_normal(mean_f: float, std_f: float, threshold_f: float) -> fl
     logger.debug(
         "probability_ge_normal  mean=%.1f std=%.2f threshold=%.1f → %.4f",
         mean_f, std_f, threshold_f, prob,
+    )
+    return prob
+
+
+def probability_for_contract(
+    strike_type: str,
+    floor_strike: Optional[int],
+    cap_strike: Optional[int],
+    mean_f: float,
+    std_f: float,
+) -> float:
+    """Compute model YES-probability for a Kalshi KXHIGHCHI-style contract.
+
+    Applies ±0.5°F continuity corrections because NWS reports temperatures
+    as whole integers.
+
+    Settlement rules by ``strike_type``:
+
+    - ``"less"``    : YES if ``actual < cap_strike``
+      → ``P(X < cap) = norm.cdf(cap − 0.5, mean, std)``
+    - ``"greater"`` : YES if ``actual > floor_strike``
+      → ``P(X > floor) = 1 − norm.cdf(floor + 0.5, mean, std)``
+
+    ``"between"`` contracts should be filtered upstream and are not supported
+    here.
+
+    Args:
+        strike_type: Kalshi settlement type — ``"less"`` or ``"greater"``.
+        floor_strike: Lower boundary in °F; required for ``"greater"``.
+        cap_strike: Upper boundary in °F; required for ``"less"``.
+        mean_f: Ensemble forecast mean in °F.
+        std_f: Ensemble forecast standard deviation in °F.  Must be > 0.
+
+    Returns:
+        YES-probability in ``[0.0, 1.0]``.
+
+    Raises:
+        ValueError: If *std_f* is not positive, *strike_type* is not
+            ``"less"`` or ``"greater"``, or a required boundary is ``None``.
+
+    Example::
+
+        # T60 contract (less, cap=60): P(actual < 60)
+        p = probability_for_contract("less", None, 60, mean_f=65.0, std_f=5.5)
+        # → norm.cdf(59.5, 65.0, 5.5) ≈ 0.159
+
+        # T67 contract (greater, floor=67): P(actual > 67)
+        p = probability_for_contract("greater", 67, None, mean_f=65.0, std_f=5.5)
+        # → 1 - norm.cdf(67.5, 65.0, 5.5) ≈ 0.325
+    """
+    if std_f <= 0:
+        raise ValueError(f"std_f must be positive, got {std_f}")
+
+    st = strike_type.lower()
+    if st == "less":
+        if cap_strike is None:
+            raise ValueError("cap_strike is required for strike_type='less'")
+        # P(actual < cap) ≈ P(X ≤ cap − 1) with integer rounding → cdf(cap − 0.5)
+        prob = float(norm.cdf(cap_strike - 0.5, loc=mean_f, scale=std_f))
+    elif st == "greater":
+        if floor_strike is None:
+            raise ValueError("floor_strike is required for strike_type='greater'")
+        # P(actual > floor) ≈ P(X ≥ floor + 1) → 1 − cdf(floor + 0.5)
+        prob = float(1.0 - norm.cdf(floor_strike + 0.5, loc=mean_f, scale=std_f))
+    else:
+        raise ValueError(
+            f"Unsupported strike_type {strike_type!r}. "
+            "Only 'less' and 'greater' are supported; filter 'between' upstream."
+        )
+
+    prob = max(0.0, min(1.0, prob))
+    logger.debug(
+        "probability_for_contract  strike_type=%s floor=%s cap=%s "
+        "mean=%.1f std=%.2f → %.4f",
+        strike_type, floor_strike, cap_strike, mean_f, std_f, prob,
     )
     return prob
 

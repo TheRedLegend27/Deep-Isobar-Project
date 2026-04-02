@@ -3,7 +3,7 @@ __pycache__/
 .pytest_cache/
 .env
 *.pyc
-data/
+/data/
 
 # API credentials — never commit real keys
 keys/

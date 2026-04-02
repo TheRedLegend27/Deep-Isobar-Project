@@ -22,10 +22,12 @@ import argparse
 import json
 import logging
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from pathlib import Path
 
 import pandas as pd
+
+from deep_isobar.notifications.discord_notifier import COLOR_BLUE, post_embed
 
 logger = logging.getLogger(__name__)
 
@@ -571,6 +573,20 @@ def generate(output_path: Path = _DASHBOARD_HTML) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
     logger.info("Dashboard written to %s", output_path)
+
+    win_rate_str = f"{stats['win_rate'] * 100:.1f}%" if stats["settled_trades"] > 0 else "—"
+    post_embed(
+        title=f"Dashboard updated \u2014 {date.today()}",
+        color=COLOR_BLUE,
+        fields=[
+            {"name": "Total trades",    "value": str(stats["total_trades"])},
+            {"name": "Open positions",  "value": str(stats["open_count"])},
+            {"name": "Win rate",        "value": win_rate_str},
+            {"name": "Net P&L",         "value": f"{stats['net_pnl']:+.4f}"},
+            {"name": "Avg alpha",       "value": f"{stats['avg_alpha']:+.4f}"},
+            {"name": "File",            "value": "data/paper_trades/dashboard.html", "inline": False},
+        ],
+    )
 
     return output_path
 
