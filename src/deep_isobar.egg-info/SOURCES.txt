@@ -20,6 +20,7 @@ src/deep_isobar/data/historical_noaa_ingest.py
 src/deep_isobar/data/weather_ingest.py
 src/deep_isobar/market/__init__.py
 src/deep_isobar/market/contract_generator.py
+src/deep_isobar/market/historical_kalshi_ingest.py
 src/deep_isobar/market/kalshi_client.py
 src/deep_isobar/market/market_lag_detection.py
 src/deep_isobar/market/market_price_adapter.py
@@ -36,7 +37,10 @@ src/deep_isobar/models/temperature_ensemble.py
 src/deep_isobar/research/__init__.py
 src/deep_isobar/research/backtest_engine.py
 src/deep_isobar/research/mispriced_weather_markets.py
+src/deep_isobar/research/portfolio_backtester.py
 src/deep_isobar/research/run_chicago_backtest.py
+src/deep_isobar/research/run_dallas_backtest.py
+src/deep_isobar/research/run_nyc_backtest.py
 src/deep_isobar/trading/__init__.py
 src/deep_isobar/trading/alpha_engine.py
 src/deep_isobar/trading/distribution_tail_alpha.py

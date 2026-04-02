@@ -67,6 +67,9 @@ class CityProfile:
     model_weight_nam: Optional[float] = None
     heat_bias_adjustment_f: float = 0.0
     cold_bias_adjustment_f: float = 0.0
+    sep_climate_normal_f: Optional[float] = None
+    sep_anomaly_trigger_f: Optional[float] = None
+    lead_decay_halflife_hours: float = 48.0
 
 
 @dataclass

@@ -7,21 +7,27 @@ cities:
     station_id: KORD
     settlement_source: NWS
     active: true
-    # --- Calibrated 2026-03-17 from CHI backtest run (90-day summer window) ---
-    # Backtest results before calibration: win_rate=83.3%, gross_pnl=49.87,
-    # max_drawdown=5.32, total_trades=36 (>= 80°F win_rate=80.0%, >= 90°F 87.5%)
-    # Error analysis: GFS mean_error=+1.50°F rmse=3.16°F;
-    #                 ECMWF mean_error=+0.44°F rmse=1.87°F
-    # Weighted bias (GFS×0.35 + ECMWF×0.50): +0.87°F warm → correction -0.9°F
-    variance_multiplier: 1.36
-    mean_bias_correction_f: 2.04
+    # --- Calibrated 2026-04-01 from CHI train/test split (May–Jul 2023 calibration window) ---
+    # Derived by run_chicago_backtest.py phase 2: neutral-profile pass over May–Jul 2023,
+    # then bias = -mean(forecast − actual), variance_multiplier = RMSE_after_bias / mean_effective_std.
+    # heat/cold_bias_adjustment_f zeroed out — bias is fully absorbed into mean_bias_correction_f.
+    # Previous values (2026-03-17): mean_bias_correction_f=2.04, variance_multiplier=1.36,
+    #                                heat_bias_adjustment_f=-0.3
+    variance_multiplier: 0.6364
+    mean_bias_correction_f: 3.7329
     kde_bandwidth: 5.5
     tail_multiplier: 1.3
     model_weight_gfs: 0.35
     model_weight_ecmwf: 0.50
     model_weight_nam: 0.15
-    heat_bias_adjustment_f: -0.3
+    heat_bias_adjustment_f: 0.0
     cold_bias_adjustment_f: 0.0
+    # September climate normal and anomaly trigger for conditional heat-bias adjustment.
+    # 1991-2020 NOAA normal mean daily high at KORD for September = 72.7°F.
+    # When observed Sep mean daily high exceeds normal by > 5°F, an additional
+    # -2.0°F heat_bias_adjustment_f is applied in the OOT accuracy report.
+    sep_climate_normal_f: 72.7
+    sep_anomaly_trigger_f: 5.0
 
   - city: New York
     city_code: NYC

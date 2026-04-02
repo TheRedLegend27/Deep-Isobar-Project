@@ -9,3 +9,4 @@ PyYAML
 loguru
 python-dateutil
 cryptography
+python-dotenv

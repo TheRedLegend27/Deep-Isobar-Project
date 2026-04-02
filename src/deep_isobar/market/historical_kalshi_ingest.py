@@ -501,6 +501,165 @@ def _build_live_market_contract(market: dict[str, Any]) -> dict[str, Any] | None
 
 
 # ---------------------------------------------------------------------------
+# Series discovery  (--discover mode)
+# ---------------------------------------------------------------------------
+
+
+_DISCOVER_CANDIDATES = [
+    # Current and historical Kalshi Chicago high-temperature series names.
+    # The KX prefix was dropped for some series around 2023–2024.
+    "KXHIGHCHI",   # original 2023 name
+    "HIGHCHI",     # KX-dropped variant (already in _SERIES_METADATA)
+    "KXCHI",       # possible alternate prefix
+    "CHIHIGH",
+    "HIGHTEMP",
+    "KXHIGH",
+    "CHIHI",
+    "KXWX",        # possible weather umbrella series
+    "WXCHI",
+    "TEMPCHI",
+    "HIGHORD",     # O'Hare (KORD) based naming
+    "KXHIGHORD",
+]
+
+
+def discover_series(
+    start_date: date,
+    end_date: date,
+    keywords: list[str],
+    credentials: tuple[str, Any],
+    request_delay_s: float = _REQUEST_DELAY_S,
+) -> list[dict[str, Any]]:
+    """Probe candidate Chicago series tickers and return those with settled
+    contracts in the date range.
+
+    Strategy: query ``GET /markets?series_ticker=CANDIDATE&status=settled``
+    for each ticker in :data:`_DISCOVER_CANDIDATES` and for any extra
+    candidates derived from *keywords*.  This is O(N candidates) API calls
+    rather than a full market scan, so it completes in seconds.
+
+    Additionally performs one broad page scan (first page only) without
+    ``series_ticker`` to catch any series not in the candidate list, with
+    keyword filtering applied to ticker and title.
+
+    Args:
+        start_date: Inclusive lower bound on contract target date.
+        end_date:   Inclusive upper bound on contract target date.
+        keywords:   Case-insensitive substrings to match against ticker
+                    and title when scanning the broad first page.
+        credentials: ``(key_id, private_key)`` pair.
+        request_delay_s: Seconds between API calls.
+
+    Returns:
+        List of dicts, one per matching series, sorted by contract count
+        descending.  Keys: ``series``, ``sample_ticker``, ``title``,
+        ``contract_count``.
+    """
+    kw_lower = [k.lower() for k in keywords]
+    series_map: dict[str, dict[str, Any]] = {}
+
+    min_ts = int(datetime(start_date.year, start_date.month, start_date.day,
+                          tzinfo=timezone.utc).timestamp())
+    max_ts = int(datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59,
+                          tzinfo=timezone.utc).timestamp())
+
+    logger.info(
+        "Discovery probe: %d candidate series  %s to %s",
+        len(_DISCOVER_CANDIDATES), start_date, end_date,
+    )
+
+    # ── Phase A: probe each candidate series_ticker ────────────────────────
+    for candidate in _DISCOVER_CANDIDATES:
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "series_ticker": candidate,
+                "status": "settled",
+                "limit": _PAGE_LIMIT,
+                "min_close_ts": min_ts,
+                "max_close_ts": max_ts,
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                data = _kalshi_get(
+                    "/markets", params, credentials,
+                    request_delay_s=request_delay_s,
+                )
+            except RuntimeError as exc:
+                logger.debug("Candidate %s probe failed: %s", candidate, exc)
+                break
+
+            for market in data.get("markets", []):
+                ticker: str = market.get("ticker", "")
+                title: str = (
+                    market.get("title")
+                    or market.get("rules_primary")
+                    or ""
+                )
+                series_prefix = ticker.split("-")[0] if "-" in ticker else ticker
+                if series_prefix not in series_map:
+                    series_map[series_prefix] = {
+                        "series":         series_prefix,
+                        "sample_ticker":  ticker,
+                        "title":          title,
+                        "contract_count": 0,
+                    }
+                series_map[series_prefix]["contract_count"] += 1
+
+            cursor = data.get("cursor") or None
+            if not cursor:
+                break
+
+        if candidate in series_map or any(
+            s.startswith(candidate[:4]) for s in series_map
+        ):
+            logger.info("  [hit]  %s -> %d contracts", candidate,
+                        series_map.get(candidate, {}).get("contract_count", 0))
+        else:
+            logger.debug("  [miss] %s", candidate)
+
+    # ── Phase B: one broad first-page scan (catches unlisted candidates) ───
+    logger.info("Discovery Phase B: broad first-page scan (no series_ticker filter)")
+    try:
+        data = _kalshi_get(
+            "/markets",
+            {"status": "settled", "limit": _PAGE_LIMIT,
+             "min_close_ts": min_ts, "max_close_ts": max_ts},
+            credentials,
+            request_delay_s=request_delay_s,
+        )
+        for market in data.get("markets", []):
+            ticker = market.get("ticker", "")
+            title  = market.get("title") or market.get("rules_primary") or ""
+            if not any(kw in (ticker + " " + title).lower() for kw in kw_lower):
+                continue
+            series_prefix = ticker.split("-")[0] if "-" in ticker else ticker
+            if series_prefix not in series_map:
+                series_map[series_prefix] = {
+                    "series":         series_prefix,
+                    "sample_ticker":  ticker,
+                    "title":          title,
+                    "contract_count": 0,
+                }
+            series_map[series_prefix]["contract_count"] += 1
+    except RuntimeError as exc:
+        logger.warning("Phase B broad scan failed: %s", exc)
+
+    results = sorted(
+        series_map.values(),
+        key=lambda r: r["contract_count"],
+        reverse=True,
+    )
+    logger.info(
+        "Discovery complete: %d candidates probed, %d matching series found",
+        len(_DISCOVER_CANDIDATES), len(results),
+    )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -699,7 +858,7 @@ if __name__ == "__main__":
     )
 
     p = argparse.ArgumentParser(
-        description="Pull historical Kalshi KXHIGHCHI market data (bid/ask snapshots).",
+        description="Pull historical Kalshi market data (bid/ask snapshots).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--series", default="KXHIGHCHI",
@@ -716,6 +875,15 @@ if __name__ == "__main__":
     p.add_argument("--contracts-out",
                    default="data/historical/markets/kalshi_kxhighchi_2023_contracts.parquet",
                    help="Output Parquet path for live_market_contract data")
+    p.add_argument("--discover", action="store_true",
+                   help=(
+                       "Discovery mode: scan all settled markets in --start/--end "
+                       "and list series whose ticker or title contains 'CHI', 'HIGH', "
+                       "or 'TEMP'.  Prints ticker, title, and contract count.  "
+                       "Does not write any parquet file."
+                   ))
+    p.add_argument("--keywords", default="CHI,HIGH,TEMP",
+                   help="Comma-separated keywords for --discover filtering (case-insensitive)")
     args = p.parse_args()
 
     try:
@@ -725,6 +893,65 @@ if __name__ == "__main__":
         print(f"ERROR: Invalid date — {exc}", file=sys.stderr)
         sys.exit(1)
 
+    credentials = _load_credentials()
+    if credentials is None:
+        print(
+            "ERROR: Kalshi credentials not found.  Set KALSHI_API_KEY_ID and "
+            "KALSHI_PRIVATE_KEY_PATH (or KALSHI_PRIVATE_KEY) in your .env file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ── Discovery mode ─────────────────────────────────────────────────────
+    if args.discover:
+        keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
+        print(f"\nDiscovery scan: {start} to {end}  keywords={keywords}")
+        print("(no parquet files will be written)\n")
+
+        try:
+            results = discover_series(
+                start_date=start,
+                end_date=end,
+                keywords=keywords,
+                credentials=credentials,
+                request_delay_s=args.delay,
+            )
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        if not results:
+            print("No matching series found.")
+            sys.exit(0)
+
+        # Print table
+        col_w = (20, 45, 8)
+        header = (
+            f"{'SERIES':<{col_w[0]}}"
+            f"{'TITLE':<{col_w[1]}}"
+            f"{'CONTRACTS':>{col_w[2]}}"
+        )
+        print(header)
+        print("-" * sum(col_w))
+        for r in results:
+            title_trunc = r["title"][:col_w[1] - 1] if r["title"] else "(no title)"
+            print(
+                f"{r['series']:<{col_w[0]}}"
+                f"{title_trunc:<{col_w[1]}}"
+                f"{r['contract_count']:>{col_w[2]}}"
+            )
+        print("-" * sum(col_w))
+        print(f"{'Total series found:':<{col_w[0] + col_w[1]}}"
+              f"{len(results):>{col_w[2]}}")
+        print(
+            "\nTo ingest a series, re-run without --discover:\n"
+            f"  python -m deep_isobar.market.historical_kalshi_ingest "
+            f"--series <TICKER> --start {start} --end {end} "
+            f"--out data/historical/markets/kalshi_<ticker>_{start.year}.parquet"
+        )
+        sys.exit(0)
+
+    # ── Normal ingest mode ─────────────────────────────────────────────────
     try:
         snapshots, contracts = fetch_historical_market_data(
             series_ticker=args.series,

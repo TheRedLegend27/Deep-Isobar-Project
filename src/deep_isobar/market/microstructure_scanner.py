@@ -278,12 +278,14 @@ def compute_staleness_seconds(
         )
 
     delta = (now_utc - snap_ts).total_seconds()
-    if delta < 0:
+    if delta < -5.0:
         raise ValueError(
             f"now_utc ({now_utc.isoformat()}) is earlier than "
             f"snapshot.timestamp_utc ({snap_ts.isoformat()}); "
             "staleness cannot be negative"
         )
+    if delta < 0:
+        delta = 0.0  # sub-second clock skew, treat as fresh
 
     logger.debug(
         "compute_staleness_seconds: contract=%s timestamp=%s now=%s staleness=%.1fs",

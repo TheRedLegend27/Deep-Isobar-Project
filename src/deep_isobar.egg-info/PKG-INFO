@@ -15,6 +15,7 @@ Requires-Dist: PyYAML
 Requires-Dist: loguru
 Requires-Dist: python-dateutil
 Requires-Dist: cryptography
+Requires-Dist: python-dotenv
 
 # Deep Isobar
 

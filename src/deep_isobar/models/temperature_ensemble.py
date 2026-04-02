@@ -15,6 +15,7 @@ Canonical interface (from INTERFACES.md)::
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date, datetime
 
 from deep_isobar.core.types import CityProfile, EnsembleSummary, ForecastPoint
@@ -24,51 +25,136 @@ logger = logging.getLogger(__name__)
 
 _VALID_METRICS = {"high_temp_f", "low_temp_f"}
 
+# Lead-time activity windows (inclusive, in hours) per model source.
+_SOURCE_WINDOWS: dict[str, tuple[int, int]] = {
+    "NAM":   (6, 48),
+    "GFS":   (6, 240),
+    "ECMWF": (72, 240),
+}
+
+
+def get_lead_weights(
+    lead_hours: int | float,
+    sources: list[str],
+    halflife: float = 48.0,
+) -> dict[str, float]:
+    """Return normalized decay weights for *sources* at a given lead time.
+
+    Applies exponential lead-time decay and per-source activity windows, then
+    re-normalizes so weights sum to 1.0 across active sources.  Sources that
+    fall outside their activity window receive a weight of 0.0.
+
+    Args:
+        lead_hours: Forecast lead time in hours.
+        sources: Model names to include (e.g. ``["GFS", "ECMWF", "NAM"]``).
+        halflife: Decay half-life in hours (default 48).  Matches
+            ``CityProfile.lead_decay_halflife_hours``.
+
+    Returns:
+        ``{source: weight}`` dict with values summing to 1.0 for active
+        sources (or all-zero if every source is masked out).
+
+    Example::
+
+        weights = get_lead_weights(120, ["GFS", "ECMWF", "NAM"])
+        # NAM → 0.0 (beyond T+48); GFS and ECMWF share the remaining weight.
+    """
+    raw: dict[str, float] = {}
+    for src in sources:
+        window = _SOURCE_WINDOWS.get(src)
+        if window is not None:
+            lo, hi = window
+            in_window = lo <= lead_hours <= hi
+        else:
+            in_window = True  # unknown model: no mask applied
+        decay = math.exp(-lead_hours / halflife) if in_window else 0.0
+        raw[src] = decay
+
+    total = sum(raw.values())
+    if total == 0.0:
+        return {src: 0.0 for src in sources}
+    return {src: w / total for src, w in raw.items()}
+
 
 def _build_weights(
     city_profile: CityProfile,
     forecasts: list[ForecastPoint],
 ) -> tuple[list[float], str]:
-    """Compute normalized per-forecast weights and determine methodology.
+    """Compute normalized per-forecast weights with lead-time decay.
+
+    For each ForecastPoint:
+    1. Compute exponential decay: ``exp(-lead_hours / halflife)``
+    2. Apply source activity-window mask (zero outside the window)
+    3. Multiply by the city-profile static weight (if any are configured)
+    4. Re-normalize so all weights sum to 1.0
+
+    Source windows:
+    - NAM:   T+6 – T+48
+    - GFS:   T+6 – T+240
+    - ECMWF: T+72 – T+240
 
     Args:
-        city_profile: City configuration with optional per-model weights.
+        city_profile: City configuration with optional per-model weights and
+            ``lead_decay_halflife_hours``.
         forecasts: Non-empty list of ForecastPoints to weight.
 
     Returns:
         A tuple ``(weights, methodology)`` where *weights* is a list of
-        floats summing to 1.0 and *methodology* is either
-        ``"equal_weight_normal"`` or ``"weighted_normal"``.
+        floats summing to 1.0 and *methodology* is one of
+        ``"equal_weight_decay"`` or ``"weighted_decay"``.
     """
-    profile_weights = {
-        "GFS": city_profile.model_weight_gfs,
-        "ECMWF": city_profile.model_weight_ecmwf,
-        "NAM": city_profile.model_weight_nam,
-    }
+    halflife = city_profile.lead_decay_halflife_hours
 
+    profile_weights = {
+        "GFS":   city_profile.model_weight_gfs,
+        "ECMWF": city_profile.model_weight_ecmwf,
+        "NAM":   city_profile.model_weight_nam,
+    }
     all_none = all(v is None for v in profile_weights.values())
 
-    if all_none:
-        n = len(forecasts)
-        weights = [1.0 / n] * n
-        logger.debug("_build_weights: all profile weights None → equal weighting n=%d", n)
-        return weights, "equal_weight_normal"
+    raw_weights: list[float] = []
+    for fp in forecasts:
+        # ── Lead-time decay ───────────────────────────────────────────────
+        window = _SOURCE_WINDOWS.get(fp.model_name)
+        if window is not None:
+            lo, hi = window
+            in_window = lo <= fp.lead_hours <= hi
+        else:
+            in_window = True
+        decay = math.exp(-fp.lead_hours / halflife) if in_window else 0.0
 
-    # Use mapped weight if present; fall back to 1.0 for unknown/unconfigured models.
-    # Explicit None means "not configured" → fallback 1.0.
-    # Explicit 0.0 means "exclude this model" → keep 0.0.
-    raw_weights = [
-        1.0 if profile_weights.get(fp.model_name) is None else profile_weights[fp.model_name]
-        for fp in forecasts
-    ]
+        # ── Static profile weight ─────────────────────────────────────────
+        # Explicit None → "not configured" → fall back to 1.0
+        # Explicit 0.0  → "exclude this model" → keep 0.0
+        if all_none:
+            profile_w = 1.0
+        else:
+            configured = profile_weights.get(fp.model_name)
+            profile_w = 1.0 if configured is None else configured
+
+        raw_weights.append(profile_w * decay)
+
     total = sum(raw_weights)
+    if total == 0.0:
+        # Every source masked out at this lead time — fall back to equal.
+        n = len(forecasts)
+        logger.warning(
+            "_build_weights: all sources masked at lead_hours=%s → equal fallback",
+            [fp.lead_hours for fp in forecasts],
+        )
+        return [1.0 / n] * n, "equal_weight_decay"
+
     weights = [w / total for w in raw_weights]
+    methodology = "equal_weight_decay" if all_none else "weighted_decay"
     logger.debug(
-        "_build_weights: weighted methodology raw=%s normalized=%s",
-        raw_weights,
+        "_build_weights: halflife=%.0f lead_hours=%s raw=%s normalized=%s methodology=%s",
+        halflife,
+        [fp.lead_hours for fp in forecasts],
+        [round(w, 4) for w in raw_weights],
         [round(w, 4) for w in weights],
+        methodology,
     )
-    return weights, "weighted_normal"
+    return weights, methodology
 
 
 def build_temperature_ensemble(
