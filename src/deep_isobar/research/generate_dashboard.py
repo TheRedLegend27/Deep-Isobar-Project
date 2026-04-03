@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import webbrowser
 from datetime import datetime, timezone, date
 from pathlib import Path
@@ -538,6 +539,156 @@ document.getElementById("footer").textContent =
 
 
 # ---------------------------------------------------------------------------
+# Google Drive upload
+# ---------------------------------------------------------------------------
+
+_DRIVE_FOLDER_NAME = "Deep Isobar"
+_DRIVE_FILE_NAME = "dashboard.html"
+_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+
+def _build_drive_credentials():  # type: ignore[return]
+    """Return Google API credentials from env vars, or None if unavailable."""
+    try:
+        from google.oauth2 import service_account  # type: ignore
+        from google.oauth2.credentials import Credentials  # type: ignore
+    except ImportError:
+        logger.warning(
+            "google-api-python-client is not installed; skipping Drive upload. "
+            "Run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib"
+        )
+        return None
+
+    sa_json_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if sa_json_path:
+        sa_path = Path(sa_json_path)
+        if sa_path.exists():
+            return service_account.Credentials.from_service_account_file(
+                str(sa_path), scopes=_DRIVE_SCOPES
+            )
+        logger.warning(
+            "GOOGLE_SERVICE_ACCOUNT_JSON points to missing file: %s", sa_path
+        )
+
+    oauth_json_path = os.environ.get("GOOGLE_OAUTH_CREDENTIALS_JSON")
+    if oauth_json_path:
+        oauth_path = Path(oauth_json_path)
+        if oauth_path.exists():
+            token_data = json.loads(oauth_path.read_text(encoding="utf-8"))
+            return Credentials(
+                token=token_data.get("token"),
+                refresh_token=token_data.get("refresh_token"),
+                token_uri=token_data.get(
+                    "token_uri", "https://oauth2.googleapis.com/token"
+                ),
+                client_id=token_data.get("client_id"),
+                client_secret=token_data.get("client_secret"),
+                scopes=token_data.get("scopes", _DRIVE_SCOPES),
+            )
+        logger.warning(
+            "GOOGLE_OAUTH_CREDENTIALS_JSON points to missing file: %s", oauth_path
+        )
+
+    return None
+
+
+def _upload_to_drive(local_path: Path) -> str | None:
+    """Upload *local_path* to the 'Deep Isobar' folder in Google Drive.
+
+    Creates the folder if it doesn't exist.  Updates the file in-place if a
+    file named ``dashboard.html`` already exists in that folder.  Makes the
+    file publicly readable and returns its ``webViewLink``.
+
+    Returns None — and never raises — when credentials are unavailable or the
+    upload fails for any reason.
+    """
+    try:
+        from googleapiclient.discovery import build  # type: ignore
+        from googleapiclient.http import MediaFileUpload  # type: ignore
+    except ImportError:
+        logger.warning(
+            "google-api-python-client is not installed; skipping Drive upload. "
+            "Run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib"
+        )
+        return None
+
+    try:
+        creds = _build_drive_credentials()
+        if creds is None:
+            logger.warning(
+                "No Google credentials found. Set GOOGLE_SERVICE_ACCOUNT_JSON or "
+                "GOOGLE_OAUTH_CREDENTIALS_JSON to enable Drive upload."
+            )
+            return None
+
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        files_api = service.files()
+
+        # Find or create the "Deep Isobar" root folder
+        q_folder = (
+            f"name='{_DRIVE_FOLDER_NAME}' "
+            "and mimeType='application/vnd.google-apps.folder' "
+            "and 'root' in parents and trashed=false"
+        )
+        folder_resp = files_api.list(q=q_folder, fields="files(id)", pageSize=1).execute()
+        folders = folder_resp.get("files", [])
+
+        if folders:
+            folder_id = folders[0]["id"]
+        else:
+            folder_meta = {
+                "name": _DRIVE_FOLDER_NAME,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": ["root"],
+            }
+            folder = files_api.create(body=folder_meta, fields="id").execute()
+            folder_id = folder["id"]
+            logger.info("Created Drive folder '%s' (id=%s)", _DRIVE_FOLDER_NAME, folder_id)
+
+        # Find existing dashboard.html in that folder
+        q_file = (
+            f"name='{_DRIVE_FILE_NAME}' "
+            f"and '{folder_id}' in parents and trashed=false"
+        )
+        file_resp = files_api.list(q=q_file, fields="files(id)", pageSize=1).execute()
+        existing = file_resp.get("files", [])
+
+        media = MediaFileUpload(str(local_path), mimetype="text/html", resumable=False)
+
+        if existing:
+            file_id = existing[0]["id"]
+            result = files_api.update(
+                fileId=file_id,
+                media_body=media,
+                fields="id,webViewLink",
+            ).execute()
+            logger.info("Updated %s on Drive (id=%s)", _DRIVE_FILE_NAME, file_id)
+        else:
+            result = files_api.create(
+                body={"name": _DRIVE_FILE_NAME, "parents": [folder_id]},
+                media_body=media,
+                fields="id,webViewLink",
+            ).execute()
+            logger.info(
+                "Uploaded %s to Drive (id=%s)", _DRIVE_FILE_NAME, result.get("id")
+            )
+
+        file_id = result.get("id")
+
+        # Ensure the file is publicly readable
+        service.permissions().create(
+            fileId=file_id,
+            body={"role": "reader", "type": "anyone"},
+        ).execute()
+
+        return result.get("webViewLink") or ""
+
+    except Exception as exc:
+        logger.warning("Drive upload failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Dashboard generation
 # ---------------------------------------------------------------------------
 
@@ -574,7 +725,14 @@ def generate(output_path: Path = _DASHBOARD_HTML) -> Path:
     output_path.write_text(html, encoding="utf-8")
     logger.info("Dashboard written to %s", output_path)
 
+    drive_link = _upload_to_drive(output_path)
+
     win_rate_str = f"{stats['win_rate'] * 100:.1f}%" if stats["settled_trades"] > 0 else "—"
+    link_field = (
+        {"name": "Drive link", "value": drive_link, "inline": False}
+        if drive_link
+        else {"name": "File", "value": "data/paper_trades/dashboard.html", "inline": False}
+    )
     post_embed(
         title=f"Dashboard updated \u2014 {date.today()}",
         color=COLOR_BLUE,
@@ -584,7 +742,7 @@ def generate(output_path: Path = _DASHBOARD_HTML) -> Path:
             {"name": "Win rate",        "value": win_rate_str},
             {"name": "Net P&L",         "value": f"{stats['net_pnl']:+.4f}"},
             {"name": "Avg alpha",       "value": f"{stats['avg_alpha']:+.4f}"},
-            {"name": "File",            "value": "data/paper_trades/dashboard.html", "inline": False},
+            link_field,
         ],
     )
 
