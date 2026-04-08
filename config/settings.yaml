@@ -23,7 +23,7 @@ runtime:
     - "21:00-22:00"
 
 risk:
-  alpha_threshold: 0.10
+  alpha_threshold: 0.38
   max_position_per_contract: 100
   max_daily_exposure: 1000
 

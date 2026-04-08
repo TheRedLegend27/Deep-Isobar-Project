@@ -231,6 +231,20 @@ def build_temperature_ensemble(
     elif metric == "low_temp_f":
         bias_corrected_mean_f += city_profile.cold_bias_adjustment_f
 
+    # April spring cold-lake bias correction (live trading path).
+    # apr_anomaly_trigger_f: 0.0 means always apply; None means disabled.
+    if target_date.month == 4 and city_profile.apr_cold_bias_adjustment_f != 0.0:
+        if city_profile.apr_anomaly_trigger_f is not None:
+            bias_corrected_mean_f += city_profile.apr_cold_bias_adjustment_f
+            logger.info(
+                "April cold-lake correction applied: city=%s date=%s "
+                "adj=%.2fF → bias_corrected_mean=%.2fF",
+                city_profile.city,
+                target_date,
+                city_profile.apr_cold_bias_adjustment_f,
+                bias_corrected_mean_f,
+            )
+
     # ── Contributing models ───────────────────────────────────────────────
     contributing_models = sorted({fp.model_name for fp in forecasts})
 

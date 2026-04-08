@@ -21,19 +21,57 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import webbrowser
 from datetime import datetime, timezone, date
 from pathlib import Path
 
 import pandas as pd
+from dotenv import load_dotenv
 
 from deep_isobar.notifications.discord_notifier import COLOR_BLUE, post_embed
+
+load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load DISCORD_WEBHOOK_URL, etc.
 
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _PAPER_TRADES_CSV = _PROJECT_ROOT / "data" / "paper_trades" / "paper_trades.csv"
 _DASHBOARD_HTML = _PROJECT_ROOT / "data" / "paper_trades" / "dashboard.html"
+
+
+# ---------------------------------------------------------------------------
+# Discord file upload
+# ---------------------------------------------------------------------------
+
+
+def post_dashboard_to_discord(local_path: Path) -> bool:
+    """POST dashboard.html as a file attachment to the Discord webhook.
+
+    Reads DISCORD_WEBHOOK_URL from the environment.
+    Returns True on success, False on any failure.  Never raises.
+    """
+    import requests
+
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        logger.warning("DISCORD_WEBHOOK_URL not set; skipping Discord file upload")
+        return False
+
+    try:
+        with open(local_path, "rb") as fh:
+            resp = requests.post(
+                webhook_url,
+                data={"content": f"📊 Dashboard updated — {date.today()}"},
+                files={"file": ("dashboard.html", fh, "text/html")},
+                timeout=30,
+            )
+        resp.raise_for_status()
+        logger.info("Dashboard posted to Discord (HTTP %s)", resp.status_code)
+        return True
+    except Exception:
+        logger.warning("Discord file upload failed", exc_info=True)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -574,18 +612,22 @@ def generate(output_path: Path = _DASHBOARD_HTML) -> Path:
     output_path.write_text(html, encoding="utf-8")
     logger.info("Dashboard written to %s", output_path)
 
+    post_dashboard_to_discord(output_path)
+
     win_rate_str = f"{stats['win_rate'] * 100:.1f}%" if stats["settled_trades"] > 0 else "—"
+    fields = [
+        {"name": "Total trades",   "value": str(stats["total_trades"])},
+        {"name": "Open positions", "value": str(stats["open_count"])},
+        {"name": "Win rate",       "value": win_rate_str},
+        {"name": "Net P&L",        "value": f"{stats['net_pnl']:+.4f}"},
+        {"name": "Avg alpha",      "value": f"{stats['avg_alpha']:+.4f}"},
+        {"name": "File",           "value": "data/paper_trades/dashboard.html", "inline": False},
+    ]
+
     post_embed(
         title=f"Dashboard updated \u2014 {date.today()}",
         color=COLOR_BLUE,
-        fields=[
-            {"name": "Total trades",    "value": str(stats["total_trades"])},
-            {"name": "Open positions",  "value": str(stats["open_count"])},
-            {"name": "Win rate",        "value": win_rate_str},
-            {"name": "Net P&L",         "value": f"{stats['net_pnl']:+.4f}"},
-            {"name": "Avg alpha",       "value": f"{stats['avg_alpha']:+.4f}"},
-            {"name": "File",            "value": "data/paper_trades/dashboard.html", "inline": False},
-        ],
+        fields=fields,
     )
 
     return output_path

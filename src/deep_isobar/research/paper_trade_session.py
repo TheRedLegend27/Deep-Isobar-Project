@@ -41,6 +41,7 @@ import argparse
 import csv
 import logging
 import sys
+import traceback
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -72,6 +73,7 @@ from deep_isobar.notifications.discord_notifier import (
     COLOR_AMBER,
     COLOR_BLUE,
     COLOR_GRAY,
+    COLOR_RED,
     post_embed,
 )
 
@@ -254,7 +256,6 @@ def run_session(dry_run: bool = False) -> int:
     """
     today = date.today()
     tomorrow = today + timedelta(days=1)
-    now_utc = datetime.now(timezone.utc)
 
     logger.info("=== Paper trade session  target_date=%s ===", tomorrow)
 
@@ -309,229 +310,265 @@ def run_session(dry_run: bool = False) -> int:
         )
 
     # ── Live Kalshi contracts for tomorrow ────────────────────────────────
-    all_contracts = fetch_live_contracts("Kalshi")
-    tomorrow_contracts = [
-        c for c in all_contracts
-        if c.target_date == tomorrow
-        and c.metric == METRIC
-        and c.strike_type in ("less", "greater")
-    ]
+    try:
+        all_contracts = fetch_live_contracts("Kalshi")
+        tomorrow_contracts = [
+            c for c in all_contracts
+            if c.target_date == tomorrow
+            and c.metric == METRIC
+            and c.strike_type in ("less", "greater")
+        ]
 
-    if not tomorrow_contracts:
-        logger.warning(
-            "No active Kalshi high_temp_f contracts found for %s — "
-            "market may not be listed yet.",
+        if not tomorrow_contracts:
+            logger.warning(
+                "No active Kalshi high_temp_f contracts found for %s — "
+                "market may not be listed yet.",
+                tomorrow,
+            )
+            # Case 1: fetch returned nothing, or nothing matched the
+            # tomorrow / high_temp_f / less|greater filters.  The "No signals
+            # today" embed further below covers the distinct case where
+            # contracts exist but none clear the alpha threshold.
+            if not dry_run:
+                post_embed(
+                    title="No contracts found",
+                    description=(
+                        f"No active Kalshi high_temp_f contracts for {tomorrow}. "
+                        "The market may not be listed yet."
+                    ),
+                    color=COLOR_GRAY,
+                )
+            return 0
+
+        logger.info(
+            "Found %d contracts for %s: thresholds=%s",
+            len(tomorrow_contracts),
             tomorrow,
-        )
-        return 0
-
-    logger.info(
-        "Found %d contracts for %s: thresholds=%s",
-        len(tomorrow_contracts),
-        tomorrow,
-        sorted(c.threshold_f for c in tomorrow_contracts),
-    )
-
-    # ── Probability surface ────────────────────────────────────────────────
-    # Compute one model probability per contract using the correct formula
-    # for each strike_type.  The dict is keyed by threshold_f (unique after
-    # "between" contracts are filtered) for consumption by market_scanner.
-    probability_surface: dict[int, float] = {}
-    for _c in tomorrow_contracts:
-        probability_surface[_c.threshold_f] = probability_for_contract(
-            strike_type=_c.strike_type,
-            floor_strike=_c.floor_strike,
-            cap_strike=_c.cap_strike,
-            mean_f=ensemble.bias_corrected_mean_f,
-            std_f=effective_std,
+            sorted(c.threshold_f for c in tomorrow_contracts),
         )
 
-    def _surface_label(c) -> str:
-        if c.strike_type == "less":
-            return f"P(T<{c.cap_strike})"
-        if c.strike_type == "greater":
-            return f"P(T>{c.floor_strike})"
-        return f"P(?{c.threshold_f})"
+        # ── Probability surface ────────────────────────────────────────────────
+        # Compute one model probability per contract using the correct formula
+        # for each strike_type.  The dict is keyed by threshold_f (unique after
+        # "between" contracts are filtered) for consumption by market_scanner.
+        probability_surface: dict[int, float] = {}
+        for _c in tomorrow_contracts:
+            probability_surface[_c.threshold_f] = probability_for_contract(
+                strike_type=_c.strike_type,
+                floor_strike=_c.floor_strike,
+                cap_strike=_c.cap_strike,
+                mean_f=ensemble.bias_corrected_mean_f,
+                std_f=effective_std,
+            )
 
-    logger.info(
-        "Probability surface: %s",
-        {_surface_label(_c): f"{probability_surface[_c.threshold_f]:.3f}"
-         for _c in sorted(tomorrow_contracts, key=lambda x: x.threshold_f)},
-    )
+        def _surface_label(c) -> str:
+            if c.strike_type == "less":
+                return f"P(T<{c.cap_strike})"
+            if c.strike_type == "greater":
+                return f"P(T>{c.floor_strike})"
+            return f"P(?{c.threshold_f})"
 
-    # ── Prepare CSV files ──────────────────────────────────────────────────
-    if not dry_run:
-        _ensure_csv(_PAPER_TRADES_CSV)
-        _ensure_csv(_DAILY_LOG_CSV)
-
-    # ── Evaluate each contract ─────────────────────────────────────────────
-    # Collect all rows first so we can deduplicate before writing.
-    all_rows: list[dict] = []
-    dry_run_signals: list[tuple[dict, object, object]] = []  # (row, signal, orderbook)
-
-    for contract in sorted(tomorrow_contracts, key=lambda c: c.threshold_f):
-        orderbook = fetch_orderbook_for_contract("Kalshi", contract.contract_id)
-        now_utc = datetime.now(timezone.utc)  # refresh after network call
-
-        micro_score = compute_microstructure_score(orderbook, now_utc)
-        tail_flag = is_tail_threshold(
-            ensemble_mean_f=ensemble.bias_corrected_mean_f,
-            threshold_f=contract.threshold_f,
-            adjusted_std_f=effective_std,
+        logger.info(
+            "Probability surface: %s",
+            {_surface_label(_c): f"{probability_surface[_c.threshold_f]:.3f}"
+             for _c in sorted(tomorrow_contracts, key=lambda x: x.threshold_f)},
         )
 
-        signal = evaluate_contract_opportunity(
-            contract=contract,
-            probability_surface=probability_surface,
-            orderbook=orderbook,
-            signal_threshold=SIGNAL_THRESHOLD,
-            timestamp_utc=now_utc,
-            microstructure_score=micro_score,
-            tail_opportunity_flag=tail_flag,
-            tail_multiplier=city_profile.tail_multiplier,
-        )
+        # ── Evaluate each contract ─────────────────────────────────────────────
+        # Collect all rows first so we can deduplicate before writing.
+        all_rows: list[dict] = []
+        dry_run_signals: list[tuple[dict, object, object]] = []  # (row, signal, orderbook)
 
-        # Entry price: cross the spread at execution side
-        if signal.signal_side == "BUY":
-            entry_price = orderbook.best_ask
-        elif signal.signal_side == "SELL":
-            entry_price = orderbook.best_bid
-        else:
-            # HOLD — record mid for the daily log
-            if orderbook.best_bid is not None and orderbook.best_ask is not None:
-                entry_price = (orderbook.best_bid + orderbook.best_ask) / 2.0
+        for contract in sorted(tomorrow_contracts, key=lambda c: c.threshold_f):
+            orderbook = fetch_orderbook_for_contract("Kalshi", contract.contract_id)
+            now_utc = datetime.now(timezone.utc)  # refresh after network call
+
+            micro_score = compute_microstructure_score(orderbook, now_utc)
+            tail_flag = is_tail_threshold(
+                ensemble_mean_f=ensemble.bias_corrected_mean_f,
+                threshold_f=contract.threshold_f,
+                adjusted_std_f=effective_std,
+            )
+
+            signal = evaluate_contract_opportunity(
+                contract=contract,
+                probability_surface=probability_surface,
+                orderbook=orderbook,
+                signal_threshold=SIGNAL_THRESHOLD,
+                timestamp_utc=now_utc,
+                microstructure_score=micro_score,
+                tail_opportunity_flag=tail_flag,
+                tail_multiplier=city_profile.tail_multiplier,
+            )
+
+            # Entry price: cross the spread at execution side
+            if signal.signal_side == "BUY":
+                entry_price = orderbook.best_ask
+            elif signal.signal_side == "SELL":
+                entry_price = orderbook.best_bid
             else:
-                entry_price = orderbook.best_bid or orderbook.best_ask
+                # HOLD — record mid for the daily log
+                if orderbook.best_bid is not None and orderbook.best_ask is not None:
+                    entry_price = (orderbook.best_bid + orderbook.best_ask) / 2.0
+                else:
+                    entry_price = orderbook.best_bid or orderbook.best_ask
 
-        is_trade = (
-            signal.signal_side != "HOLD"
-            and abs(signal.alpha) >= SIGNAL_THRESHOLD
-        )
+            is_trade = (
+                signal.signal_side != "HOLD"
+                and abs(signal.alpha) >= SIGNAL_THRESHOLD
+            )
 
-        row: dict = {
-            "date": str(tomorrow),
-            "contract_ticker": contract.contract_id,
-            "direction": signal.signal_side,
-            "alpha": round(signal.alpha, 6),
-            "model_prob": round(signal.model_probability, 6),
-            "market_prob": round(signal.market_probability, 6),
-            "entry_price": round(entry_price, 6) if entry_price is not None else "",
-            "position_size": POSITION_SIZE,
-            "status": "OPEN" if is_trade else "NO_SIGNAL",
-            "realized_pnl": "",
-            "settled_temp": "",
-            "threshold_f": contract.threshold_f,
-            "strike_type": contract.strike_type,
-            "floor_strike": contract.floor_strike if contract.floor_strike is not None else "",
-            "cap_strike":   contract.cap_strike   if contract.cap_strike   is not None else "",
-        }
+            row: dict = {
+                "date": str(tomorrow),
+                "contract_ticker": contract.contract_id,
+                "direction": signal.signal_side,
+                "alpha": round(signal.alpha, 6),
+                "model_prob": round(signal.model_probability, 6),
+                "market_prob": round(signal.market_probability, 6),
+                "entry_price": round(entry_price, 6) if entry_price is not None else "",
+                "position_size": POSITION_SIZE,
+                "status": "OPEN" if is_trade else "NO_SIGNAL",
+                "realized_pnl": "",
+                "settled_temp": "",
+                "threshold_f": contract.threshold_f,
+                "strike_type": contract.strike_type,
+                "floor_strike": contract.floor_strike if contract.floor_strike is not None else "",
+                "cap_strike":   contract.cap_strike   if contract.cap_strike   is not None else "",
+            }
 
-        all_rows.append(row)
-        if dry_run:
-            dry_run_signals.append((row, signal, orderbook))
+            all_rows.append(row)
+            if dry_run:
+                dry_run_signals.append((row, signal, orderbook))
 
-    # ── Deduplicate trade signals ──────────────────────────────────────────
-    # For each (threshold_f, direction) pair keep only the highest-alpha signal.
-    # key → best row seen so far
-    best_by_key: dict[tuple, dict] = {}
-    for row in all_rows:
-        if row["status"] != "OPEN":
-            continue
-        key = (row["threshold_f"], row["direction"])
-        existing = best_by_key.get(key)
-        if existing is None or abs(row["alpha"]) > abs(existing["alpha"]):
-            if existing is not None:
+        # ── Deduplicate trade signals ──────────────────────────────────────────
+        # For each (threshold_f, direction) pair keep only the highest-alpha signal.
+        # key → best row seen so far
+        best_by_key: dict[tuple, dict] = {}
+        for row in all_rows:
+            if row["status"] != "OPEN":
+                continue
+            key = (row["threshold_f"], row["direction"])
+            existing = best_by_key.get(key)
+            if existing is None or abs(row["alpha"]) > abs(existing["alpha"]):
+                if existing is not None:
+                    logger.warning(
+                        "Dropping duplicate signal: %s (threshold=%.0f°F already covered"
+                        " by %s with higher alpha)",
+                        existing["contract_ticker"],
+                        existing["threshold_f"],
+                        row["contract_ticker"],
+                    )
+                best_by_key[key] = row
+            else:
                 logger.warning(
                     "Dropping duplicate signal: %s (threshold=%.0f°F already covered"
                     " by %s with higher alpha)",
-                    existing["contract_ticker"],
-                    existing["threshold_f"],
                     row["contract_ticker"],
+                    row["threshold_f"],
+                    existing["contract_ticker"],
                 )
-            best_by_key[key] = row
+
+        # Mark dropped duplicates so the daily log reflects the dedup decision
+        winning_tickers = {r["contract_ticker"] for r in best_by_key.values()}
+        for row in all_rows:
+            if row["status"] == "OPEN" and row["contract_ticker"] not in winning_tickers:
+                row["status"] = "DEDUP_DROP"
+
+        # ── Dry-run output ─────────────────────────────────────────────────────
+        if dry_run:
+            signals_logged = 0
+            for row, signal, orderbook in dry_run_signals:
+                _print_signal(row, signal, orderbook)
+                if row["status"] == "OPEN":
+                    signals_logged += 1
+            return signals_logged
+
+        # ── Discord notifications ──────────────────────────────────────────────
+        open_rows = [r for r in all_rows if r["status"] == "OPEN"]
+        if open_rows:
+            for row in open_rows:
+                entry_str = f"{row['entry_price']}" if row["entry_price"] != "" else "—"
+                post_embed(
+                    title=f"Signal: {row['contract_ticker']}",
+                    color=COLOR_AMBER,
+                    fields=[
+                        {"name": "Direction",    "value": row["direction"]},
+                        {"name": "Alpha",        "value": f"{row['alpha']:+.4f}"},
+                        {"name": "Model prob",   "value": f"{row['model_prob']:.4f}"},
+                        {"name": "Market prob",  "value": f"{row['market_prob']:.4f}"},
+                        {"name": "Entry price",  "value": entry_str},
+                        {"name": "Threshold",    "value": f"{row['threshold_f']:.0f}\u00b0F"},
+                    ],
+                )
         else:
-            logger.warning(
-                "Dropping duplicate signal: %s (threshold=%.0f°F already covered"
-                " by %s with higher alpha)",
-                row["contract_ticker"],
-                row["threshold_f"],
-                existing["contract_ticker"],
-            )
-
-    # Mark dropped duplicates so the daily log reflects the dedup decision
-    winning_tickers = {r["contract_ticker"] for r in best_by_key.values()}
-    for row in all_rows:
-        if row["status"] == "OPEN" and row["contract_ticker"] not in winning_tickers:
-            row["status"] = "DEDUP_DROP"
-
-    # ── Dry-run output ─────────────────────────────────────────────────────
-    if dry_run:
-        signals_logged = 0
-        for row, signal, orderbook in dry_run_signals:
-            _print_signal(row, signal, orderbook)
-            if row["status"] == "OPEN":
-                signals_logged += 1
-        return signals_logged
-
-    # ── Discord notifications ──────────────────────────────────────────────
-    open_rows = [r for r in all_rows if r["status"] == "OPEN"]
-    if open_rows:
-        for row in open_rows:
-            entry_str = f"{row['entry_price']}" if row["entry_price"] != "" else "—"
             post_embed(
-                title=f"Signal: {row['contract_ticker']}",
-                color=COLOR_AMBER,
-                fields=[
-                    {"name": "Direction",    "value": row["direction"]},
-                    {"name": "Alpha",        "value": f"{row['alpha']:+.4f}"},
-                    {"name": "Model prob",   "value": f"{row['model_prob']:.4f}"},
-                    {"name": "Market prob",  "value": f"{row['market_prob']:.4f}"},
-                    {"name": "Entry price",  "value": entry_str},
-                    {"name": "Threshold",    "value": f"{row['threshold_f']:.0f}\u00b0F"},
-                ],
+                title="No signals today",
+                description=f"No contracts met the |alpha| \u2265 {SIGNAL_THRESHOLD} threshold for {tomorrow}.",
+                color=COLOR_GRAY,
             )
-    else:
-        post_embed(
-            title="No signals today",
-            description=f"No contracts met the |alpha| \u2265 {SIGNAL_THRESHOLD} threshold for {tomorrow}.",
-            color=COLOR_GRAY,
+
+        # ── Write to CSV files ─────────────────────────────────────────────────
+        signals_logged = 0
+        _ensure_csv(_PAPER_TRADES_CSV)
+        _ensure_csv(_DAILY_LOG_CSV)
+
+        for row in all_rows:
+            # Always record every evaluated contract in the daily log
+            _append_csv_row(_DAILY_LOG_CSV, row)
+
+            if row["status"] == "OPEN":
+                _append_csv_row(_PAPER_TRADES_CSV, row)
+                signals_logged += 1
+                logger.info(
+                    "TRADE LOGGED: %s %s  alpha=%+.3f  entry=%s  threshold=%.0f°F",
+                    row["direction"],
+                    row["contract_ticker"],
+                    row["alpha"],
+                    row["entry_price"] or 0.0,
+                    row["threshold_f"],
+                )
+            else:
+                logger.info(
+                    "No trade: %-35s  alpha=%+.3f  side=%s  status=%s",
+                    row["contract_ticker"],
+                    row["alpha"],
+                    row["direction"],
+                    row["status"],
+                )
+
+        logger.info(
+            "Session complete: %d trade(s) logged to %s",
+            signals_logged, _PAPER_TRADES_CSV,
         )
 
-    # ── Write to CSV files ─────────────────────────────────────────────────
-    signals_logged = 0
-    _ensure_csv(_PAPER_TRADES_CSV)
-    _ensure_csv(_DAILY_LOG_CSV)
+        return signals_logged
 
-    for row in all_rows:
-        # Always record every evaluated contract in the daily log
-        _append_csv_row(_DAILY_LOG_CSV, row)
+    except Exception as exc:  # noqa: BLE001
+        # Discord embed field values are capped at 1024 chars; 8 reserved for
+        # the ``` fences added below.  Shed outermost lines until it fits so
+        # we never cut mid-line (innermost frames are most useful).
+        tb_lines = traceback.format_exc().splitlines()[-20:]
+        while tb_lines and len("\n".join(tb_lines)) > 1016:
+            tb_lines.pop(0)
+        tb_truncated = "\n".join(tb_lines)
+        exc_type = type(exc).__name__
 
-        if row["status"] == "OPEN":
-            _append_csv_row(_PAPER_TRADES_CSV, row)
-            signals_logged += 1
-            logger.info(
-                "TRADE LOGGED: %s %s  alpha=%+.3f  entry=%s  threshold=%.0f°F",
-                row["direction"],
-                row["contract_ticker"],
-                row["alpha"],
-                row["entry_price"] or 0.0,
-                row["threshold_f"],
+        logger.exception("Unhandled exception in contract evaluation loop")
+
+        try:
+            post_embed(
+                title="Session crashed \u2014 unhandled exception",
+                color=COLOR_RED,
+                fields=[
+                    {"name": "Exception type", "value": exc_type},
+                    {"name": "Message",        "value": str(exc) or "(no message)"},
+                    {"name": "Traceback (tail)", "value": f"```\n{tb_truncated}\n```"},
+                ],
             )
-        else:
-            logger.info(
-                "No trade: %-35s  alpha=%+.3f  side=%s  status=%s",
-                row["contract_ticker"],
-                row["alpha"],
-                row["direction"],
-                row["status"],
-            )
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to send error embed to Discord", exc_info=True)
 
-    logger.info(
-        "Session complete: %d trade(s) logged to %s",
-        signals_logged, _PAPER_TRADES_CSV,
-    )
-
-    return signals_logged
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
