@@ -18,6 +18,7 @@ import logging
 import math
 from datetime import date, datetime
 
+from deep_isobar.calibration import bias_loader
 from deep_isobar.core.types import CityProfile, EnsembleSummary, ForecastPoint
 from deep_isobar.models.forecast_volatility import compute_forecast_std
 
@@ -221,29 +222,19 @@ def build_temperature_ensemble(
     # ── Ensemble std (raw spread, unweighted) ─────────────────────────────
     ensemble_std_f = compute_forecast_std([fp.forecast_value_f for fp in forecasts])
 
-    # ── Variance adjustment ───────────────────────────────────────────────
-    adjusted_std_f = ensemble_std_f * city_profile.variance_multiplier
+    # ── Dynamic calibration lookup (per-station / per-month) ─────────────────
+    dynamic_bias_f, dynamic_variance_mult = bias_loader.get_current_bias(
+        city_profile.station_id, target_date.month
+    )
+    adjusted_std_f = ensemble_std_f * dynamic_variance_mult
 
     # ── Bias correction ───────────────────────────────────────────────────
-    bias_corrected_mean_f = ensemble_mean_f + city_profile.mean_bias_correction_f
+    bias_corrected_mean_f = ensemble_mean_f
     if metric == "high_temp_f":
         bias_corrected_mean_f += city_profile.heat_bias_adjustment_f
     elif metric == "low_temp_f":
         bias_corrected_mean_f += city_profile.cold_bias_adjustment_f
-
-    # April spring cold-lake bias correction (live trading path).
-    # apr_anomaly_trigger_f: 0.0 means always apply; None means disabled.
-    if target_date.month == 4 and city_profile.apr_cold_bias_adjustment_f != 0.0:
-        if city_profile.apr_anomaly_trigger_f is not None:
-            bias_corrected_mean_f += city_profile.apr_cold_bias_adjustment_f
-            logger.info(
-                "April cold-lake correction applied: city=%s date=%s "
-                "adj=%.2fF → bias_corrected_mean=%.2fF",
-                city_profile.city,
-                target_date,
-                city_profile.apr_cold_bias_adjustment_f,
-                bias_corrected_mean_f,
-            )
+    bias_corrected_mean_f += dynamic_bias_f
 
     # ── Contributing models ───────────────────────────────────────────────
     contributing_models = sorted({fp.model_name for fp in forecasts})
@@ -271,7 +262,7 @@ def build_temperature_ensemble(
         model_count=len(contributing_models),
         ensemble_mean_f=ensemble_mean_f,
         ensemble_std_f=ensemble_std_f,
-        variance_multiplier=city_profile.variance_multiplier,
+        variance_multiplier=dynamic_variance_mult,
         adjusted_std_f=adjusted_std_f,
         bias_corrected_mean_f=bias_corrected_mean_f,
         methodology=methodology,

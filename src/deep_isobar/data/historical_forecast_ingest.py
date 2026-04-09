@@ -13,10 +13,19 @@ Archive source
 AWS Open Data Registry (public, no authentication required):
 
     https://noaa-gfs-bdp-pds.s3.amazonaws.com/
-    gfs.YYYYMMDD/HH/atmos/gfs.tHHz.pgrb2.0p25.fFFF
-    gfs.YYYYMMDD/HH/atmos/gfs.tHHz.pgrb2.0p25.fFFF.idx
 
-Coverage: 2021-present.  August 2023 is confirmed available.
+NOAA inserted an ``atmos/`` subdirectory into the GFS archive path during a
+gradual migration.  The exact cutover varies by date and run; both layouts
+coexist for an indeterminate period.  ``_resolve_gfs_idx_url`` handles this
+transparently by trying ``atmos/`` first, then the bare path, returning the
+URL that returns HTTP 200.  If both return 404 the run is logged as an
+archive gap and skipped gracefully.
+
+  With atmos/:  gfs.YYYYMMDD/HH/atmos/gfs.tHHz.pgrb2.0p25.fFFF[.idx]
+  Without:      gfs.YYYYMMDD/HH/gfs.tHHz.pgrb2.0p25.fFFF[.idx]
+
+Coverage: confirmed available from roughly 2021 onward; some earlier dates
+exist but with more gaps.  August 2023 is confirmed complete.
 
 Lead-time schedule (18z UTC ≈ 1 pm CDT, afternoon-high proxy)
 --------------------------------------------------------------
@@ -56,7 +65,6 @@ from __future__ import annotations
 
 import calendar
 import logging
-import os
 import random
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -155,27 +163,46 @@ def _check_cfgrib() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _gfs_urls(run_date: date, cycle: str, fhour: int) -> tuple[str, str]:
-    """Return ``(grib2_url, idx_url)`` for one GFS run / forecast-hour pair.
+def _resolve_gfs_idx_url(
+    base_url: str,
+    date_str: str,
+    cycle: str,
+    fhour: str,
+) -> str | None:
+    """Probe S3 for the correct ``.idx`` URL, trying ``atmos/`` then bare path.
+
+    NOAA migrated the GFS archive layout gradually; the ``atmos/`` subdirectory
+    was inserted between the cycle directory and the filename, but the exact
+    cutover varies.  This function tries both layouts and returns whichever
+    returns HTTP 200.
 
     Args:
-        run_date: Calendar date of the model run initialisation.
-        cycle: Run cycle, either ``"00"`` or ``"12"``.
-        fhour: Forecast hour (e.g. ``42`` → ``f042``).
+        base_url: S3 bucket root (e.g. ``_AWS_BASE``).
+        date_str: Run date formatted as ``"YYYYMMDD"``.
+        cycle: Run cycle, ``"00"`` or ``"12"``.
+        fhour: Zero-padded forecast hour string, e.g. ``"042"``.
 
     Returns:
-        Two-tuple of ``(grib2_url, idx_url)`` as HTTPS strings.
+        The first ``.idx`` URL that returns HTTP 200, or ``None`` if both
+        return 404 (archive gap — caller should skip and warn).
 
     Example::
 
-        grib2_url, idx_url = _gfs_urls(date(2023, 8, 1), "00", 42)
-        # → "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.20230801/00/atmos/gfs.t00z.pgrb2.0p25.f042"
+        idx_url = _resolve_gfs_idx_url(_AWS_BASE, "20230801", "00", "042")
+        # → ".../gfs.20230801/00/atmos/gfs.t00z.pgrb2.0p25.f042.idx"
+        grib2_url = idx_url[:-4]  # strip ".idx"
     """
-    date_str = run_date.strftime("%Y%m%d")
-    fname = f"gfs.t{cycle}z.pgrb2.0p25.f{fhour:03d}"
-    path = f"gfs.{date_str}/{cycle}/atmos/{fname}"
-    base_url = f"{_AWS_BASE}/{path}"
-    return base_url, f"{base_url}.idx"
+    fname = f"gfs.t{cycle}z.pgrb2.0p25.f{fhour}.idx"
+    for subdir in ("atmos/", ""):
+        url = f"{base_url}/gfs.{date_str}/{cycle}/{subdir}{fname}"
+        try:
+            r = requests.head(url, timeout=10)
+        except requests.RequestException:
+            raise  # network error — don't silently try the other subdir
+        if r.status_code == 200:
+            return url
+        # 404 → try next layout; any other status is also non-fatal for resolution
+    return None
 
 
 def _cache_path(cache_dir: Path, run_date: date, cycle: str, fhour: int) -> Path:
@@ -426,7 +453,7 @@ def fetch_gfs_forecasts(
     cycle (``"00"`` or ``"12"``), for each ``lead_day`` (1–5).  For each
     combination the function:
 
-    1. Constructs AWS GRIB2 and idx URLs.
+    1. Resolves the correct AWS path (tries ``atmos/`` then bare) via HEAD.
     2. Fetches the idx to find the byte offset of ``TMP:2 m above ground``.
     3. Downloads only that GRIB2 record via an HTTP ``Range`` request.
     4. Caches the snippet locally (subsequent runs are instant).
@@ -514,6 +541,7 @@ def fetch_gfs_forecasts(
 
     for day in range(1, n_days + 1):
         run_date = date(year, month, day)
+        date_str = run_date.strftime("%Y%m%d")
 
         for cycle in cycles:
             run_time_utc = datetime(
@@ -524,32 +552,56 @@ def fetch_gfs_forecasts(
 
             for lead_day in lead_days:
                 fhour = _LEAD_FHOUR[cycle][lead_day]
+                fhour_str = f"{fhour:03d}"
                 target_date = run_date + timedelta(days=lead_day)
-                grib2_url, idx_url = _gfs_urls(run_date, cycle, fhour)
                 dest = _cache_path(cache_root, run_date, cycle, fhour)
 
-                # ── Download snippet (with 404-skip and corrupt-retry) ──────
-                try:
-                    _download_snippet(grib2_url, idx_url, dest)
-                except requests.HTTPError as exc:
-                    status = (
-                        exc.response.status_code
-                        if exc.response is not None
-                        else "?"
-                    )
-                    logger.warning(
-                        "HTTP %s for %s/%s f%03d — skipping",
-                        status, run_date, cycle, fhour,
-                    )
-                    skipped += 1
-                    continue
-                except ValueError as exc:
-                    logger.warning(
-                        "idx parse error for %s/%s f%03d: %s — skipping",
-                        run_date, cycle, fhour, exc,
-                    )
-                    skipped += 1
-                    continue
+                # ── Resolve URL and download if not cached ──────────────────
+                grib2_url: str | None = None
+                idx_url: str | None = None
+
+                if not dest.exists():
+                    try:
+                        idx_url = _resolve_gfs_idx_url(
+                            _AWS_BASE, date_str, cycle, fhour_str
+                        )
+                    except requests.RequestException as exc:
+                        logger.warning(
+                            "Network error resolving %s/%s f%s: %s — skipping",
+                            run_date, cycle, fhour_str, exc,
+                        )
+                        skipped += 1
+                        continue
+                    if idx_url is None:
+                        logger.warning(
+                            "HTTP 404 for %s/%s f%s — archive gap, skipping",
+                            run_date, cycle, fhour_str,
+                        )
+                        skipped += 1
+                        continue
+                    grib2_url = idx_url[:-4]  # strip ".idx"
+
+                    try:
+                        _download_snippet(grib2_url, idx_url, dest)
+                    except requests.HTTPError as exc:
+                        status = (
+                            exc.response.status_code
+                            if exc.response is not None
+                            else "?"
+                        )
+                        logger.warning(
+                            "HTTP %s for %s/%s f%s — skipping",
+                            status, run_date, cycle, fhour_str,
+                        )
+                        skipped += 1
+                        continue
+                    except ValueError as exc:
+                        logger.warning(
+                            "idx parse error for %s/%s f%s: %s — skipping",
+                            run_date, cycle, fhour_str, exc,
+                        )
+                        skipped += 1
+                        continue
 
                 # ── Extract temperature ─────────────────────────────────────
                 try:
@@ -560,6 +612,22 @@ def fetch_gfs_forecasts(
                         dest.name, exc,
                     )
                     dest.unlink(missing_ok=True)
+                    # Re-resolve URL if we came from a cache hit (grib2_url is None).
+                    if grib2_url is None:
+                        try:
+                            idx_url = _resolve_gfs_idx_url(
+                                _AWS_BASE, date_str, cycle, fhour_str
+                            )
+                        except requests.RequestException:
+                            idx_url = None
+                        if idx_url is None:
+                            logger.warning(
+                                "Cannot re-resolve URL for retry of %s — skipping",
+                                dest.name,
+                            )
+                            skipped += 1
+                            continue
+                        grib2_url = idx_url[:-4]
                     try:
                         _download_snippet(grib2_url, idx_url, dest)
                         t_f = _extract_fahrenheit(dest, city_lat, city_lon_360)
