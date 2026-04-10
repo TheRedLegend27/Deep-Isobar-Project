@@ -62,9 +62,12 @@ _CSV_DTYPES = {
     "alpha": float,
     "model_prob": float,
     "market_prob": float,
+    "ensemble_mean_f": float,
     "entry_price": float,
     "position_size": float,
     "threshold_f": float,
+    "anomaly_penalty_f": float,
+    "anomaly_adjusted_signal": float,
 }
 
 

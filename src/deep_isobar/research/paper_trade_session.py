@@ -22,10 +22,12 @@ Output files
 CSV schema
 ----------
 date, contract_ticker, direction, alpha, model_prob, market_prob,
-entry_price, position_size, status, realized_pnl, settled_temp, threshold_f
+ensemble_mean_f, entry_price, position_size, status, realized_pnl,
+settled_temp, threshold_f, strike_type, floor_strike, cap_strike,
+anomaly_flags, anomaly_penalty_f, anomaly_adjusted_signal,
+anomaly_confidence, anomaly_reasoning
 
-``threshold_f`` is an extra column (beyond the spec minimum) stored so
-``settle_paper_trades.py`` can settle without parsing the ticker string.
+See ``_CSV_COLUMNS`` for the authoritative list.
 
 GFS forecast note
 -----------------
@@ -206,11 +208,24 @@ def _fetch_live_gfs_t24(city_profile, run_date: date) -> list[ForecastPoint]:
 
 
 def _ensure_csv(path: Path) -> None:
-    """Create the CSV file with a header row if it does not already exist."""
+    """Create the CSV file with a header row if it does not already exist.
+
+    Raises RuntimeError if the file exists but its header doesn't match
+    _CSV_COLUMNS — schema drift must be resolved before running a session.
+    """
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", newline="") as fh:
             csv.DictWriter(fh, fieldnames=_CSV_COLUMNS).writeheader()
+        return
+    with path.open(newline="") as fh:
+        existing = next(csv.reader(fh), [])
+    if existing != _CSV_COLUMNS:
+        raise RuntimeError(
+            f"Schema mismatch in {path.name}: header has {len(existing)} columns "
+            f"but _CSV_COLUMNS defines {len(_CSV_COLUMNS)}. "
+            "Migrate the CSV to the new schema before running a session."
+        )
 
 
 def _append_csv_row(path: Path, row: dict) -> None:
@@ -451,7 +466,7 @@ def run_session(dry_run: bool = False) -> int:
                 if orderbook.best_bid is not None and orderbook.best_ask is not None:
                     entry_price = (orderbook.best_bid + orderbook.best_ask) / 2.0
                 else:
-                    entry_price = orderbook.best_bid or orderbook.best_ask
+                    entry_price = orderbook.best_bid if orderbook.best_bid is not None else orderbook.best_ask
 
             is_trade = (
                 signal.signal_side != "HOLD"
