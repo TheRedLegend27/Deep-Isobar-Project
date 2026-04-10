@@ -1,5 +1,56 @@
 # Deep Isobar
 
+## Quick Start
+
+**Prerequisites:** Python 3.11+, Node 18+, ecCodes / cfgrib (for GRIB2 parsing)
+
+```bash
+# Install Python deps
+pip install -r requirements.txt
+
+# Install dashboard deps
+cd dashboard_ui && npm install && cd ..
+
+# Copy and fill in credentials
+cp .env.example .env
+```
+
+Start everything with one command:
+
+```bash
+make up
+```
+
+| Service | URL |
+|---|---|
+| API health | http://localhost:8765/api/health |
+| Dashboard | http://localhost:5173 |
+
+**On LAN / phone:** replace `localhost` with your machine's local IP (e.g. `192.168.1.x`).
+
+**Windows (no Make):** double-click `start_all.bat` — opens both servers in separate windows.
+
+### Daily commands
+
+```bash
+make dry      # dry-run: score today's markets, print signals, place nothing
+make trade    # live paper-trade session (writes to data/paper_trades/)
+make settle   # settle yesterday's contracts against NOAA observed temps
+```
+
+### Other useful targets
+
+```bash
+make replay          # re-run KMDW historical calibration (2021-2024)
+make onboard-dallas  # onboard KDFW (Dallas) as a new city
+make audit           # print parquet row counts + April bias values
+make logs            # tail the most recent log file in data/paper_trades/
+make status          # today's date, last CSV row, last error row, API health
+make down            # kill both dev servers
+```
+
+---
+
 Autonomous weather-intelligence and prediction market trading system.
 
 Deep Isobar identifies **mispriced weather contracts** by comparing ensemble weather model probabilities against market-implied probabilities, then executes trades when the edge clears risk thresholds.
