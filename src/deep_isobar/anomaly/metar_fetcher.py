@@ -77,14 +77,16 @@ def parse_metar_fields(metar: str) -> dict:
         wind_dir = _deg_to_cardinal(int(wind_match.group(1)))
 
     # ── Visibility ──────────────────────────────────────────────────────────
+    # M prefix means "less than" (e.g. M1/4SM = < 0.25 mi); strip it and use
+    # the value as-is — it still represents near-zero visibility for our purposes.
     visibility_mi = 10.0
-    # Mixed fraction form: "1 1/4SM"
-    vis_mixed = re.search(r"\b(\d+)\s+(\d+)/(\d+)SM\b", body)
+    # Mixed fraction form: "1 1/4SM" or "M1 1/4SM"
+    vis_mixed = re.search(r"\bM?(\d+)\s+(\d+)/(\d+)SM\b", body)
     if vis_mixed:
         visibility_mi = int(vis_mixed.group(1)) + int(vis_mixed.group(2)) / int(vis_mixed.group(3))
     else:
-        # Pure fraction form: "1/4SM"
-        vis_frac = re.search(r"\b(\d+)/(\d+)SM\b", body)
+        # Pure fraction form: "1/4SM" or "M1/4SM"
+        vis_frac = re.search(r"\bM?(\d+)/(\d+)SM\b", body)
         if vis_frac:
             visibility_mi = int(vis_frac.group(1)) / int(vis_frac.group(2))
         else:
@@ -99,8 +101,6 @@ def parse_metar_fields(metar: str) -> dict:
         layer = sky_match.group(1)
         if _SKY_PRIORITY.get(layer, 0) > _SKY_PRIORITY.get(sky_cover, 0):
             sky_cover = layer
-    if sky_cover == "SKC":
-        sky_cover = "CLR"
 
     # ── Temperature ─────────────────────────────────────────────────────────
     # Format: TT/TD where M prefix means negative (M02 = -2°C)

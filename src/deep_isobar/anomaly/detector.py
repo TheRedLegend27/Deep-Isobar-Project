@@ -109,7 +109,7 @@ def check_anomalies(
                 description=str(f["description"]),
                 temp_impact_f=float(f["temp_impact_f"]),
             )
-            for f in data.get("flags", [])
+            for f in (data.get("flags") or [])
         ]
 
         return AnomalyReport(
