@@ -69,9 +69,6 @@ class CityProfile:
     cold_bias_adjustment_f: float = 0.0
     sep_climate_normal_f: Optional[float] = None
     sep_anomaly_trigger_f: Optional[float] = None
-    apr_climate_normal_f: Optional[float] = None
-    apr_anomaly_trigger_f: Optional[float] = None
-    apr_cold_bias_adjustment_f: float = 0.0
     lead_decay_halflife_hours: float = 48.0
 
 

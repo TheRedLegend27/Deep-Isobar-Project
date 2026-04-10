@@ -105,9 +105,9 @@ def _iter_months(start: date, end: date) -> list[tuple[int, int]]:
 def _neutral_profile(base_profile: CityProfile) -> CityProfile:
     """Return a copy of *base_profile* with all bias corrections zeroed out.
 
-    Mirrors Phase 1 of run_chicago_backtest.py exactly, with the addition of
-    ``apr_cold_bias_adjustment_f`` so that seasonal adjustments are also
-    suppressed for spring months.
+    Mirrors Phase 1 of run_chicago_backtest.py exactly.  Seasonal corrections
+    are handled entirely by bias_loader and are suppressed during replay by
+    passing month-agnostic neutral parameters here.
     """
     return dataclasses.replace(
         base_profile,
@@ -115,7 +115,6 @@ def _neutral_profile(base_profile: CityProfile) -> CityProfile:
         variance_multiplier=1.0,
         heat_bias_adjustment_f=0.0,
         cold_bias_adjustment_f=0.0,
-        apr_cold_bias_adjustment_f=0.0,
     )
 
 

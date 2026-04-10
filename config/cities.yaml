@@ -7,14 +7,14 @@ cities:
     station_id: KMDW
     settlement_source: NWS
     active: true
-    # --- Calibrated 2026-04-01 from CHI train/test split (May–Jul 2023 calibration window) ---
-    # Derived by run_chicago_backtest.py phase 2: neutral-profile pass over May–Jul 2023,
-    # then bias = -mean(forecast − actual), variance_multiplier = RMSE_after_bias / mean_effective_std.
-    # heat/cold_bias_adjustment_f zeroed out — bias is fully absorbed into mean_bias_correction_f.
-    # Previous values (2026-03-17): mean_bias_correction_f=2.04, variance_multiplier=1.36,
-    #                                heat_bias_adjustment_f=-0.3
-    variance_multiplier: 0.82
-    mean_bias_correction_f: 3.1493
+    # --- Calibrated 2026-04-09 from full KMDW historical dataset (all 12 months, 1364 samples) ---
+    # mean_bias_correction_f = mean of all monthly mean_bias_f values from parquet (3.9599°F).
+    # variance_multiplier = 0.7787 (annual recalibration; fallback for months with thin data).
+    # Monthly values in bias_profiles/KMDW_monthly_profile.parquet take precedence at runtime.
+    # heat/cold_bias_adjustment_f zeroed out — bias fully absorbed into monthly parquet profiles.
+    # Previous values (2026-04-01): mean_bias_correction_f=3.1493, variance_multiplier=0.82
+    variance_multiplier: 0.7787
+    mean_bias_correction_f: 3.9599
     kde_bandwidth: 5.5
     tail_multiplier: 1.3
     model_weight_gfs: 0.35
@@ -28,16 +28,9 @@ cities:
     # -2.0°F heat_bias_adjustment_f is applied in the OOT accuracy report.
     sep_climate_normal_f: 72.7
     sep_anomaly_trigger_f: 5.0
-    # April spring cold-lake bias correction — applied unconditionally in live trading
-    # via build_temperature_ensemble() in temperature_ensemble.py.
-    # 1991-2020 NOAA normal mean daily high at KMDW for April = 52.0°F.
-    # apr_anomaly_trigger_f: 0.0 means always apply (no anomaly threshold check).
-    # apr_cold_bias_adjustment_f: -3.5°F counters the observed warm bias in April;
-    # net live correction = mean_bias_correction_f (+3.1493) + apr_cold_bias (-3.5) = -0.35°F.
-    # Calibrated 2026-04-08 against April 2026 paper-trade losses.
-    apr_climate_normal_f: 52.0
-    apr_anomaly_trigger_f: 0.0
-    apr_cold_bias_adjustment_f: -3.5
+    # Seasonal bias corrections (e.g. April spring cold-lake bias) are handled
+    # entirely by bias_loader via the per-month parquet profile.
+    # KMDW April: mean_bias_f=5.424, variance_multiplier=2.169 (116 samples).
 
   - city: New York
     city_code: NYC

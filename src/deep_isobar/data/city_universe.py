@@ -169,9 +169,6 @@ def _build_profile(entry: dict[str, Any]) -> CityProfile:
         cold_bias_adjustment_f=float(entry.get("cold_bias_adjustment_f", 0.0)),
         sep_climate_normal_f=entry.get("sep_climate_normal_f"),
         sep_anomaly_trigger_f=entry.get("sep_anomaly_trigger_f"),
-        apr_climate_normal_f=entry.get("apr_climate_normal_f"),
-        apr_anomaly_trigger_f=entry.get("apr_anomaly_trigger_f"),
-        apr_cold_bias_adjustment_f=float(entry.get("apr_cold_bias_adjustment_f", 0.0)),
         lead_decay_halflife_hours=float(entry.get("lead_decay_halflife_hours", 48.0)),
     )
 

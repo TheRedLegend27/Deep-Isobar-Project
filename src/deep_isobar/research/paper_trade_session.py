@@ -52,13 +52,14 @@ load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY
 from deep_isobar.core.types import ForecastPoint
 from deep_isobar.data.city_universe import get_city_profile
 from deep_isobar.data.historical_forecast_ingest import (
+    _AWS_BASE,
     _LEAD_FHOUR,
     _STATION_COORDS,
     _cache_path,
     _check_cfgrib,
     _download_snippet,
     _extract_fahrenheit,
-    _gfs_urls,
+    _resolve_gfs_idx_url,
 )
 from deep_isobar.market.kalshi_client import (
     fetch_live_contracts,
@@ -104,6 +105,7 @@ _CSV_COLUMNS = [
     "alpha",
     "model_prob",
     "market_prob",
+    "ensemble_mean_f",
     "entry_price",
     "position_size",
     "status",
@@ -149,14 +151,23 @@ def _fetch_live_gfs_t24(city_profile, run_date: date) -> list[ForecastPoint]:
 
     for cycle in ("12", "00"):
         fhour = _LEAD_FHOUR[cycle][1]   # lead_day=1 → 18z UTC on target date
+        fhour_str = f"{fhour:03d}"
         run_time_utc = datetime(
             run_date.year, run_date.month, run_date.day,
             int(cycle), 0, 0, tzinfo=timezone.utc,
         )
-        grib2_url, idx_url = _gfs_urls(run_date, cycle, fhour)
+        date_str = run_date.strftime("%Y%m%d")
         dest = _cache_path(_GFS_CACHE_DIR, run_date, cycle, fhour)
 
         try:
+            idx_url = _resolve_gfs_idx_url(_AWS_BASE, date_str, cycle, fhour_str)
+            if idx_url is None:
+                logger.warning(
+                    "GFS %sz f%s not found on AWS (both layouts 404) — skipping",
+                    cycle, fhour_str,
+                )
+                continue
+            grib2_url = idx_url[:-4]  # strip ".idx"
             _download_snippet(grib2_url, idx_url, dest)
             t_f = _extract_fahrenheit(dest, city_lat, city_lon_360)
         except Exception as exc:  # noqa: BLE001
@@ -425,6 +436,7 @@ def run_session(dry_run: bool = False) -> int:
                 "alpha": round(signal.alpha, 6),
                 "model_prob": round(signal.model_probability, 6),
                 "market_prob": round(signal.market_probability, 6),
+                "ensemble_mean_f": round(ensemble.ensemble_mean_f, 4),
                 "entry_price": round(entry_price, 6) if entry_price is not None else "",
                 "position_size": POSITION_SIZE,
                 "status": "OPEN" if is_trade else "NO_SIGNAL",

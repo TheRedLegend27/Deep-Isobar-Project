@@ -46,6 +46,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, etc.
 
+from deep_isobar.calibration import bias_loader
+from deep_isobar.data.city_universe import get_city_profile
 from deep_isobar.data.historical_noaa_ingest import fetch_settlement_observations
 from deep_isobar.notifications.discord_notifier import (
     COLOR_GREEN,
@@ -325,6 +327,61 @@ def _print_pnl_summary(df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bias-profile update
+# ---------------------------------------------------------------------------
+
+
+def _update_bias_profile(
+    settle_date: date,
+    settled_rows: pd.DataFrame,
+    settled_temp: float,
+) -> None:
+    """Push one calibration point into the bias_loader parquet for this date.
+
+    Reads ``ensemble_mean_f`` from *settled_rows* (all rows share the same
+    value — it's the session-level raw ensemble mean logged at trade time).
+    Skips silently when the column is absent (rows written before the column
+    was added) or NaN.  Never raises — a failure here must not abort settlement.
+    """
+    try:
+        if "ensemble_mean_f" not in settled_rows.columns:
+            logger.debug(
+                "Skipping bias update for %s — ensemble_mean_f column absent (legacy row)",
+                settle_date,
+            )
+            return
+
+        raw_mean_series = pd.to_numeric(
+            settled_rows["ensemble_mean_f"], errors="coerce"
+        ).dropna()
+
+        if raw_mean_series.empty:
+            logger.debug(
+                "Skipping bias update for %s — ensemble_mean_f is NaN (legacy row)",
+                settle_date,
+            )
+            return
+
+        raw_mean_f = float(raw_mean_series.iloc[0])
+        station_id = get_city_profile(CITY).station_id
+
+        bias_loader.update_profile_after_settlement(
+            station_id=station_id,
+            settlement_date=settle_date,
+            raw_mean_f=raw_mean_f,
+            actual_f=settled_temp,
+        )
+        logger.info(
+            "Bias profile updated — %s  raw_mean=%.2f°F  actual=%.2f°F  error=%.2f°F",
+            station_id, raw_mean_f, settled_temp, raw_mean_f - settled_temp,
+        )
+    except Exception:
+        logger.exception(
+            "Bias profile update failed for %s — settlement is unaffected", settle_date
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -394,6 +451,13 @@ def settle(settle_date: date) -> None:
     # Write updated CSV
     df.to_csv(_PAPER_TRADES_CSV, index=False)
     logger.info("Wrote %d settled row(s) to %s", n_settled, _PAPER_TRADES_CSV)
+
+    # Push one calibration point into the bias profile parquet
+    newly_settled = df[
+        (df["date"].astype(str) == str(settle_date))
+        & df["status"].isin(["WIN", "LOSS"])
+    ]
+    _update_bias_profile(settle_date, newly_settled, settled_temp)
 
     # Print newly settled trades
     newly_settled = df[

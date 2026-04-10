@@ -83,9 +83,6 @@ variance_multiplier: 0.82
 sep_climate_normal_f: 72.7
 sep_anomaly_trigger_f: 5.0
 sep_heat_bias_adjustment_f: -2.0
-apr_climate_normal_f: 52.0
-apr_anomaly_trigger_f: 0.0
-apr_cold_bias_adjustment_f: -3.5   # temporary; replaced by replay output
 alpha_threshold: 0.38
 lead_decay_halflife_hours: 48.0
 ```
@@ -141,7 +138,7 @@ config/
 | Morning session | 7:00 AM CDT | `paper_trade_session.py` |
 | Settlement | 6:00 PM CDT | `settle_paper_trades.py` |
 | Dashboard | 7:15 PM CDT | `generate_dashboard.py` |
-
+ 
 **Data sources:**
 
 | Source | Notes |
