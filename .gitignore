@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 /data/
 /dashboard_ui/
+/prompts/
+/docs/
+/test/
 # API credentials — never commit real keys
 keys/
 *.pem
