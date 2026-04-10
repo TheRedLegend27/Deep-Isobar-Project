@@ -115,6 +115,11 @@ _CSV_COLUMNS = [
     "strike_type",
     "floor_strike",
     "cap_strike",
+    "anomaly_flags",
+    "anomaly_penalty_f",
+    "anomaly_adjusted_signal",
+    "anomaly_confidence",
+    "anomaly_reasoning",
 ]
 
 
@@ -308,6 +313,30 @@ def run_session(dry_run: bool = False) -> int:
         effective_std,
     )
 
+    # ── Anomaly detection ─────────────────────────────────────────────────────
+    # Runs once per session for logging only — does not affect trade decisions.
+    try:
+        from deep_isobar.anomaly import check_anomalies, fetch_kmdw_metar, parse_metar_fields
+        raw_metar = fetch_kmdw_metar()
+        metar_fields = parse_metar_fields(raw_metar)
+        anomaly = check_anomalies(
+            metar=raw_metar,
+            nws_forecast_f=None,  # TODO: wire NWS forecast fetch
+            model_mean_f=ensemble.ensemble_mean_f,
+            wind_dir=metar_fields.get("wind_dir", ""),
+            sky_cover=metar_fields.get("sky_cover", ""),
+        )
+        logger.info(
+            "Anomaly check: flags=%s  penalty=%.1f°F  signal=%s  confidence=%s",
+            [f.code for f in anomaly.flags],
+            anomaly.total_temp_penalty_f,
+            anomaly.adjusted_signal,
+            anomaly.confidence,
+        )
+    except Exception as e:
+        anomaly = None
+        logger.debug(f"Anomaly check skipped: {e}")
+
     if not dry_run:
         post_embed(
             title="Deep Isobar \u2014 Morning run started",
@@ -446,6 +475,11 @@ def run_session(dry_run: bool = False) -> int:
                 "strike_type": contract.strike_type,
                 "floor_strike": contract.floor_strike if contract.floor_strike is not None else "",
                 "cap_strike":   contract.cap_strike   if contract.cap_strike   is not None else "",
+                "anomaly_flags":           ",".join(f.code for f in anomaly.flags) if anomaly else "",
+                "anomaly_penalty_f":       round(anomaly.total_temp_penalty_f, 2) if anomaly else "",
+                "anomaly_adjusted_signal": anomaly.adjusted_signal if anomaly else "",
+                "anomaly_confidence":      anomaly.confidence if anomaly else "",
+                "anomaly_reasoning":       anomaly.reasoning if anomaly else "",
             }
 
             all_rows.append(row)
