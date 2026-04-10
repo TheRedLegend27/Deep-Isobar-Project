@@ -4,7 +4,7 @@ __pycache__/
 .env
 *.pyc
 /data/
-
+/dashboard_ui/
 # API credentials — never commit real keys
 keys/
 *.pem
