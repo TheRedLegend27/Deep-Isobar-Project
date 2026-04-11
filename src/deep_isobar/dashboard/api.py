@@ -67,7 +67,6 @@ _CSV_DTYPES = {
     "position_size": float,
     "threshold_f": float,
     "anomaly_penalty_f": float,
-    "anomaly_adjusted_signal": float,
 }
 
 

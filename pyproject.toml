@@ -21,6 +21,7 @@ dependencies = [
     "python-dateutil",
     "cryptography",
     "python-dotenv",
+    "anthropic",
 ]
 
 [tool.pytest.ini_options]
