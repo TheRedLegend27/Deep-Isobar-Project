@@ -10,3 +10,9 @@ loguru
 python-dateutil
 python-dotenv
 anthropic
+
+# GRIB2 parsing + Kalshi auth
+cfgrib
+xarray
+eccodes
+cryptography

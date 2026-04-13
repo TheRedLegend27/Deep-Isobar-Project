@@ -7,6 +7,7 @@ they are logged for review and never gate or modify trade execution.
 
 from .detector import AnomalyFlag, AnomalyReport, check_anomalies
 from .metar_fetcher import fetch_kmdw_metar, parse_metar_fields
+from .nws_fetcher import fetch_nws_high_forecast_f
 
 __all__ = [
     "AnomalyFlag",
@@ -14,4 +15,5 @@ __all__ = [
     "check_anomalies",
     "fetch_kmdw_metar",
     "parse_metar_fields",
+    "fetch_nws_high_forecast_f",
 ]

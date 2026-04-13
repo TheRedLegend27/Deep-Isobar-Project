@@ -72,6 +72,7 @@ from deep_isobar.market.microstructure_scanner import compute_microstructure_sco
 from deep_isobar.models.probability_engine import probability_for_contract
 from deep_isobar.models.temperature_ensemble import build_temperature_ensemble
 from deep_isobar.trading.distribution_tail_alpha import is_tail_threshold
+from deep_isobar.config import get_setting
 from deep_isobar.notifications.discord_notifier import (
     COLOR_AMBER,
     COLOR_BLUE,
@@ -93,7 +94,8 @@ _DAILY_LOG_CSV = _PAPER_TRADES_DIR / "daily_log.csv"
 _GFS_CACHE_DIR = _PROJECT_ROOT / "data" / "historical" / "forecasts" / ".grib_cache"
 
 CITY = "Chicago"
-SIGNAL_THRESHOLD = 0.25     # minimum |alpha| to generate a trade
+SIGNAL_THRESHOLD: float = get_setting("risk.alpha_threshold", default=0.25)
+logger.info(f"Signal threshold loaded from config: {SIGNAL_THRESHOLD}")
 POSITION_SIZE = 10.0        # contracts per trade (paper)
 METRIC = "high_temp_f"
 # Minimum ensemble std applied when only one GFS run is available.
@@ -332,11 +334,26 @@ def run_session(dry_run: bool = False) -> int:
     # Runs once per session for logging only — does not affect trade decisions.
     try:
         from deep_isobar.anomaly import check_anomalies, fetch_kmdw_metar, parse_metar_fields
+        from deep_isobar.anomaly.nws_fetcher import fetch_nws_high_forecast_f
         raw_metar = fetch_kmdw_metar()
         metar_fields = parse_metar_fields(raw_metar)
+        # CityProfile has no lat/lon fields — derive from _STATION_COORDS (360° lon → standard)
+        _nws_lat, _nws_lon_360 = _STATION_COORDS.get(
+            city_profile.station_id, (41.7868, 272.2478)
+        )
+        _nws_lon = _nws_lon_360 - 360.0 if _nws_lon_360 > 180.0 else _nws_lon_360
+        try:
+            nws_forecast_f = fetch_nws_high_forecast_f(lat=_nws_lat, lon=_nws_lon)
+        except Exception:
+            logger.debug("NWS fetcher raised unexpectedly — defaulting to None")
+            nws_forecast_f = None
+        if nws_forecast_f is not None:
+            logger.info(f"NWS forecast high: {nws_forecast_f:.1f}°F")
+        else:
+            logger.debug("NWS forecast unavailable — anomaly NWS_MODEL_DIVERGENCE will not fire")
         anomaly = check_anomalies(
             metar=raw_metar,
-            nws_forecast_f=None,  # TODO: wire NWS forecast fetch
+            nws_forecast_f=nws_forecast_f,
             model_mean_f=ensemble.ensemble_mean_f,
             wind_dir=metar_fields.get("wind_dir", ""),
             sky_cover=metar_fields.get("sky_cover", ""),
@@ -648,7 +665,7 @@ if __name__ == "__main__":
         description=(
             "Daily paper trade session for Chicago high temperature contracts.\n\n"
             "Fetches GFS T+24 forecast, evaluates live Kalshi contracts, and\n"
-            "logs any trade signals (|alpha| >= 0.25) to data/paper_trades/."
+            f"logs any trade signals (|alpha| >= {SIGNAL_THRESHOLD}) to data/paper_trades/."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
