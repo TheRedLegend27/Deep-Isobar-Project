@@ -16,3 +16,11 @@ cfgrib
 xarray
 eccodes
 cryptography
+
+# Web API
+fastapi
+uvicorn[standard]
+
+# Auth
+python-jose[cryptography]
+bcrypt
