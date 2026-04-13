@@ -51,7 +51,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, etc.
 
-from deep_isobar.core.types import ForecastPoint
+from deep_isobar.core.types import ForecastPoint, TradeSignal
 from deep_isobar.data.city_universe import get_city_profile
 from deep_isobar.data.historical_forecast_ingest import (
     _AWS_BASE,
@@ -124,6 +124,11 @@ _CSV_COLUMNS = [
     "anomaly_adjusted_signal",
     "anomaly_confidence",
     "anomaly_reasoning",
+    "spread_rank",
+    "spread_total_contracts",
+    "sizing_base_usd",
+    "sizing_final_usd",
+    "sizing_reasoning",
 ]
 
 
@@ -212,8 +217,14 @@ def _fetch_live_gfs_t24(city_profile, run_date: date) -> list[ForecastPoint]:
 def _ensure_csv(path: Path) -> None:
     """Create the CSV file with a header row if it does not already exist.
 
-    Raises RuntimeError if the file exists but its header doesn't match
-    _CSV_COLUMNS — schema drift must be resolved before running a session.
+    When the file exists and its header is a strict prefix of the current
+    ``_CSV_COLUMNS`` (i.e. new columns were appended to the schema), the file
+    is automatically migrated: the header is rewritten and existing rows
+    receive empty values for the new columns.
+
+    Raises RuntimeError if the file exists but its header is incompatible
+    with ``_CSV_COLUMNS`` (column order or names differ, not just missing
+    trailing columns).
     """
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,12 +233,39 @@ def _ensure_csv(path: Path) -> None:
         return
     with path.open(newline="") as fh:
         existing = next(csv.reader(fh), [])
-    if existing != _CSV_COLUMNS:
-        raise RuntimeError(
-            f"Schema mismatch in {path.name}: header has {len(existing)} columns "
-            f"but _CSV_COLUMNS defines {len(_CSV_COLUMNS)}. "
-            "Migrate the CSV to the new schema before running a session."
+    if existing == _CSV_COLUMNS:
+        return  # schema matches exactly — nothing to do
+    # Auto-migrate if existing header is a prefix of the current schema.
+    # This handles the case where new columns (e.g. spread_rank) were added.
+    if existing == _CSV_COLUMNS[: len(existing)]:
+        _migrate_csv_add_columns(path)
+        logger.info(
+            "Auto-migrated %s: added columns %s",
+            path.name,
+            _CSV_COLUMNS[len(existing):],
         )
+        return
+    raise RuntimeError(
+        f"Schema mismatch in {path.name}: header has {len(existing)} columns "
+        f"but _CSV_COLUMNS defines {len(_CSV_COLUMNS)}. "
+        "Migrate the CSV to the new schema before running a session."
+    )
+
+
+def _migrate_csv_add_columns(path: Path) -> None:
+    """Rewrite *path* with the full ``_CSV_COLUMNS`` schema.
+
+    Existing rows keep their current values; new columns are written as
+    empty strings.  This is a forward-only migration — columns already
+    present are never removed or reordered.
+    """
+    with path.open("r", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_CSV_COLUMNS, restval="")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def _append_csv_row(path: Path, row: dict) -> None:
@@ -450,6 +488,8 @@ def run_session(dry_run: bool = False) -> int:
         # Collect all rows first so we can deduplicate before writing.
         all_rows: list[dict] = []
         dry_run_signals: list[tuple[dict, object, object]] = []  # (row, signal, orderbook)
+        # Maps contract_id → TradeSignal for use by the multi-bracket spreader.
+        signal_lookup: dict[str, TradeSignal] = {}
 
         for contract in sorted(tomorrow_contracts, key=lambda c: c.threshold_f):
             orderbook = fetch_orderbook_for_contract("Kalshi", contract.contract_id)
@@ -472,6 +512,8 @@ def run_session(dry_run: bool = False) -> int:
                 tail_opportunity_flag=tail_flag,
                 tail_multiplier=city_profile.tail_multiplier,
             )
+            # Store for multi-bracket spreading (populated regardless of dry_run).
+            signal_lookup[contract.contract_id] = signal
 
             # Entry price: cross the spread at execution side
             if signal.signal_side == "BUY":
@@ -512,6 +554,13 @@ def run_session(dry_run: bool = False) -> int:
                 "anomaly_adjusted_signal": anomaly.adjusted_signal if anomaly else "",
                 "anomaly_confidence":      anomaly.confidence if anomaly else "",
                 "anomaly_reasoning":       anomaly.reasoning if anomaly else "",
+                # Spread metadata defaults — overwritten by multi-bracket block when enabled.
+                "spread_rank": 1,
+                "spread_total_contracts": 1,
+                # Sizing metadata defaults — overwritten by multi-bracket block when enabled.
+                "sizing_base_usd": "",
+                "sizing_final_usd": "",
+                "sizing_reasoning": "",
             }
 
             all_rows.append(row)
@@ -551,6 +600,74 @@ def run_session(dry_run: bool = False) -> int:
         for row in all_rows:
             if row["status"] == "OPEN" and row["contract_ticker"] not in winning_tickers:
                 row["status"] = "DEDUP_DROP"
+
+        # ── Multi-bracket spreading ────────────────────────────────────────────
+        # Runs only when enabled in config.  Mutates OPEN row dicts in-place
+        # to assign spread_rank, spread_total_contracts, and position_size.
+        # Rows that are OPEN but don't make the spread cut are marked
+        # SPREAD_SKIP so the daily log reflects the selection decision.
+        multi_bracket_cfg = get_setting("risk.multi_bracket", default={})
+        spreading_enabled = multi_bracket_cfg.get("enabled", False)
+
+        if spreading_enabled:
+            from deep_isobar.trading.bracket_spreader import build_spread, log_spread_summary
+
+            # ── Dynamic position sizing ────────────────────────────────────────
+            dynamic_cfg = multi_bracket_cfg.get("dynamic_sizing", {})
+            if dynamic_cfg.get("enabled", False):
+                from deep_isobar.trading.position_sizer import compute_exposure, log_sizing_decision
+                sizing = compute_exposure(
+                    anomaly_report=anomaly,           # already computed earlier in session
+                    ensemble_std_f=ensemble.ensemble_std_f,
+                    cfg=dynamic_cfg,
+                )
+                log_sizing_decision(sizing, logger)
+                daily_exposure_cap_usd = sizing.final_exposure_usd
+            else:
+                sizing = None
+                daily_exposure_cap_usd = multi_bracket_cfg.get("daily_exposure_cap_usd", 50.0)
+
+            # Stamp sizing columns on every row (session-level, same value for all)
+            for row in all_rows:
+                if sizing is not None:
+                    row["sizing_base_usd"] = sizing.base_exposure_usd
+                    row["sizing_final_usd"] = sizing.final_exposure_usd
+                    row["sizing_reasoning"] = sizing.reasoning
+                else:
+                    row["sizing_base_usd"] = daily_exposure_cap_usd
+                    row["sizing_final_usd"] = daily_exposure_cap_usd
+                    row["sizing_reasoning"] = "dynamic sizing disabled"
+
+            open_rows_pre_spread = [r for r in all_rows if r["status"] == "OPEN"]
+            open_signals = [signal_lookup[r["contract_ticker"]] for r in open_rows_pre_spread]
+
+            if open_signals:
+                allocations = build_spread(
+                    signals=open_signals,
+                    daily_exposure_cap_usd=daily_exposure_cap_usd,
+                    max_contracts=multi_bracket_cfg.get("max_contracts_per_session", 3),
+                    min_alpha=multi_bracket_cfg.get("min_alpha_to_spread", SIGNAL_THRESHOLD),
+                    allocation_method=multi_bracket_cfg.get("allocation_method", "proportional"),
+                )
+                log_spread_summary(allocations, logger)
+
+                if allocations:
+                    n_total = len(allocations)
+                    alloc_by_id = {a.signal.contract_id: a for a in allocations}
+
+                    for row in all_rows:
+                        if row["status"] != "OPEN":
+                            continue
+                        ticker = row["contract_ticker"]
+                        if ticker in alloc_by_id:
+                            alloc = alloc_by_id[ticker]
+                            row["position_size"] = alloc.allocated_usd
+                            row["spread_rank"] = alloc.rank
+                            row["spread_total_contracts"] = n_total
+                        else:
+                            # OPEN signal didn't make the spread cut
+                            row["status"] = "SPREAD_SKIP"
+                            row["spread_total_contracts"] = n_total
 
         # ── Dry-run output ─────────────────────────────────────────────────────
         if dry_run:
@@ -598,12 +715,16 @@ def run_session(dry_run: bool = False) -> int:
                 _append_csv_row(_PAPER_TRADES_CSV, row)
                 signals_logged += 1
                 logger.info(
-                    "TRADE LOGGED: %s %s  alpha=%+.3f  entry=%s  threshold=%.0f°F",
+                    "TRADE LOGGED: %s %s  alpha=%+.3f  entry=%s  threshold=%.0f°F"
+                    "  pos=$%.2f  spread=#%s/%s",
                     row["direction"],
                     row["contract_ticker"],
                     row["alpha"],
                     row["entry_price"] or 0.0,
                     row["threshold_f"],
+                    row["position_size"],
+                    row["spread_rank"],
+                    row["spread_total_contracts"],
                 )
             else:
                 logger.info(

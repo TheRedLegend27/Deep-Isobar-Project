@@ -26,6 +26,38 @@ risk:
   alpha_threshold: 0.38
   max_position_per_contract: 100
   max_daily_exposure: 1000
+  multi_bracket:
+    enabled: true
+    max_contracts_per_session: 3      # max number of brackets to enter
+    daily_exposure_cap_usd: 50.0      # total $ at risk across all brackets today (static fallback)
+    min_alpha_to_spread: 0.38         # must clear same threshold as primary signal
+    allocation_method: proportional   # proportional | equal | kelly (only proportional
+                                      # implemented now — others are stubs)
+    dynamic_sizing:
+      enabled: true
+      base_exposure_usd: 50.0        # replaces the static daily_exposure_cap_usd
+      min_exposure_usd: 10.0         # floor — never go below this
+
+      # Anomaly confidence multipliers
+      anomaly_multipliers:
+        HIGH: 1.0      # no penalty — model is confident
+        MEDIUM: 0.70   # 30% reduction
+        LOW: 0.50      # 50% reduction
+        NONE: 1.0      # anomaly check didn't run — no penalty
+
+      # Per-flag penalty (stacks multiplicatively with confidence multiplier)
+      flag_penalties:
+        FOG_MORNING: 0.85
+        LAKE_BREEZE: 0.85
+        COLD_START: 0.90
+        FRONTAL_SUPPRESSION: 0.85
+        NWS_MODEL_DIVERGENCE: 0.80
+
+      # Ensemble spread penalty (ensemble_std_f thresholds in °F)
+      spread_thresholds:
+        clean: 3.0        # std < 3.0°F → no penalty (multiplier 1.0)
+        moderate: 5.0     # 3.0–5.0°F → multiplier 0.80
+        wide: 999.0       # > 5.0°F → multiplier 0.60
 
 models:
   default_metric: high_temp_f

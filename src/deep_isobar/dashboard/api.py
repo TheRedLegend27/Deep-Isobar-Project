@@ -95,7 +95,13 @@ def _pnl_display(row: pd.Series) -> str:
 
 
 def _row_to_dict(row: pd.Series) -> dict[str, Any]:
-    """Convert a DataFrame row to a JSON-safe dict, normalising NaN → None."""
+    """Convert a DataFrame row to a JSON-safe dict, normalising NaN → None.
+
+    Spread columns (``spread_rank``, ``spread_total_contracts``) are always
+    present in the output — legacy rows that predate the spread feature will
+    have these fields defaulted to 1 rather than None so the frontend can
+    safely check ``spread_total_contracts > 1``.
+    """
     out: dict[str, Any] = {}
     for k, v in row.items():
         try:
@@ -104,6 +110,9 @@ def _row_to_dict(row: pd.Series) -> dict[str, Any]:
             # pd.isna raises on non-scalar containers — keep as-is
             out[k] = v
     out["pnl_display"] = _pnl_display(row)
+    # Ensure spread metadata is always an integer, not None, for frontend safety.
+    out["spread_rank"] = int(out.get("spread_rank") or 1)
+    out["spread_total_contracts"] = int(out.get("spread_total_contracts") or 1)
     return out
 
 
@@ -329,6 +338,30 @@ def bias_profile() -> dict[str, Any]:
 class TradeOverride(BaseModel):
     status: str
     settled_temp: float | None = None
+
+
+@app.get("/api/account")
+def get_account() -> dict:
+    """Return Kalshi account balance and open-position portfolio value."""
+    from deep_isobar.market.kalshi_client import get_balance
+
+    try:
+        result = get_balance()
+        if result is None:
+            return {
+                "balance_usd": None,
+                "portfolio_value_usd": None,
+                "total_usd": None,
+                "error": "Kalshi API unavailable",
+            }
+        return result
+    except Exception as exc:
+        return {
+            "balance_usd": None,
+            "portfolio_value_usd": None,
+            "total_usd": None,
+            "error": str(exc),
+        }
 
 
 @app.patch("/api/trades/{contract_ticker}")

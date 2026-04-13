@@ -812,3 +812,47 @@ def fetch_orderbook_for_contract(
             contract_id, type(exc).__name__, exc,
         )
         return _stub_fetch_orderbook(contract_id)
+
+
+def get_balance() -> dict | None:
+    """Return Kalshi account balance and open-position portfolio value.
+
+    Calls ``GET /trade-api/v2/portfolio/balance`` (authenticated, RSA-PSS).
+    Kalshi returns amounts in cents; this function converts to dollars.
+
+    Returns:
+        Dict with keys ``balance_usd`` (available cash), ``portfolio_value_usd``
+        (open position value), and ``total_usd`` (sum of both).
+        Returns the same zero-valued dict in stub mode.
+        Returns ``None`` on any live API error — never raises.
+
+    Example::
+
+        bal = get_balance()
+        # → {"balance_usd": 125.50, "portfolio_value_usd": 45.00, "total_usd": 170.50}
+    """
+    _stub_response: dict = {"balance_usd": 0.0, "portfolio_value_usd": 0.0, "total_usd": 0.0}
+
+    if _use_stub_mode():
+        logger.debug("get_balance: stub_mode=true — returning zero balances")
+        return _stub_response
+
+    credentials = _load_credentials()
+    if credentials is None:
+        logger.debug("get_balance: no credentials — returning zero balances")
+        return _stub_response
+
+    try:
+        data = _kalshi_get("/portfolio/balance", None, credentials)
+        balance_cents = data.get("balance", 0) or 0
+        portfolio_cents = data.get("portfolio_value", 0) or 0
+        balance_usd = round(balance_cents / 100.0, 2)
+        portfolio_usd = round(portfolio_cents / 100.0, 2)
+        return {
+            "balance_usd": balance_usd,
+            "portfolio_value_usd": portfolio_usd,
+            "total_usd": round(balance_usd + portfolio_usd, 2),
+        }
+    except Exception as exc:
+        logger.warning("get_balance: API call failed — %s: %s", type(exc).__name__, exc)
+        return None
