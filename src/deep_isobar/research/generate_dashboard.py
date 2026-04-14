@@ -322,6 +322,20 @@ _HTML_TEMPLATE = """\
     .pnl-pos { color: var(--green); }
     .pnl-neg { color: var(--red); }
 
+    .ticker-link { color: inherit; text-decoration: none; }
+    .ticker-link:hover { text-decoration: underline; opacity: 0.85; }
+    .bracket-chip {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 0.65rem;
+      font-weight: 700;
+      margin-left: 5px;
+      vertical-align: middle;
+    }
+    .bracket-yes { background: rgba(63,185,80,0.15);  color: #3fb950; }
+    .bracket-no  { background: rgba(248,81,73,0.10);  color: #d29922; }
+
     footer {
       margin-top: var(--gap);
       text-align: center;
@@ -444,9 +458,35 @@ cardDefs.forEach(cd => {
       : "—";
     var tempStr = r.settled_temp !== null ? r.settled_temp + "\u00b0F" : "—";
     var thrStr  = r.threshold_f  !== null ? r.threshold_f  : "—";
+
+    // Kalshi deep link
+    var tickerDisplay;
+    if (r.ticker) {
+      var tickerLower = r.ticker.toLowerCase();
+      var seriesLower = tickerLower.split("-")[0];
+      var kalshiUrl = "https://kalshi.com/markets/" + seriesLower + "/" + tickerLower;
+      tickerDisplay = '<a href="' + kalshiUrl + '" target="_blank" rel="noopener" class="ticker-link">' + r.ticker + "</a>";
+    } else {
+      tickerDisplay = "\u2014";
+    }
+
+    // Bracket recommendation chip (OPEN trades only)
+    var bracketChip = "";
+    if (r.status === "OPEN" && r.ticker) {
+      var tMatch = r.ticker.match(/[Tt](\d+)$/);
+      if (tMatch) {
+        var thr = tMatch[1];
+        if (r.direction === "BUY") {
+          bracketChip = '<span class="bracket-chip bracket-yes">YES &gt; T' + thr + "</span>";
+        } else if (r.direction === "SELL") {
+          bracketChip = '<span class="bracket-chip bracket-no">NO &gt; T' + thr + "</span>";
+        }
+      }
+    }
+
     var row = "<tr>"
       + "<td>" + r.date + "</td>"
-      + '<td style="font-family:monospace;font-size:0.75rem">' + r.ticker + "</td>"
+      + '<td style="font-family:monospace;font-size:0.75rem">' + tickerDisplay + bracketChip + "</td>"
       + '<td><span class="badge badge-' + r.direction + '">' + r.direction + "</span></td>"
       + "<td>" + thrStr + "</td>"
       + "<td>" + alphaStr + "</td>"

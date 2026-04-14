@@ -96,6 +96,7 @@ _SERIES_METADATA: dict[str, dict[str, str]] = {
     "HIGHDAL":    {"city": "Dallas",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
     "KXHIGHNY":   {"city": "New York",    "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
     "HIGHNY":     {"city": "New York",    "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "KXHIGHTBOS": {"city": "Boston",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
     "KXHIGHBOS":  {"city": "Boston",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
     "HIGHBOS":    {"city": "Boston",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
     "KXHIGHPHIL": {"city": "Philadelphia","metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
@@ -109,12 +110,23 @@ _MONTH_MAP: dict[str, int] = {
     "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
+# Reverse map: month number → abbreviation (for normalization)
+_MONTH_NUM_TO_ABV: dict[int, str] = {v: k for k, v in _MONTH_MAP.items()}
+
 # Ticker regex — matches bracket (B) and threshold-edge (T) formats:
 #   KXHIGHCHI-26MAR18-B51.5   — range bracket, floor in °F
 #   KXHIGHCHI-26MAR17-T30     — edge bracket (above/below threshold)
 # Groups: (series)(YY)(MMM)(DD)(bracket_type: B|T)(threshold — may be decimal)
 _TICKER_RE = re.compile(
     r"^([A-Z0-9]+)-(\d{2})([A-Z]{3})(\d{2})-([BT])([\d.]+)$",
+    re.IGNORECASE,
+)
+
+# Alternate ticker format returned by some cities (e.g. Boston):
+#   KXHIGHBOS_HIGH_TEMP_F_GT_30_20260415
+# Groups: (series)(threshold)(YYYY)(MM)(DD)
+_ALT_TICKER_RE = re.compile(
+    r"^([A-Z0-9]+)_HIGH_TEMP_F_GT_(\d+)_(\d{4})(\d{2})(\d{2})$",
     re.IGNORECASE,
 )
 
@@ -314,6 +326,48 @@ def _kalshi_get(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_ticker(ticker: str) -> str:
+    """Normalize alternate Kalshi ticker formats to the standard format.
+
+    Some cities (e.g. Boston) return tickers in the form::
+
+        KXHIGHBOS_HIGH_TEMP_F_GT_30_20260415
+
+    This function converts those to the canonical dash-separated format::
+
+        KXHIGHBOS-26APR15-T30
+
+    Standard-format tickers are returned unchanged.
+
+    Args:
+        ticker: Raw ticker string from the API or internal source.
+
+    Returns:
+        Normalized ticker string in ``SERIES-YYMMMDD-T{n}`` format,
+        or the original string if it doesn't match the alternate pattern.
+    """
+    t = ticker.upper().strip()
+    match = _ALT_TICKER_RE.match(t)
+    if not match:
+        return t  # already standard format or unknown — pass through
+
+    series = match.group(1)
+    threshold = match.group(2)
+    year = int(match.group(3))
+    month = int(match.group(4))
+    day = int(match.group(5))
+
+    month_abbv = _MONTH_NUM_TO_ABV.get(month)
+    if month_abbv is None:
+        logger.debug("_normalize_ticker: unknown month %d in ticker %r", month, ticker)
+        return t  # can't normalize, return as-is
+
+    yy = str(year)[-2:]
+    normalized = f"{series}-{yy}{month_abbv}{day:02d}-T{threshold}"
+    logger.debug("_normalize_ticker: %r → %r", ticker, normalized)
+    return normalized
+
+
 def _parse_ticker(ticker: str) -> dict[str, Any] | None:
     """Extract structured fields from a Kalshi weather contract ticker.
 
@@ -335,6 +389,7 @@ def _parse_ticker(ticker: str) -> dict[str, Any] | None:
         _parse_ticker("KXHIGHCHI-26MAR18-B51.5")
         # → {"series": "KXHIGHCHI", "target_date": date(2026, 3, 18), "threshold_f": 52}
     """
+    ticker = _normalize_ticker(ticker)
     match = _TICKER_RE.match(ticker.upper().strip())
     if not match:
         logger.debug("_parse_ticker: no match for ticker %r", ticker)
@@ -379,10 +434,11 @@ def _parse_contract(market: dict[str, Any], now_utc: datetime) -> MarketContract
         A populated :class:`~deep_isobar.core.types.MarketContract`,
         or ``None`` if the market cannot be mapped to the Deep Isobar schema.
     """
-    ticker: str = market.get("ticker", "")
+    raw_ticker: str = market.get("ticker", "")
+    ticker = _normalize_ticker(raw_ticker)  # normalize alternate formats (e.g. Boston)
     parsed = _parse_ticker(ticker)
     if parsed is None:
-        logger.debug("_parse_contract: skipping unparseable ticker %r", ticker)
+        logger.debug("_parse_contract: skipping unparseable ticker %r", raw_ticker)
         return None
 
     # Read strike_type from the API response.  Kalshi returns "less", "greater",
@@ -671,13 +727,18 @@ def _stub_fetch_live_contracts(series_ticker: str | None = None) -> list[MarketC
     city = meta.get("city", "Chicago")
     city_tag = (series_ticker or "CHI").upper()
 
+    # Build canonical ticker: KXHIGHBOS-26APR15-T30 (not the legacy underscore format)
+    month_abbv = _MONTH_NUM_TO_ABV[target_date.month]
+    yy = str(target_date.year)[-2:]
+    dd = f"{target_date.day:02d}"
+
     logger.info(
         "fetch_live_contracts [STUB]: target_date=%s thresholds=%s",
         target_date, thresholds,
     )
     return [
         MarketContract(
-            contract_id=f"{city_tag}_HIGH_TEMP_F_GT_{t}_{target_date.strftime('%Y%m%d')}",
+            contract_id=f"{city_tag}-{yy}{month_abbv}{dd}-T{t}",
             market_source=_MARKET_SOURCE,
             city=city,
             metric="high_temp_f",
