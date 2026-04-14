@@ -66,6 +66,7 @@ from __future__ import annotations
 import calendar
 import logging
 import random
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -123,6 +124,15 @@ _OUTPUT_COLUMNS = [
 ]
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+# Serialize cfgrib opens across threads.  Chicago and Dallas share the same
+# cached GRIB2 snippets (city-agnostic grid files).  When two threads call
+# cfgrib.open_dataset() on the same file simultaneously, one regenerates the
+# stale .*.idx sidecar while the other's eccodes context is mid-read, causing:
+#   ECCODES ERROR: grib_handle_create: Cannot create handle, no definitions found
+# The lock ensures only one thread opens/parses a GRIB file at a time; the
+# scalar extraction (arr.flat[0]) and unit conversion are done outside the lock.
+_GRIB_OPEN_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Dependency guard
@@ -418,17 +428,38 @@ def _extract_fahrenheit(grib_path: Path, lat: float, lon_360: float) -> float:
     """
     import cfgrib  # noqa: PLC0415 — deferred, behind _check_cfgrib guard
 
-    ds = cfgrib.open_dataset(
-        str(grib_path),
-        filter_by_keys={"typeOfLevel": "heightAboveGround", "level": 2},
-        errors="raise",
-    )
+    with _GRIB_OPEN_LOCK:
+        # Purge stale cfgrib index sidecars before opening.  The sidecar
+        # filename embeds a version hash (e.g. .da267.idx) that changes when
+        # cfgrib is updated; leaving stale sidecars causes cfgrib to warn and
+        # regenerate them.  Deleting them here is safe: cfgrib will recreate the
+        # index on the next open.  Crucially, this must happen inside the lock so
+        # that two threads never simultaneously try to regenerate the same index,
+        # which causes eccodes to lose its handle context and raise:
+        #   "Cannot create handle, no definitions found"
+        for stale_idx in grib_path.parent.glob(f"{grib_path.name}.*.idx"):
+            stale_idx.unlink(missing_ok=True)
 
-    # cfgrib names 2m temperature "t2m" (CF convention for height-above-ground)
-    var = "t2m" if "t2m" in ds else "t"
-    t_k = float(
-        ds[var].sel(latitude=lat, longitude=lon_360, method="nearest").values
-    )
+        ds = cfgrib.open_dataset(
+            str(grib_path),
+            filter_by_keys={"typeOfLevel": "heightAboveGround", "level": 2},
+            errors="raise",
+        )
+
+        # cfgrib names 2m temperature "t2m" (CF convention for height-above-ground)
+        var = "t2m" if "t2m" in ds else "t"
+        # .sel() with scalar lat/lon should return a 0-d DataArray, but cfgrib may
+        # leave a residual `step` or `valid_time` dimension when the GRIB2 byte-range
+        # snippet contains multiple records.  Evaluating such a multi-element numpy
+        # array in a boolean or float() context raises:
+        #   "The truth value of an array with more than one element is ambiguous"
+        # or the equivalent "only size-1 arrays can be converted to Python scalars".
+        # .squeeze() collapses all size-1 dimensions first; .flat[0] then extracts
+        # a Python scalar safely regardless of the remaining array shape.
+        arr = ds[var].sel(latitude=lat, longitude=lon_360, method="nearest").squeeze().values
+
+    # Pure Python math — no need to hold the lock past the array extraction.
+    t_k = float(arr.flat[0])
     t_f = (t_k - 273.15) * 9.0 / 5.0 + 32.0
     return round(t_f, 2)
 
