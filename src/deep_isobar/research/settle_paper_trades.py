@@ -1,7 +1,7 @@
 """Settle paper trades against NOAA actual daily high temperature.
 
 Run after ~18:00 local time (6 PM CDT) once NOAA/ACIS has posted the
-official daily high for Chicago::
+official daily high for each traded city::
 
     python -m deep_isobar.research.settle_paper_trades
     python -m deep_isobar.research.settle_paper_trades --date 2026-04-01
@@ -10,7 +10,8 @@ Pipeline
 --------
 1. Read ``data/paper_trades/paper_trades.csv``.
 2. Find OPEN rows whose ``date`` matches the settle date (default: today).
-3. Fetch the actual high_temp_f from NOAA/ACIS for that date.
+3. Group OPEN rows by city; for each city fetch the actual high_temp_f from
+   NOAA/ACIS using the city's ``acis_station_id`` (from ``config/cities.yaml``).
 4. For each open trade determine WIN or LOSS:
 
    - **BUY** (long YES):  WIN if ``actual_high >= threshold_f``
@@ -29,8 +30,12 @@ Pipeline
 ACIS availability note
 ----------------------
 NOAA/ACIS typically posts the official daily high by 20:00–23:00 local
-time, though Chicago (KORD) is usually available by ~18:00 CDT.  If the
+time, though Chicago (KMDW) is usually available by ~18:00 CDT.  If the
 script reports missing data, wait 30–60 minutes and retry.
+
+The settlement station used per city is ``acis_station_id`` from
+``config/cities.yaml``.  For example, Dallas uses ``CLIDFW`` (the Kalshi
+official settlement station) rather than the METAR station ``KDFW``.
 """
 
 from __future__ import annotations
@@ -47,7 +52,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, etc.
 
 from deep_isobar.calibration import bias_loader
-from deep_isobar.data.city_universe import get_city_profile
+from deep_isobar.data.city_universe import get_city_profile, load_city_profiles
 from deep_isobar.data.historical_noaa_ingest import fetch_settlement_observations
 from deep_isobar.notifications.discord_notifier import (
     COLOR_GREEN,
@@ -65,9 +70,11 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _PAPER_TRADES_CSV = _PROJECT_ROOT / "data" / "paper_trades" / "paper_trades.csv"
 
-CITY = "Chicago"
 KALSHI_FEE_RATE = 0.07   # 7% fee deducted from gross profit on winning trades
 _DEFAULT_POSITION_SIZE = 10.0
+# Fallback city when the 'city' column is absent or empty (legacy rows written
+# before the multi-city refactor — all of which are Chicago trades).
+_LEGACY_CITY_DEFAULT = "Chicago"
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +82,15 @@ _DEFAULT_POSITION_SIZE = 10.0
 # ---------------------------------------------------------------------------
 
 
-def _fetch_noaa_actual(settle_date: date) -> float | None:
+def _fetch_noaa_actual(city_name: str, settle_date: date) -> float | None:
     """Return the official NOAA high_temp_f for *settle_date* from ACIS.
 
-    Uses :func:`~deep_isobar.data.historical_noaa_ingest.fetch_settlement_observations`
-    which calls the ACIS StnData endpoint — no API key required.
+    Uses ``acis_station_id`` from the city config (falling back to
+    ``station_id``) via
+    :func:`~deep_isobar.data.historical_noaa_ingest.fetch_settlement_observations`.
 
     Args:
+        city_name: Exact city name as in ``config/cities.yaml``.
         settle_date: The date to fetch the observed high for.
 
     Returns:
@@ -89,21 +98,21 @@ def _fetch_noaa_actual(settle_date: date) -> float | None:
     """
     try:
         df = fetch_settlement_observations(
-            city=CITY,
+            city=city_name,
             start_date=settle_date,
             end_date=settle_date,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.error("ACIS fetch failed for %s: %s", settle_date, exc)
+        logger.error("[%s] ACIS fetch failed for %s: %s", city_name, settle_date, exc)
         return None
 
     if df.empty:
-        logger.warning("ACIS returned no rows for %s", settle_date)
+        logger.warning("[%s] ACIS returned no rows for %s", city_name, settle_date)
         return None
 
     df = df[df["quality_flag"] != "missing"]
     if df.empty:
-        logger.warning("ACIS data for %s has quality_flag=missing", settle_date)
+        logger.warning("[%s] ACIS data for %s has quality_flag=missing", city_name, settle_date)
         return None
 
     return float(df.iloc[0]["high_temp_f"])
@@ -161,13 +170,15 @@ def _settle_open_trades(
     df: pd.DataFrame,
     settle_date: date,
     settled_temp: float,
+    city_name: str,
 ) -> tuple[pd.DataFrame, int]:
-    """Mark OPEN trades for *settle_date* as WIN/LOSS and populate PnL fields.
+    """Mark OPEN trades for *settle_date* and *city_name* as WIN/LOSS.
 
     Args:
         df: Full paper_trades DataFrame.
         settle_date: Date being settled.
         settled_temp: Observed high temperature in °F.
+        city_name: City whose OPEN rows should be settled.
 
     Returns:
         ``(updated_df, n_settled)`` where *n_settled* is the count of rows
@@ -175,13 +186,27 @@ def _settle_open_trades(
     """
     df = df.copy()
 
+    # Determine which rows belong to this city.  The 'city' column was added
+    # in the multi-city refactor.  Legacy rows (empty city) default to Chicago.
+    if "city" in df.columns:
+        city_col = df["city"].fillna("").str.strip()
+        city_mask = city_col.apply(
+            lambda v: (v == city_name) or (v == "" and city_name == _LEGACY_CITY_DEFAULT)
+        )
+    else:
+        # Column absent entirely — treat all rows as Chicago.
+        city_mask = pd.Series(
+            [city_name == _LEGACY_CITY_DEFAULT] * len(df), index=df.index
+        )
+
     open_mask = (
         (df["date"].astype(str) == str(settle_date))
         & (df["status"] == "OPEN")
+        & city_mask
+        & ~df["contract_ticker"].str.contains(r"-B", na=False)
     )
 
     def _parse_optional_int(val) -> int | None:
-        """Parse an integer from a CSV cell that may be empty or NaN."""
         try:
             s = str(val).strip()
             if s in ("", "nan", "None"):
@@ -202,19 +227,12 @@ def _settle_open_trades(
             else _DEFAULT_POSITION_SIZE
         )
 
-        # Determine the YES-settlement outcome from strike_type.
-        # Rows written before this fix may lack strike_type; fall back to
-        # parsing the ticker for the bracket letter.
         strike_type = str(row.get("strike_type", "") or "").lower().strip()
         if not strike_type:
-            # Legacy fallback: infer from ticker name
             ticker = str(row.get("contract_ticker", ""))
             import re as _re
             m = _re.search(r"-([BT])[\d.]+$", ticker, _re.IGNORECASE)
             if m and m.group(1).upper() == "T":
-                # T-contracts: lower T = "less" edge, upper T = "greater" edge.
-                # Without cap/floor data we can't distinguish; default to "less"
-                # (T66 was a "less" contract) and log a warning.
                 strike_type = "less"
                 logger.warning(
                     "settle: missing strike_type for %r — inferred 'less'; "
@@ -231,12 +249,8 @@ def _settle_open_trades(
         floor_strike = _parse_optional_int(row.get("floor_strike"))
         cap_strike   = _parse_optional_int(row.get("cap_strike"))
 
-        # Kalshi settlement rules by strike_type:
-        #   less    → YES if actual < cap_strike    (e.g. T66: actual < 66)
-        #   greater → YES if actual > floor_strike  (e.g. T67: actual > 67)
         if strike_type == "less":
             if cap_strike is None:
-                # Legacy fallback: use threshold_f as cap_strike
                 cap_strike = int(float(row["threshold_f"]))
                 logger.warning(
                     "settle: missing cap_strike for %r — using threshold_f=%s",
@@ -260,10 +274,9 @@ def _settle_open_trades(
 
         pnl = _compute_pnl(direction, entry_price, realized_outcome, position_size)
 
-        # Label outcome from the trade's perspective
         if direction == "BUY":
             status = "WIN" if realized_outcome == 1 else "LOSS"
-        else:  # SELL
+        else:
             status = "WIN" if realized_outcome == 0 else "LOSS"
 
         df.loc[idx, "status"] = status
@@ -332,22 +345,24 @@ def _print_pnl_summary(df: pd.DataFrame) -> None:
 
 
 def _update_bias_profile(
+    city_name: str,
     settle_date: date,
     settled_rows: pd.DataFrame,
     settled_temp: float,
 ) -> None:
     """Push one calibration point into the bias_loader parquet for this date.
 
-    Reads ``ensemble_mean_f`` from *settled_rows* (all rows share the same
-    value — it's the session-level raw ensemble mean logged at trade time).
-    Skips silently when the column is absent (rows written before the column
-    was added) or NaN.  Never raises — a failure here must not abort settlement.
+    Uses ``station_id`` (METAR station) for the parquet file key — this is
+    intentional; the bias profile tracks model vs. METAR-collocated errors,
+    independent of the ACIS settlement station.
+
+    Never raises — a failure here must not abort settlement.
     """
     try:
         if "ensemble_mean_f" not in settled_rows.columns:
             logger.debug(
-                "Skipping bias update for %s — ensemble_mean_f column absent (legacy row)",
-                settle_date,
+                "[%s] Skipping bias update for %s — ensemble_mean_f column absent (legacy row)",
+                city_name, settle_date,
             )
             return
 
@@ -357,13 +372,15 @@ def _update_bias_profile(
 
         if raw_mean_series.empty:
             logger.debug(
-                "Skipping bias update for %s — ensemble_mean_f is NaN (legacy row)",
-                settle_date,
+                "[%s] Skipping bias update for %s — ensemble_mean_f is NaN (legacy row)",
+                city_name, settle_date,
             )
             return
 
         raw_mean_f = float(raw_mean_series.iloc[0])
-        station_id = get_city_profile(CITY).station_id
+        # Use station_id (METAR), not acis_station_id, for bias profile key.
+        profile = get_city_profile(city_name)
+        station_id = profile.station_id
 
         bias_loader.update_profile_after_settlement(
             station_id=station_id,
@@ -372,12 +389,13 @@ def _update_bias_profile(
             actual_f=settled_temp,
         )
         logger.info(
-            "Bias profile updated — %s  raw_mean=%.2f°F  actual=%.2f°F  error=%.2f°F",
-            station_id, raw_mean_f, settled_temp, raw_mean_f - settled_temp,
+            "[%s] Bias profile updated — %s  raw_mean=%.2f°F  actual=%.2f°F  error=%.2f°F",
+            city_name, station_id, raw_mean_f, settled_temp, raw_mean_f - settled_temp,
         )
     except Exception:
         logger.exception(
-            "Bias profile update failed for %s — settlement is unaffected", settle_date
+            "[%s] Bias profile update failed for %s — settlement is unaffected",
+            city_name, settle_date,
         )
 
 
@@ -389,11 +407,13 @@ def _update_bias_profile(
 def settle(settle_date: date) -> None:
     """Settle all OPEN paper trades for *settle_date*.
 
+    Groups OPEN rows by city, fetches the NOAA actual for each city using
+    the city's ``acis_station_id``, and settles each group independently.
+
     Args:
         settle_date: The date to settle (typically today, after ~18:00 local).
 
-    Exits with code 1 if ``paper_trades.csv`` is missing or the NOAA actual
-    cannot be fetched.
+    Exits with code 1 if ``paper_trades.csv`` is missing.
     """
     if not _PAPER_TRADES_CSV.exists():
         logger.error(
@@ -408,8 +428,7 @@ def settle(settle_date: date) -> None:
         dtype={"threshold_f": float, "position_size": float},
     )
 
-    # Safety net: warn about any B-type contracts that slipped into the CSV
-    # before the _parse_contract fix.  Do not attempt to settle them.
+    # Warn about B-type contracts (bracket; not yet settleable).
     b_contracts = df[df["contract_ticker"].str.contains(r"-B", na=False)]
     if not b_contracts.empty:
         for _, b_row in b_contracts.iterrows():
@@ -419,94 +438,127 @@ def settle(settle_date: date) -> None:
                 b_row["contract_ticker"], b_row["status"],
             )
 
-    open_today = df[
+    # Determine which cities have OPEN trades on this date.
+    open_today_mask = (
         (df["date"].astype(str) == str(settle_date))
         & (df["status"] == "OPEN")
         & ~df["contract_ticker"].str.contains(r"-B", na=False)
-    ]
+    )
+    open_today = df[open_today_mask]
 
     if open_today.empty:
         logger.info("No OPEN trades for %s — nothing to settle.", settle_date)
         _print_pnl_summary(df)
         return
 
-    logger.info(
-        "Fetching NOAA actual high_temp_f for %s (Chicago / KORD)…",
-        settle_date,
-    )
-    settled_temp = _fetch_noaa_actual(settle_date)
-
-    if settled_temp is None:
-        logger.error(
-            "NOAA actual high_temp_f not yet available for %s.\n"
-            "ACIS typically posts by 18:00–23:00 CDT. Try again later.",
-            settle_date,
+    # Resolve the city for each open row.  The 'city' column was added in the
+    # multi-city refactor; legacy rows (empty or absent) default to Chicago.
+    if "city" in open_today.columns:
+        cities_with_open = (
+            open_today["city"].fillna("").str.strip()
+            .apply(lambda v: v if v else _LEGACY_CITY_DEFAULT)
+            .unique()
+            .tolist()
         )
-        sys.exit(1)
+    else:
+        cities_with_open = [_LEGACY_CITY_DEFAULT]
 
-    logger.info("NOAA actual high_temp_f for %s: %.1f°F", settle_date, settled_temp)
+    # Settle each city independently.
+    n_total_settled = 0
+    all_newly_settled_rows: list[pd.DataFrame] = []
 
-    df, n_settled = _settle_open_trades(df, settle_date, settled_temp)
+    for city_name in cities_with_open:
+        logger.info(
+            "[%s] Fetching NOAA actual high_temp_f for %s…",
+            city_name, settle_date,
+        )
+        settled_temp = _fetch_noaa_actual(city_name, settle_date)
 
-    # Write updated CSV
+        if settled_temp is None:
+            logger.error(
+                "[%s] NOAA actual high_temp_f not yet available for %s.\n"
+                "ACIS typically posts by 18:00–23:00 CDT. Try again later.",
+                city_name, settle_date,
+            )
+            # Continue with other cities rather than exiting.
+            continue
+
+        logger.info(
+            "[%s] NOAA actual high_temp_f for %s: %.1f°F",
+            city_name, settle_date, settled_temp,
+        )
+
+        df, n_settled = _settle_open_trades(df, settle_date, settled_temp, city_name)
+        n_total_settled += n_settled
+
+        newly_settled = df[
+            (df["date"].astype(str) == str(settle_date))
+            & df["status"].isin(["WIN", "LOSS"])
+            & (
+                df["city"].fillna("").str.strip().apply(
+                    lambda v: (v == city_name) or (v == "" and city_name == _LEGACY_CITY_DEFAULT)
+                )
+                if "city" in df.columns
+                else pd.Series([city_name == _LEGACY_CITY_DEFAULT] * len(df), index=df.index)
+            )
+        ]
+
+        if not newly_settled.empty:
+            all_newly_settled_rows.append(newly_settled)
+
+            # Push calibration point into bias_loader.
+            _update_bias_profile(city_name, settle_date, newly_settled, settled_temp)
+
+            # Print newly settled trades for this city.
+            print(f"\n  [{city_name}] Settled {len(newly_settled)} trade(s) for {settle_date}:")
+            for _, trade_row in newly_settled.iterrows():
+                print(
+                    f"    {trade_row['direction']:<4}  "
+                    f"{trade_row['contract_ticker']:<40}  "
+                    f"thr={trade_row['threshold_f']:.0f}°F  "
+                    f"actual={settled_temp:.1f}°F  "
+                    f"{trade_row['status']:<4}  "
+                    f"pnl={float(trade_row['realized_pnl']):+.4f}"
+                )
+
+            # ── Per-trade Discord embeds ───────────────────────────────────
+            for _, trade_row in newly_settled.iterrows():
+                is_win = trade_row["status"] == "WIN"
+                pnl = float(trade_row["realized_pnl"])
+                post_embed(
+                    title=f"{'WIN' if is_win else 'LOSS'} \u2014 [{city_name}] {trade_row['contract_ticker']}",
+                    color=COLOR_GREEN if is_win else COLOR_RED,
+                    fields=[
+                        {"name": "Settled temp",  "value": f"{settled_temp:.1f}\u00b0F"},
+                        {"name": "Threshold",     "value": f"{trade_row['threshold_f']:.0f}\u00b0F"},
+                        {"name": "Realized P&L",  "value": f"{pnl:+.4f}"},
+                        {"name": "Entry price",   "value": f"{float(trade_row['entry_price']):.4f}"},
+                    ],
+                )
+
+    # Write the fully updated CSV once (after all cities settled).
     df.to_csv(_PAPER_TRADES_CSV, index=False)
-    logger.info("Wrote %d settled row(s) to %s", n_settled, _PAPER_TRADES_CSV)
+    logger.info("Wrote %d settled row(s) to %s", n_total_settled, _PAPER_TRADES_CSV)
 
-    # Push one calibration point into the bias profile parquet
-    newly_settled = df[
-        (df["date"].astype(str) == str(settle_date))
-        & df["status"].isin(["WIN", "LOSS"])
-    ]
-    _update_bias_profile(settle_date, newly_settled, settled_temp)
-
-    # Print newly settled trades
-    newly_settled = df[
-        (df["date"].astype(str) == str(settle_date))
-        & df["status"].isin(["WIN", "LOSS"])
-    ]
-    if not newly_settled.empty:
-        print(f"\n  Settled {len(newly_settled)} trade(s) for {settle_date}:")
-        for _, trade_row in newly_settled.iterrows():
-            print(
-                f"    {trade_row['direction']:<4}  "
-                f"{trade_row['contract_ticker']:<40}  "
-                f"thr={trade_row['threshold_f']:.0f}°F  "
-                f"actual={settled_temp:.1f}°F  "
-                f"{trade_row['status']:<4}  "
-                f"pnl={float(trade_row['realized_pnl']):+.4f}"
-            )
-
-        # ── Per-trade Discord embeds ───────────────────────────────────────
-        for _, trade_row in newly_settled.iterrows():
-            is_win = trade_row["status"] == "WIN"
-            pnl = float(trade_row["realized_pnl"])
-            post_embed(
-                title=f"{'WIN' if is_win else 'LOSS'} \u2014 {trade_row['contract_ticker']}",
-                color=COLOR_GREEN if is_win else COLOR_RED,
-                fields=[
-                    {"name": "Settled temp",  "value": f"{settled_temp:.1f}\u00b0F"},
-                    {"name": "Threshold",     "value": f"{trade_row['threshold_f']:.0f}\u00b0F"},
-                    {"name": "Realized P&L",  "value": f"{pnl:+.4f}"},
-                    {"name": "Entry price",   "value": f"{float(trade_row['entry_price']):.4f}"},
-                ],
-            )
-
-        # ── Summary embed ─────────────────────────────────────────────────
+    # ── Summary Discord embed ─────────────────────────────────────────────
+    if n_total_settled > 0:
         all_settled = df[df["status"].isin(["WIN", "LOSS"])].copy()
         all_settled["realized_pnl"] = pd.to_numeric(
             all_settled["realized_pnl"], errors="coerce"
         ).fillna(0.0)
-        n_total = len(all_settled)
-        n_wins  = int((all_settled["status"] == "WIN").sum())
-        session_pnl    = float(newly_settled["realized_pnl"].astype(float).sum())
+        n_wins = int((all_settled["status"] == "WIN").sum())
+        session_pnl = sum(
+            float(r["realized_pnl"].astype(float).sum())
+            for r in all_newly_settled_rows
+        ) if all_newly_settled_rows else 0.0
         cumulative_pnl = float(all_settled["realized_pnl"].sum())
         post_embed(
             title=f"Settlement complete \u2014 {settle_date}",
             color=COLOR_BLUE,
             fields=[
-                {"name": "Trades settled",  "value": str(n_settled)},
+                {"name": "Trades settled",  "value": str(n_total_settled)},
                 {"name": "Wins",            "value": str(n_wins)},
-                {"name": "Losses",          "value": str(n_total - n_wins)},
+                {"name": "Losses",          "value": str(len(all_settled) - n_wins)},
                 {"name": "Session P&L",     "value": f"{session_pnl:+.4f}"},
                 {"name": "Cumulative P&L",  "value": f"{cumulative_pnl:+.4f}"},
             ],
@@ -531,7 +583,8 @@ if __name__ == "__main__":
         description=(
             "Settle paper trades against NOAA actual daily high temperature.\n\n"
             "Run after ~18:00 local time when ACIS has posted the official\n"
-            "daily high for Chicago (KORD)."
+            "daily highs.  Handles all active cities automatically using\n"
+            "each city's acis_station_id from config/cities.yaml."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

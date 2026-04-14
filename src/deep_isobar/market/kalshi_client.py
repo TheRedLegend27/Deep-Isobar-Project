@@ -568,18 +568,24 @@ def _parse_orderbook_response(
 # ---------------------------------------------------------------------------
 
 
-def _fetch_live_contracts_from_api(credentials: tuple[str, Any]) -> list[MarketContract]:
-    """Fetch and parse open Chicago weather contracts from the Kalshi API.
+def _fetch_live_contracts_from_api(
+    credentials: tuple[str, Any],
+    series_ticker: str | None = None,
+) -> list[MarketContract]:
+    """Fetch and parse open weather contracts for one series from the Kalshi API.
 
     Paginates automatically (up to :data:`_MAX_PAGES` pages).
 
     Args:
         credentials: ``(key_id, private_key)`` from :func:`_load_credentials`.
+        series_ticker: Kalshi series identifier (e.g. ``"KXHIGHCHI"``).
+            When ``None``, reads ``markets.kalshi.series_ticker`` from
+            ``config/settings.yaml`` (default: ``"KXHIGHCHI"``).
 
     Returns:
         List of parsed :class:`~deep_isobar.core.types.MarketContract` objects.
     """
-    series_ticker = get_setting("markets.kalshi.series_ticker", "KXHIGHCHI")
+    series_ticker = series_ticker or get_setting("markets.kalshi.series_ticker", "KXHIGHCHI")
     now_utc = datetime.now(timezone.utc)
     contracts: list[MarketContract] = []
     cursor: str | None = None
@@ -701,11 +707,14 @@ def _stub_fetch_orderbook(contract_id: str) -> OrderBookSnapshot:
 # ---------------------------------------------------------------------------
 
 
-def fetch_live_contracts(market_source: str) -> list[MarketContract]:
-    """Return live temperature contracts for the given market source.
+def fetch_live_contracts(
+    market_source: str,
+    series_ticker: str | None = None,
+) -> list[MarketContract]:
+    """Return live temperature contracts for the given market source and series.
 
     In **live mode** (credentials present and valid), calls
-    ``GET /markets`` filtered to the configured Chicago weather series.
+    ``GET /markets`` filtered to *series_ticker*.
     Falls back to stub data automatically on any API error.
 
     In **stub mode**, returns 7 deterministic Chicago ``high_temp_f >= T``
@@ -714,6 +723,9 @@ def fetch_live_contracts(market_source: str) -> list[MarketContract]:
     Args:
         market_source: Exchange identifier.  Only ``"Kalshi"`` (case-
             insensitive) is accepted; any other value raises immediately.
+        series_ticker: Kalshi series (e.g. ``"KXHIGHCHI"``, ``"KXHIGHTDAL"``).
+            When ``None``, reads ``markets.kalshi.series_ticker`` from
+            ``config/settings.yaml``.
 
     Returns:
         List of :class:`~deep_isobar.core.types.MarketContract` objects.
@@ -723,7 +735,7 @@ def fetch_live_contracts(market_source: str) -> list[MarketContract]:
 
     Example::
 
-        contracts = fetch_live_contracts("Kalshi")
+        contracts = fetch_live_contracts("Kalshi", series_ticker="KXHIGHTDAL")
         for c in contracts:
             print(c.contract_id, c.threshold_f)
     """
@@ -746,7 +758,7 @@ def fetch_live_contracts(market_source: str) -> list[MarketContract]:
 
     logger.info("fetch_live_contracts: live mode — calling Kalshi API")
     try:
-        contracts = _fetch_live_contracts_from_api(credentials)
+        contracts = _fetch_live_contracts_from_api(credentials, series_ticker=series_ticker)
         if not contracts:
             logger.warning(
                 "fetch_live_contracts: API returned 0 parseable contracts — "

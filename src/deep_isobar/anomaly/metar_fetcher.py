@@ -1,4 +1,4 @@
-"""METAR fetch and parse utilities for KMDW (Chicago Midway Airport).
+"""METAR fetch and parse utilities for arbitrary ICAO stations.
 
 Fetches the latest raw METAR from aviationweather.gov and extracts the
 key fields used by the anomaly detector: wind direction, sky cover,
@@ -15,32 +15,40 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_METAR_URL = "https://aviationweather.gov/api/data/metar?ids=KMDW&format=raw"
+_METAR_URL_TEMPLATE = "https://aviationweather.gov/api/data/metar?ids={station_id}&format=raw"
 
 _CARDINAL = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 _SKY_PRIORITY = {"CLR": 0, "SKC": 0, "FEW": 1, "SCT": 2, "BKN": 3, "OVC": 4}
 
 
-def fetch_kmdw_metar() -> str:
-    """Fetch the latest raw METAR for KMDW from aviationweather.gov.
+def fetch_metar(station_id: str) -> str:
+    """Fetch the latest raw METAR for *station_id* from aviationweather.gov.
+
+    Args:
+        station_id: ICAO station identifier (e.g. ``"KMDW"``, ``"KDFW"``).
 
     Returns:
         Raw METAR string (e.g. ``"KMDW 101053Z 34007KT ..."``), or an empty
         string on any network or parse failure.
     """
+    url = _METAR_URL_TEMPLATE.format(station_id=station_id.upper())
     try:
-        resp = requests.get(_METAR_URL, timeout=10)
+        resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         text = resp.text.strip()
         for line in text.splitlines():
             line = line.strip()
-            if line.startswith("KMDW"):
+            if line.startswith(station_id.upper()):
                 return line
-        # Fall back to first non-empty line if no KMDW-prefixed line found
+        # Fall back to first non-empty line if no station-prefixed line found
         return text.splitlines()[0].strip() if text else ""
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to fetch KMDW METAR: %s", exc)
+        logger.warning("Failed to fetch METAR for %s: %s", station_id, exc)
         return ""
+
+
+# Backward-compatible alias — existing imports of fetch_kmdw_metar continue to work.
+fetch_kmdw_metar = lambda: fetch_metar("KMDW")  # noqa: E731
 
 
 def _deg_to_cardinal(deg: float) -> str:

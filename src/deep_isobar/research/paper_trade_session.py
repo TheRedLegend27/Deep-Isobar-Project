@@ -1,8 +1,8 @@
-"""Daily paper trade session for Deep Isobar.
+"""Daily paper trade session for Deep Isobar — multi-city orchestrator.
 
-Fetches the current GFS T+24 forecast for Chicago's tomorrow high,
-pulls live Kalshi bid/ask for the matching contracts, runs the
-ensemble → probability → alpha pipeline, and logs signals to CSV.
+Loads all active cities from ``config/cities.yaml``, runs each city's
+forecast → ensemble → Kalshi → spreading pipeline concurrently, and logs
+signals to CSV.
 
 Run once per day before the decision cutoff (~12:00 UTC / 7 am CDT)::
 
@@ -25,7 +25,9 @@ date, contract_ticker, direction, alpha, model_prob, market_prob,
 ensemble_mean_f, entry_price, position_size, status, realized_pnl,
 settled_temp, threshold_f, strike_type, floor_strike, cap_strike,
 anomaly_flags, anomaly_penalty_f, anomaly_adjusted_signal,
-anomaly_confidence, anomaly_reasoning
+anomaly_confidence, anomaly_reasoning, spread_rank,
+spread_total_contracts, sizing_base_usd, sizing_final_usd,
+sizing_reasoning, city
 
 See ``_CSV_COLUMNS`` for the authoritative list.
 
@@ -43,16 +45,19 @@ import argparse
 import csv
 import logging
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, etc.
 
-from deep_isobar.core.types import ForecastPoint, TradeSignal
-from deep_isobar.data.city_universe import get_city_profile
+from deep_isobar.core.types import CityProfile, ForecastPoint, TradeSignal
+from deep_isobar.data.city_universe import get_city_universe
 from deep_isobar.data.historical_forecast_ingest import (
     _AWS_BASE,
     _LEAD_FHOUR,
@@ -77,6 +82,7 @@ from deep_isobar.notifications.discord_notifier import (
     COLOR_AMBER,
     COLOR_BLUE,
     COLOR_GRAY,
+    COLOR_GREEN,
     COLOR_RED,
     post_embed,
 )
@@ -93,7 +99,6 @@ _PAPER_TRADES_CSV = _PAPER_TRADES_DIR / "paper_trades.csv"
 _DAILY_LOG_CSV = _PAPER_TRADES_DIR / "daily_log.csv"
 _GFS_CACHE_DIR = _PROJECT_ROOT / "data" / "historical" / "forecasts" / ".grib_cache"
 
-CITY = "Chicago"
 SIGNAL_THRESHOLD: float = get_setting("risk.alpha_threshold", default=0.25)
 logger.info(f"Signal threshold loaded from config: {SIGNAL_THRESHOLD}")
 POSITION_SIZE = 10.0        # contracts per trade (paper)
@@ -101,6 +106,9 @@ METRIC = "high_temp_f"
 # Minimum ensemble std applied when only one GFS run is available.
 # Matches the floor used in the Chicago backtest.
 _MIN_ENSEMBLE_STD_F = 5.5
+
+# Thread lock for CSV writes — multiple cities run concurrently.
+_CSV_LOCK = threading.Lock()
 
 _CSV_COLUMNS = [
     "date",
@@ -129,6 +137,7 @@ _CSV_COLUMNS = [
     "sizing_base_usd",
     "sizing_final_usd",
     "sizing_reasoning",
+    "city",
 ]
 
 
@@ -137,7 +146,7 @@ _CSV_COLUMNS = [
 # ---------------------------------------------------------------------------
 
 
-def _fetch_live_gfs_t24(city_profile, run_date: date) -> list[ForecastPoint]:
+def _fetch_live_gfs_t24(city_profile: CityProfile, run_date: date) -> list[ForecastPoint]:
     """Download GFS T+24 forecasts for *run_date*, targeting tomorrow's high.
 
     Tries 12z cycle (f030, 30 h lead) first, then 00z (f042, 42 h lead).
@@ -236,7 +245,7 @@ def _ensure_csv(path: Path) -> None:
     if existing == _CSV_COLUMNS:
         return  # schema matches exactly — nothing to do
     # Auto-migrate if existing header is a prefix of the current schema.
-    # This handles the case where new columns (e.g. spread_rank) were added.
+    # This handles the case where new columns (e.g. city) were appended.
     if existing == _CSV_COLUMNS[: len(existing)]:
         _migrate_csv_add_columns(path)
         logger.info(
@@ -279,7 +288,7 @@ def _append_csv_row(path: Path, row: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _print_signal(row: dict, signal, orderbook) -> None:
+def _print_signal(row: dict, signal: Any, orderbook: Any) -> None:
     """Print a single evaluated contract to stdout (dry-run mode)."""
     is_trade = row["status"] == "OPEN"
     tag = ">>> TRADE SIGNAL (would be logged)" if is_trade else "    no trade"
@@ -297,7 +306,8 @@ def _print_signal(row: dict, signal, orderbook) -> None:
         condition = "unknown"
 
     print(
-        f"\n  Contract    : {row['contract_ticker']}\n"
+        f"\n  City        : {row['city']}\n"
+        f"  Contract    : {row['contract_ticker']}\n"
         f"  Condition   : {condition}\n"
         f"  Direction   : {row['direction']}\n"
         f"  Alpha       : {float(row['alpha']):+.4f}\n"
@@ -311,47 +321,53 @@ def _print_signal(row: dict, signal, orderbook) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main session
+# Per-city session
 # ---------------------------------------------------------------------------
 
 
-def run_session(dry_run: bool = False) -> int:
-    """Run one paper trade session for tomorrow's Chicago high.
+def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
+    """Run one paper trade session for a single city.
+
+    Fetches GFS T+24 forecast for tomorrow's high, pulls live Kalshi
+    bid/ask for the city's contracts, runs the ensemble → probability →
+    alpha pipeline, and logs signals to CSV.
 
     Args:
+        city: City configuration profile.
         dry_run: When ``True``, print signals to stdout without writing to
             any CSV file.
 
     Returns:
-        Number of trade signals found (logged when ``dry_run=False``).
+        Dict with keys ``city`` (str), ``signals`` (int), ``error`` (str or None).
     """
     today = date.today()
     tomorrow = today + timedelta(days=1)
+    city_label = city.city
 
-    logger.info("=== Paper trade session  target_date=%s ===", tomorrow)
+    logger.info("=== [%s] Paper trade session  target_date=%s ===", city_label, tomorrow)
 
-    # ── City profile ───────────────────────────────────────────────────────
-    city_profile = get_city_profile(CITY)
+    result: dict = {"city": city_label, "signals": 0, "error": None}
 
     # ── GFS forecast ───────────────────────────────────────────────────────
     try:
-        forecast_points = _fetch_live_gfs_t24(city_profile, today)
+        forecast_points = _fetch_live_gfs_t24(city, today)
     except ImportError as exc:
-        logger.error("cfgrib/xarray/eccodes not installed: %s", exc)
-        sys.exit(1)
+        logger.error("[%s] cfgrib/xarray/eccodes not installed: %s", city_label, exc)
+        result["error"] = f"cfgrib not installed: {exc}"
+        return result
 
     if not forecast_points:
-        logger.error(
-            "No GFS T+24 forecast available for run_date=%s. "
-            "Check that the 00z or 12z run has been posted to AWS "
-            "(00z available ~05:00 UTC, 12z ~17:00 UTC).",
-            today,
+        msg = (
+            f"No GFS T+24 forecast available for {city_label} run_date={today}. "
+            "Check that the 00z or 12z run has been posted to AWS."
         )
-        sys.exit(1)
+        logger.error("[%s] %s", city_label, msg)
+        result["error"] = msg
+        return result
 
     # ── Temperature ensemble ───────────────────────────────────────────────
     ensemble = build_temperature_ensemble(
-        city_profile=city_profile,
+        city_profile=city,
         forecasts=forecast_points,
         target_date=tomorrow,
         metric=METRIC,
@@ -360,35 +376,40 @@ def run_session(dry_run: bool = False) -> int:
     effective_std = max(ensemble.adjusted_std_f, _MIN_ENSEMBLE_STD_F)
 
     logger.info(
-        "Ensemble: raw_mean=%.1f°F  bias_corrected=%.1f°F  "
+        "[%s] Ensemble: raw_mean=%.1f°F  bias_corrected=%.1f°F  "
         "adjusted_std=%.1f°F  (effective=%.1f°F)",
+        city_label,
         ensemble.ensemble_mean_f,
         ensemble.bias_corrected_mean_f,
         ensemble.adjusted_std_f,
         effective_std,
     )
 
-    # ── Anomaly detection ─────────────────────────────────────────────────────
-    # Runs once per session for logging only — does not affect trade decisions.
+    # ── Anomaly detection ─────────────────────────────────────────────────
+    # Use city.nws_lat/nws_lon for NWS; city.station_id for METAR.
     try:
-        from deep_isobar.anomaly import check_anomalies, fetch_kmdw_metar, parse_metar_fields
+        from deep_isobar.anomaly import check_anomalies, parse_metar_fields
+        from deep_isobar.anomaly.metar_fetcher import fetch_metar
         from deep_isobar.anomaly.nws_fetcher import fetch_nws_high_forecast_f
-        raw_metar = fetch_kmdw_metar()
+
+        raw_metar = fetch_metar(city.station_id)
         metar_fields = parse_metar_fields(raw_metar)
-        # CityProfile has no lat/lon fields — derive from _STATION_COORDS (360° lon → standard)
-        _nws_lat, _nws_lon_360 = _STATION_COORDS.get(
-            city_profile.station_id, (41.7868, 272.2478)
-        )
-        _nws_lon = _nws_lon_360 - 360.0 if _nws_lon_360 > 180.0 else _nws_lon_360
-        try:
-            nws_forecast_f = fetch_nws_high_forecast_f(lat=_nws_lat, lon=_nws_lon)
-        except Exception:
-            logger.debug("NWS fetcher raised unexpectedly — defaulting to None")
-            nws_forecast_f = None
+
+        nws_lat = city.nws_lat if city.nws_lat != 0.0 else None
+        nws_lon = city.nws_lon if city.nws_lon != 0.0 else None
+
+        nws_forecast_f = None
+        if nws_lat is not None and nws_lon is not None:
+            try:
+                nws_forecast_f = fetch_nws_high_forecast_f(lat=nws_lat, lon=nws_lon)
+            except Exception:
+                logger.debug("[%s] NWS fetcher raised unexpectedly — defaulting to None", city_label)
+
         if nws_forecast_f is not None:
-            logger.info(f"NWS forecast high: {nws_forecast_f:.1f}°F")
+            logger.info("[%s] NWS forecast high: %.1f°F", city_label, nws_forecast_f)
         else:
-            logger.debug("NWS forecast unavailable — anomaly NWS_MODEL_DIVERGENCE will not fire")
+            logger.debug("[%s] NWS forecast unavailable — NWS_MODEL_DIVERGENCE will not fire", city_label)
+
         anomaly = check_anomalies(
             metar=raw_metar,
             nws_forecast_f=nws_forecast_f,
@@ -397,7 +418,8 @@ def run_session(dry_run: bool = False) -> int:
             sky_cover=metar_fields.get("sky_cover", ""),
         )
         logger.info(
-            "Anomaly check: flags=%s  penalty=%.1f°F  signal=%s  confidence=%s",
+            "[%s] Anomaly check: flags=%s  penalty=%.1f°F  signal=%s  confidence=%s",
+            city_label,
             [f.code for f in anomaly.flags],
             anomaly.total_temp_penalty_f,
             anomaly.adjusted_signal,
@@ -405,11 +427,11 @@ def run_session(dry_run: bool = False) -> int:
         )
     except Exception as e:
         anomaly = None
-        logger.debug(f"Anomaly check skipped: {e}")
+        logger.debug("[%s] Anomaly check skipped: %s", city_label, e)
 
     if not dry_run:
         post_embed(
-            title="Deep Isobar \u2014 Morning run started",
+            title=f"Deep Isobar \u2014 [{city_label}] Morning run started",
             color=COLOR_BLUE,
             fields=[
                 {"name": "Target date",        "value": str(tomorrow)},
@@ -421,7 +443,9 @@ def run_session(dry_run: bool = False) -> int:
 
     # ── Live Kalshi contracts for tomorrow ────────────────────────────────
     try:
-        all_contracts = fetch_live_contracts("Kalshi")
+        # Use city.kalshi_series to fetch only this city's contracts.
+        series = city.kalshi_series or None
+        all_contracts = fetch_live_contracts("Kalshi", series_ticker=series)
         tomorrow_contracts = [
             c for c in all_contracts
             if c.target_date == tomorrow
@@ -431,36 +455,31 @@ def run_session(dry_run: bool = False) -> int:
 
         if not tomorrow_contracts:
             logger.warning(
-                "No active Kalshi high_temp_f contracts found for %s — "
+                "[%s] No active Kalshi high_temp_f contracts found for %s — "
                 "market may not be listed yet.",
-                tomorrow,
+                city_label, tomorrow,
             )
-            # Case 1: fetch returned nothing, or nothing matched the
-            # tomorrow / high_temp_f / less|greater filters.  The "No signals
-            # today" embed further below covers the distinct case where
-            # contracts exist but none clear the alpha threshold.
             if not dry_run:
                 post_embed(
-                    title="No contracts found",
+                    title=f"[{city_label}] No contracts found",
                     description=(
                         f"No active Kalshi high_temp_f contracts for {tomorrow}. "
                         "The market may not be listed yet."
                     ),
                     color=COLOR_GRAY,
                 )
-            return 0
+            result["signals"] = 0
+            return result
 
         logger.info(
-            "Found %d contracts for %s: thresholds=%s",
+            "[%s] Found %d contracts for %s: thresholds=%s",
+            city_label,
             len(tomorrow_contracts),
             tomorrow,
             sorted(c.threshold_f for c in tomorrow_contracts),
         )
 
-        # ── Probability surface ────────────────────────────────────────────────
-        # Compute one model probability per contract using the correct formula
-        # for each strike_type.  The dict is keyed by threshold_f (unique after
-        # "between" contracts are filtered) for consumption by market_scanner.
+        # ── Probability surface ────────────────────────────────────────────
         probability_surface: dict[int, float] = {}
         for _c in tomorrow_contracts:
             probability_surface[_c.threshold_f] = probability_for_contract(
@@ -471,7 +490,7 @@ def run_session(dry_run: bool = False) -> int:
                 std_f=effective_std,
             )
 
-        def _surface_label(c) -> str:
+        def _surface_label(c: Any) -> str:
             if c.strike_type == "less":
                 return f"P(T<{c.cap_strike})"
             if c.strike_type == "greater":
@@ -479,21 +498,20 @@ def run_session(dry_run: bool = False) -> int:
             return f"P(?{c.threshold_f})"
 
         logger.info(
-            "Probability surface: %s",
+            "[%s] Probability surface: %s",
+            city_label,
             {_surface_label(_c): f"{probability_surface[_c.threshold_f]:.3f}"
              for _c in sorted(tomorrow_contracts, key=lambda x: x.threshold_f)},
         )
 
-        # ── Evaluate each contract ─────────────────────────────────────────────
-        # Collect all rows first so we can deduplicate before writing.
+        # ── Evaluate each contract ─────────────────────────────────────────
         all_rows: list[dict] = []
-        dry_run_signals: list[tuple[dict, object, object]] = []  # (row, signal, orderbook)
-        # Maps contract_id → TradeSignal for use by the multi-bracket spreader.
+        dry_run_signals: list[tuple[dict, object, object]] = []
         signal_lookup: dict[str, TradeSignal] = {}
 
         for contract in sorted(tomorrow_contracts, key=lambda c: c.threshold_f):
             orderbook = fetch_orderbook_for_contract("Kalshi", contract.contract_id)
-            now_utc = datetime.now(timezone.utc)  # refresh after network call
+            now_utc = datetime.now(timezone.utc)
 
             micro_score = compute_microstructure_score(orderbook, now_utc)
             tail_flag = is_tail_threshold(
@@ -510,18 +528,15 @@ def run_session(dry_run: bool = False) -> int:
                 timestamp_utc=now_utc,
                 microstructure_score=micro_score,
                 tail_opportunity_flag=tail_flag,
-                tail_multiplier=city_profile.tail_multiplier,
+                tail_multiplier=city.tail_multiplier,
             )
-            # Store for multi-bracket spreading (populated regardless of dry_run).
             signal_lookup[contract.contract_id] = signal
 
-            # Entry price: cross the spread at execution side
             if signal.signal_side == "BUY":
                 entry_price = orderbook.best_ask
             elif signal.signal_side == "SELL":
                 entry_price = orderbook.best_bid
             else:
-                # HOLD — record mid for the daily log
                 if orderbook.best_bid is not None and orderbook.best_ask is not None:
                     entry_price = (orderbook.best_bid + orderbook.best_ask) / 2.0
                 else:
@@ -554,22 +569,19 @@ def run_session(dry_run: bool = False) -> int:
                 "anomaly_adjusted_signal": anomaly.adjusted_signal if anomaly else "",
                 "anomaly_confidence":      anomaly.confidence if anomaly else "",
                 "anomaly_reasoning":       anomaly.reasoning if anomaly else "",
-                # Spread metadata defaults — overwritten by multi-bracket block when enabled.
                 "spread_rank": 1,
                 "spread_total_contracts": 1,
-                # Sizing metadata defaults — overwritten by multi-bracket block when enabled.
                 "sizing_base_usd": "",
                 "sizing_final_usd": "",
                 "sizing_reasoning": "",
+                "city": city.city,
             }
 
             all_rows.append(row)
             if dry_run:
                 dry_run_signals.append((row, signal, orderbook))
 
-        # ── Deduplicate trade signals ──────────────────────────────────────────
-        # For each (threshold_f, direction) pair keep only the highest-alpha signal.
-        # key → best row seen so far
+        # ── Deduplicate trade signals ──────────────────────────────────────
         best_by_key: dict[tuple, dict] = {}
         for row in all_rows:
             if row["status"] != "OPEN":
@@ -579,8 +591,9 @@ def run_session(dry_run: bool = False) -> int:
             if existing is None or abs(row["alpha"]) > abs(existing["alpha"]):
                 if existing is not None:
                     logger.warning(
-                        "Dropping duplicate signal: %s (threshold=%.0f°F already covered"
+                        "[%s] Dropping duplicate signal: %s (threshold=%.0f°F already covered"
                         " by %s with higher alpha)",
+                        city_label,
                         existing["contract_ticker"],
                         existing["threshold_f"],
                         row["contract_ticker"],
@@ -588,36 +601,31 @@ def run_session(dry_run: bool = False) -> int:
                 best_by_key[key] = row
             else:
                 logger.warning(
-                    "Dropping duplicate signal: %s (threshold=%.0f°F already covered"
+                    "[%s] Dropping duplicate signal: %s (threshold=%.0f°F already covered"
                     " by %s with higher alpha)",
+                    city_label,
                     row["contract_ticker"],
                     row["threshold_f"],
                     existing["contract_ticker"],
                 )
 
-        # Mark dropped duplicates so the daily log reflects the dedup decision
         winning_tickers = {r["contract_ticker"] for r in best_by_key.values()}
         for row in all_rows:
             if row["status"] == "OPEN" and row["contract_ticker"] not in winning_tickers:
                 row["status"] = "DEDUP_DROP"
 
-        # ── Multi-bracket spreading ────────────────────────────────────────────
-        # Runs only when enabled in config.  Mutates OPEN row dicts in-place
-        # to assign spread_rank, spread_total_contracts, and position_size.
-        # Rows that are OPEN but don't make the spread cut are marked
-        # SPREAD_SKIP so the daily log reflects the selection decision.
+        # ── Multi-bracket spreading ────────────────────────────────────────
         multi_bracket_cfg = get_setting("risk.multi_bracket", default={})
         spreading_enabled = multi_bracket_cfg.get("enabled", False)
 
         if spreading_enabled:
             from deep_isobar.trading.bracket_spreader import build_spread, log_spread_summary
 
-            # ── Dynamic position sizing ────────────────────────────────────────
             dynamic_cfg = multi_bracket_cfg.get("dynamic_sizing", {})
             if dynamic_cfg.get("enabled", False):
                 from deep_isobar.trading.position_sizer import compute_exposure, log_sizing_decision
                 sizing = compute_exposure(
-                    anomaly_report=anomaly,           # already computed earlier in session
+                    anomaly_report=anomaly,
                     ensemble_std_f=ensemble.ensemble_std_f,
                     cfg=dynamic_cfg,
                 )
@@ -627,7 +635,6 @@ def run_session(dry_run: bool = False) -> int:
                 sizing = None
                 daily_exposure_cap_usd = multi_bracket_cfg.get("daily_exposure_cap_usd", 50.0)
 
-            # Stamp sizing columns on every row (session-level, same value for all)
             for row in all_rows:
                 if sizing is not None:
                     row["sizing_base_usd"] = sizing.base_exposure_usd
@@ -665,26 +672,26 @@ def run_session(dry_run: bool = False) -> int:
                             row["spread_rank"] = alloc.rank
                             row["spread_total_contracts"] = n_total
                         else:
-                            # OPEN signal didn't make the spread cut
                             row["status"] = "SPREAD_SKIP"
                             row["spread_total_contracts"] = n_total
 
-        # ── Dry-run output ─────────────────────────────────────────────────────
+        # ── Dry-run output ─────────────────────────────────────────────────
         if dry_run:
             signals_logged = 0
             for row, signal, orderbook in dry_run_signals:
                 _print_signal(row, signal, orderbook)
                 if row["status"] == "OPEN":
                     signals_logged += 1
-            return signals_logged
+            result["signals"] = signals_logged
+            return result
 
-        # ── Discord notifications ──────────────────────────────────────────────
+        # ── Discord notifications (per-city trade embeds) ──────────────────
         open_rows = [r for r in all_rows if r["status"] == "OPEN"]
         if open_rows:
             for row in open_rows:
                 entry_str = f"{row['entry_price']}" if row["entry_price"] != "" else "—"
                 post_embed(
-                    title=f"Signal: {row['contract_ticker']}",
+                    title=f"[{city_label}] Signal: {row['contract_ticker']}",
                     color=COLOR_AMBER,
                     fields=[
                         {"name": "Direction",    "value": row["direction"]},
@@ -697,66 +704,65 @@ def run_session(dry_run: bool = False) -> int:
                 )
         else:
             post_embed(
-                title="No signals today",
+                title=f"[{city_label}] No signals today",
                 description=f"No contracts met the |alpha| \u2265 {SIGNAL_THRESHOLD} threshold for {tomorrow}.",
                 color=COLOR_GRAY,
             )
 
-        # ── Write to CSV files ─────────────────────────────────────────────────
+        # ── Write to CSV files (thread-safe) ──────────────────────────────
         signals_logged = 0
-        _ensure_csv(_PAPER_TRADES_CSV)
-        _ensure_csv(_DAILY_LOG_CSV)
+        with _CSV_LOCK:
+            _ensure_csv(_PAPER_TRADES_CSV)
+            _ensure_csv(_DAILY_LOG_CSV)
 
-        for row in all_rows:
-            # Always record every evaluated contract in the daily log
-            _append_csv_row(_DAILY_LOG_CSV, row)
+            for row in all_rows:
+                _append_csv_row(_DAILY_LOG_CSV, row)
 
-            if row["status"] == "OPEN":
-                _append_csv_row(_PAPER_TRADES_CSV, row)
-                signals_logged += 1
-                logger.info(
-                    "TRADE LOGGED: %s %s  alpha=%+.3f  entry=%s  threshold=%.0f°F"
-                    "  pos=$%.2f  spread=#%s/%s",
-                    row["direction"],
-                    row["contract_ticker"],
-                    row["alpha"],
-                    row["entry_price"] or 0.0,
-                    row["threshold_f"],
-                    row["position_size"],
-                    row["spread_rank"],
-                    row["spread_total_contracts"],
-                )
-            else:
-                logger.info(
-                    "No trade: %-35s  alpha=%+.3f  side=%s  status=%s",
-                    row["contract_ticker"],
-                    row["alpha"],
-                    row["direction"],
-                    row["status"],
-                )
+                if row["status"] == "OPEN":
+                    _append_csv_row(_PAPER_TRADES_CSV, row)
+                    signals_logged += 1
+                    logger.info(
+                        "[%s] TRADE LOGGED: %s %s  alpha=%+.3f  entry=%s  threshold=%.0f°F"
+                        "  pos=$%.2f  spread=#%s/%s",
+                        city_label,
+                        row["direction"],
+                        row["contract_ticker"],
+                        row["alpha"],
+                        row["entry_price"] or 0.0,
+                        row["threshold_f"],
+                        row["position_size"],
+                        row["spread_rank"],
+                        row["spread_total_contracts"],
+                    )
+                else:
+                    logger.info(
+                        "[%s] No trade: %-35s  alpha=%+.3f  side=%s  status=%s",
+                        city_label,
+                        row["contract_ticker"],
+                        row["alpha"],
+                        row["direction"],
+                        row["status"],
+                    )
 
         logger.info(
-            "Session complete: %d trade(s) logged to %s",
-            signals_logged, _PAPER_TRADES_CSV,
+            "[%s] Session complete: %d trade(s) logged",
+            city_label, signals_logged,
         )
-
-        return signals_logged
+        result["signals"] = signals_logged
+        return result
 
     except Exception as exc:  # noqa: BLE001
-        # Discord embed field values are capped at 1024 chars; 8 reserved for
-        # the ``` fences added below.  Shed outermost lines until it fits so
-        # we never cut mid-line (innermost frames are most useful).
         tb_lines = traceback.format_exc().splitlines()[-20:]
         while tb_lines and len("\n".join(tb_lines)) > 1016:
             tb_lines.pop(0)
         tb_truncated = "\n".join(tb_lines)
         exc_type = type(exc).__name__
 
-        logger.exception("Unhandled exception in contract evaluation loop")
+        logger.exception("[%s] Unhandled exception in contract evaluation loop", city_label)
 
         try:
             post_embed(
-                title="Session crashed \u2014 unhandled exception",
+                title=f"[{city_label}] Session crashed \u2014 unhandled exception",
                 color=COLOR_RED,
                 fields=[
                     {"name": "Exception type", "value": exc_type},
@@ -765,9 +771,96 @@ def run_session(dry_run: bool = False) -> int:
                 ],
             )
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to send error embed to Discord", exc_info=True)
+            logger.warning("[%s] Failed to send error embed to Discord", city_label, exc_info=True)
 
-        sys.exit(1)
+        result["error"] = f"{exc_type}: {exc}"
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Multi-city orchestrator
+# ---------------------------------------------------------------------------
+
+
+def main(dry_run: bool = False) -> None:
+    """Load all active cities and run a paper trade session for each.
+
+    Uses ``ThreadPoolExecutor(max_workers=4)`` to run cities concurrently.
+    One city failure never blocks others.  Posts a single summary Discord
+    embed at the end listing every city with its result.
+
+    Args:
+        dry_run: When ``True``, print signals to stdout without writing to
+            any CSV file.
+    """
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+
+    all_profiles = get_city_universe()
+    active_cities = [p for p in all_profiles if p.active]
+
+    if not active_cities:
+        logger.warning("No active cities found in config/cities.yaml — nothing to do.")
+        return
+
+    city_names = [c.city for c in active_cities]
+    logger.info(
+        "=== Multi-city session  target_date=%s  cities=%s ===",
+        tomorrow, city_names,
+    )
+
+    results: dict[str, dict] = {}
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_city = {
+            executor.submit(run_city_session, city, dry_run): city
+            for city in active_cities
+        }
+        for future in as_completed(future_to_city):
+            city = future_to_city[future]
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[%s] Future raised unexpectedly: %s", city.city, exc)
+                result = {"city": city.city, "signals": 0, "error": str(exc)}
+            results[city.city] = result
+
+    # ── Session log ────────────────────────────────────────────────────────
+    session_log_path = _PAPER_TRADES_DIR / "session_log.txt"
+    session_log_path.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with session_log_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n=== Session {ts}  target={tomorrow} ===\n")
+        for city_name, r in results.items():
+            if r["error"]:
+                fh.write(f"  {city_name}: ERROR — {r['error']}\n")
+            else:
+                fh.write(f"  {city_name}: {r['signals']} signal(s)\n")
+
+    # ── Summary Discord embed ──────────────────────────────────────────────
+    if not dry_run:
+        summary_fields = []
+        for city_name, r in results.items():
+            if r["error"]:
+                value = f"\u274c Error: {r['error'][:80]}"
+            elif r["signals"] == 0:
+                value = "\u23f9 No signals"
+            else:
+                value = f"\u2705 {r['signals']} signal(s) logged"
+            summary_fields.append({"name": city_name, "value": value})
+
+        post_embed(
+            title=f"Daily Session Summary \u2014 {tomorrow}",
+            color=COLOR_GREEN if all(not r["error"] for r in results.values()) else COLOR_AMBER,
+            fields=summary_fields,
+        )
+
+    total_signals = sum(r["signals"] for r in results.values())
+    errors = [r for r in results.values() if r["error"]]
+    logger.info(
+        "=== All cities complete: %d signal(s) total, %d error(s) ===",
+        total_signals, len(errors),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -784,9 +877,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=(
-            "Daily paper trade session for Chicago high temperature contracts.\n\n"
-            "Fetches GFS T+24 forecast, evaluates live Kalshi contracts, and\n"
-            f"logs any trade signals (|alpha| >= {SIGNAL_THRESHOLD}) to data/paper_trades/."
+            "Daily paper trade session for all active cities.\n\n"
+            "Loads active cities from config/cities.yaml, fetches GFS T+24\n"
+            "forecasts, evaluates live Kalshi contracts, and logs any trade\n"
+            f"signals (|alpha| >= {SIGNAL_THRESHOLD}) to data/paper_trades/."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -807,9 +901,4 @@ if __name__ == "__main__":
         print(f"  Position size    : {POSITION_SIZE} contracts")
         print("-" * 55)
 
-    n = run_session(dry_run=args.dry_run)
-
-    if args.dry_run:
-        print(f"\n[DRY RUN] {n} trade signal(s) identified — nothing written to disk.")
-    else:
-        print(f"\nDone. {n} trade signal(s) logged.")
+    main(dry_run=args.dry_run)

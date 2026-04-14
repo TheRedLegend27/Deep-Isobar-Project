@@ -170,6 +170,11 @@ def _build_profile(entry: dict[str, Any]) -> CityProfile:
         sep_climate_normal_f=entry.get("sep_climate_normal_f"),
         sep_anomaly_trigger_f=entry.get("sep_anomaly_trigger_f"),
         lead_decay_halflife_hours=float(entry.get("lead_decay_halflife_hours", 48.0)),
+        active=bool(entry.get("active", True)),
+        kalshi_series=str(entry.get("kalshi_series", "")),
+        acis_station_id=str(entry.get("acis_station_id", "")),
+        nws_lat=float(entry.get("nws_lat", 0.0)),
+        nws_lon=float(entry.get("nws_lon", 0.0)),
     )
 
 
@@ -248,6 +253,21 @@ def get_city_profile(
     raise KeyError(
         f"City not found: '{city}'. Available cities: {available}"
     )
+
+
+def get_city_universe(config_dir: str | None = None) -> list[CityProfile]:
+    """Return all city profiles from ``config/cities.yaml``, including inactive ones.
+
+    Convenience alias for :func:`load_city_profiles` that communicates
+    intent when callers need the full universe to filter by ``active`` flag.
+
+    Args:
+        config_dir: Optional config directory override.
+
+    Returns:
+        List of all ``CityProfile`` instances (active and inactive).
+    """
+    return load_city_profiles(config_dir)
 
 
 def list_active_cities(config_dir: str | None = None) -> list[str]:

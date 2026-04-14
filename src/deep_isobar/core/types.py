@@ -70,6 +70,15 @@ class CityProfile:
     sep_climate_normal_f: Optional[float] = None
     sep_anomaly_trigger_f: Optional[float] = None
     lead_decay_halflife_hours: float = 48.0
+    # Multi-city fields — populated from cities.yaml; default to safe no-ops.
+    active: bool = True
+    kalshi_series: str = ""
+    # ACIS settlement station; may differ from METAR station_id (e.g. Dallas:
+    # METAR=KDFW, ACIS/Kalshi settlement=CLIDFW).  Falls back to station_id
+    # at runtime when empty.
+    acis_station_id: str = ""
+    nws_lat: float = 0.0
+    nws_lon: float = 0.0
 
 
 @dataclass

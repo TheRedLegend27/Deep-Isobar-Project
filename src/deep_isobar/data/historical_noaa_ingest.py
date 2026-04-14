@@ -295,7 +295,9 @@ def fetch_settlement_observations(
         )
 
     profile = get_city_profile(city, config_dir=config_dir)
-    station_id = profile.station_id
+    # Use acis_station_id when set — it may differ from the METAR station_id
+    # (e.g. Dallas: METAR=KDFW, ACIS/Kalshi settlement=CLIDFW).
+    station_id = profile.acis_station_id if profile.acis_station_id else profile.station_id
     settlement_source = profile.settlement_source
 
     raw_rows = _acis_request(station_id, start_date, end_date)
