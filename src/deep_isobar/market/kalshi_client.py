@@ -88,14 +88,18 @@ _ENV_KEY_INLINE = "KALSHI_PRIVATE_KEY"      # inline PEM (\\n-escaped ok)
 # Add new cities / metrics / operators here when expanding beyond Chicago.
 # Both KX-prefixed (current Kalshi naming) and bare names are included.
 _SERIES_METADATA: dict[str, dict[str, str]] = {
-    "KXHIGHCHI": {"city": "Chicago", "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
-    "KXLOWCHI":  {"city": "Chicago", "metric": "low_temp_f",   "comparison_operator": "le", "settlement_source": "NWS"},
-    "HIGHCHI":   {"city": "Chicago", "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
-    "LOWCHI":    {"city": "Chicago", "metric": "low_temp_f",   "comparison_operator": "le", "settlement_source": "NWS"},
-    "KXHIGHTDAL": {"city": "Dallas",  "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
-    "HIGHDAL":    {"city": "Dallas",   "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
-    "KXHIGHNY":   {"city": "New York", "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
-    "HIGHNY":     {"city": "New York", "metric": "high_temp_f",  "comparison_operator": "ge", "settlement_source": "NWS"},
+    "KXHIGHCHI": {"city": "Chicago",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "KXLOWCHI":  {"city": "Chicago",      "metric": "low_temp_f",  "comparison_operator": "le", "settlement_source": "NWS"},
+    "HIGHCHI":   {"city": "Chicago",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "LOWCHI":    {"city": "Chicago",      "metric": "low_temp_f",  "comparison_operator": "le", "settlement_source": "NWS"},
+    "KXHIGHTDAL": {"city": "Dallas",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "HIGHDAL":    {"city": "Dallas",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "KXHIGHNY":   {"city": "New York",    "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "HIGHNY":     {"city": "New York",    "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "KXHIGHBOS":  {"city": "Boston",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "HIGHBOS":    {"city": "Boston",      "metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "KXHIGHPHIL": {"city": "Philadelphia","metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
+    "HIGHPHIL":   {"city": "Philadelphia","metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
 }
 
 # Month abbreviation → month number (Kalshi uses 3-letter uppercase abbrevs)
@@ -129,8 +133,8 @@ _STUB_THRESHOLDS_BY_SEASON: dict[str, list[int]] = {
     "fall":   [35, 40, 45, 50, 55, 60, 65],   # Sep / Oct / Nov
 }
 
-_STUB_BID = 48.0   # cents (adapter normalises to 0.48)
-_STUB_ASK = 52.0   # cents (adapter normalises to 0.52)
+_STUB_BID = 0.48   # decimal probability (matches live Kalshi dollar-string prices)
+_STUB_ASK = 0.52   # decimal probability
 
 
 def _stub_thresholds_for_date(target_date: date) -> list[int]:
@@ -382,14 +386,16 @@ def _parse_contract(market: dict[str, Any], now_utc: datetime) -> MarketContract
         return None
 
     # Read strike_type from the API response.  Kalshi returns "less", "greater",
-    # or "between".  Skip "between" (bracket) contracts — they require a range
-    # probability function that doesn't exist yet.
+    # or "between" (bracket).  All three are now supported.
     strike_type: str = (market.get("strike_type") or "").lower()
     if not strike_type:
         logger.debug("_parse_contract: missing strike_type for %r — skipping", ticker)
         return None
-    if strike_type == "between":
-        logger.debug("_parse_contract: skipping between/bracket contract %r", ticker)
+    if strike_type not in ("less", "greater", "between"):
+        logger.debug(
+            "_parse_contract: unknown strike_type %r for %r — skipping",
+            strike_type, ticker,
+        )
         return None
 
     # Parse floor/cap strike boundaries from the API response (integers or null).
@@ -649,27 +655,31 @@ def _fetch_orderbook_from_api(
 # ---------------------------------------------------------------------------
 
 
-def _stub_fetch_live_contracts() -> list[MarketContract]:
-    """Return deterministic mock Chicago high_temp_f contracts (stub mode).
+def _stub_fetch_live_contracts(series_ticker: str | None = None) -> list[MarketContract]:
+    """Return deterministic mock high_temp_f contracts (stub mode).
 
     Returns 7 contracts in a season-appropriate 5°F threshold range for
-    today's date.  Thresholds are chosen so that at least some contracts
+    tomorrow's date.  Thresholds are chosen so that at least some contracts
     are near the money when running the pipeline locally in any season.
-    The scheduler derives its target date from these contracts, so the
-    forecast and probability surface are automatically aligned with the
-    contracts in hand.
+    The city is derived from *series_ticker* via :data:`_SERIES_METADATA`
+    when provided, defaulting to Chicago.
     """
-    target_date = date.today()
+    target_date = date.today() + timedelta(days=1)
     thresholds = _stub_thresholds_for_date(target_date)
+
+    meta = _SERIES_METADATA.get(series_ticker.upper() if series_ticker else "") or {}
+    city = meta.get("city", "Chicago")
+    city_tag = (series_ticker or "CHI").upper()
+
     logger.info(
         "fetch_live_contracts [STUB]: target_date=%s thresholds=%s",
         target_date, thresholds,
     )
     return [
         MarketContract(
-            contract_id=f"CHI_HIGH_TEMP_F_GT_{t}_{target_date.strftime('%Y%m%d')}",
+            contract_id=f"{city_tag}_HIGH_TEMP_F_GT_{t}_{target_date.strftime('%Y%m%d')}",
             market_source=_MARKET_SOURCE,
-            city="Chicago",
+            city=city,
             metric="high_temp_f",
             comparison_operator="gt",
             threshold_f=t,
@@ -678,7 +688,7 @@ def _stub_fetch_live_contracts() -> list[MarketContract]:
             strike_type="greater",
             floor_strike=t,
             cap_strike=None,
-            raw_title=f"Chicago High > {t}°F on {target_date.isoformat()}",
+            raw_title=f"{city} High > {t}°F on {target_date.isoformat()}",
             active=True,
         )
         for t in thresholds
@@ -688,8 +698,8 @@ def _stub_fetch_live_contracts() -> list[MarketContract]:
 def _stub_fetch_orderbook(contract_id: str) -> OrderBookSnapshot:
     """Return a synthetic order-book snapshot (stub mode).
 
-    Prices are in cents (48/52) so the mid is 50 → market probability 0.50
-    after normalisation by :func:`~deep_isobar.market.market_price_adapter`.
+    Prices are in decimal probability form (0.48/0.52) matching the live
+    Kalshi dollar-string format, so mid=0.50 → market probability 0.50.
     """
     logger.debug("fetch_orderbook_for_contract [STUB]: contract=%s", contract_id)
     return OrderBookSnapshot(
@@ -717,8 +727,8 @@ def fetch_live_contracts(
     ``GET /markets`` filtered to *series_ticker*.
     Falls back to stub data automatically on any API error.
 
-    In **stub mode**, returns 7 deterministic Chicago ``high_temp_f >= T``
-    contracts for tomorrow without any network call.
+    In **stub mode**, returns 7 deterministic ``high_temp_f >= T`` contracts
+    for tomorrow derived from *series_ticker* without any network call.
 
     Args:
         market_source: Exchange identifier.  Only ``"Kalshi"`` (case-
@@ -747,14 +757,14 @@ def fetch_live_contracts(
 
     if _use_stub_mode():
         logger.info("fetch_live_contracts: stub_mode=true in config — using stub")
-        return _stub_fetch_live_contracts()
+        return _stub_fetch_live_contracts(series_ticker)
 
     credentials = _load_credentials()
     if credentials is None:
         logger.info(
             "fetch_live_contracts: no usable credentials found — using stub mode"
         )
-        return _stub_fetch_live_contracts()
+        return _stub_fetch_live_contracts(series_ticker)
 
     logger.info("fetch_live_contracts: live mode — calling Kalshi API")
     try:
@@ -764,7 +774,7 @@ def fetch_live_contracts(
                 "fetch_live_contracts: API returned 0 parseable contracts — "
                 "falling back to stub"
             )
-            return _stub_fetch_live_contracts()
+            return _stub_fetch_live_contracts(series_ticker)
         return contracts
     except Exception as exc:
         logger.warning(
@@ -772,7 +782,7 @@ def fetch_live_contracts(
             "falling back to stub",
             type(exc).__name__, exc,
         )
-        return _stub_fetch_live_contracts()
+        return _stub_fetch_live_contracts(series_ticker)
 
 
 def fetch_orderbook_for_contract(
@@ -816,7 +826,19 @@ def fetch_orderbook_for_contract(
         return _stub_fetch_orderbook(contract_id)
 
     try:
-        return _fetch_orderbook_from_api(contract_id, credentials)
+        snapshot = _fetch_orderbook_from_api(contract_id, credentials)
+        if (
+            snapshot.best_bid is None
+            and snapshot.best_ask is None
+            and snapshot.last_trade_price is None
+        ):
+            logger.warning(
+                "fetch_orderbook_for_contract: live API returned empty orderbook "
+                "for %r — falling back to stub",
+                contract_id,
+            )
+            return _stub_fetch_orderbook(contract_id)
+        return snapshot
     except Exception as exc:
         logger.warning(
             "fetch_orderbook_for_contract: live API call failed for %r "

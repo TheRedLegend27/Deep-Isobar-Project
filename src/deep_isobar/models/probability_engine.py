@@ -82,13 +82,22 @@ def probability_for_contract(
     - ``"greater"`` : YES if ``actual > floor_strike``
       → ``P(X > floor) = 1 − norm.cdf(floor + 0.5, mean, std)``
 
-    ``"between"`` contracts should be filtered upstream and are not supported
-    here.
+    Settlement rules by ``strike_type``:
+
+    - ``"less"``    : YES if ``actual < cap_strike``
+      → ``P(X < cap) = norm.cdf(cap − 0.5, mean, std)``
+    - ``"greater"`` : YES if ``actual > floor_strike``
+      → ``P(X > floor) = 1 − norm.cdf(floor + 0.5, mean, std)``
+    - ``"between"`` : YES if ``floor_strike ≤ actual < cap_strike``
+      → ``P(floor ≤ X < cap) = norm.cdf(cap − 0.5) − norm.cdf(floor − 0.5)``
 
     Args:
-        strike_type: Kalshi settlement type — ``"less"`` or ``"greater"``.
-        floor_strike: Lower boundary in °F; required for ``"greater"``.
-        cap_strike: Upper boundary in °F; required for ``"less"``.
+        strike_type: Kalshi settlement type — ``"less"``, ``"greater"``, or
+            ``"between"``.
+        floor_strike: Lower boundary in °F; required for ``"greater"`` and
+            ``"between"``.
+        cap_strike: Upper boundary in °F; required for ``"less"`` and
+            ``"between"``.
         mean_f: Ensemble forecast mean in °F.
         std_f: Ensemble forecast standard deviation in °F.  Must be > 0.
 
@@ -96,8 +105,8 @@ def probability_for_contract(
         YES-probability in ``[0.0, 1.0]``.
 
     Raises:
-        ValueError: If *std_f* is not positive, *strike_type* is not
-            ``"less"`` or ``"greater"``, or a required boundary is ``None``.
+        ValueError: If *std_f* is not positive, *strike_type* is unrecognised,
+            or a required boundary is ``None``.
 
     Example::
 
@@ -108,6 +117,10 @@ def probability_for_contract(
         # T67 contract (greater, floor=67): P(actual > 67)
         p = probability_for_contract("greater", 67, None, mean_f=65.0, std_f=5.5)
         # → 1 - norm.cdf(67.5, 65.0, 5.5) ≈ 0.325
+
+        # B65 bracket (between, floor=65, cap=70): P(65 ≤ actual < 70)
+        p = probability_for_contract("between", 65, 70, mean_f=67.0, std_f=5.5)
+        # → norm.cdf(69.5, 67.0, 5.5) - norm.cdf(64.5, 67.0, 5.5) ≈ 0.346
     """
     if std_f <= 0:
         raise ValueError(f"std_f must be positive, got {std_f}")
@@ -123,10 +136,20 @@ def probability_for_contract(
             raise ValueError("floor_strike is required for strike_type='greater'")
         # P(actual > floor) ≈ P(X ≥ floor + 1) → 1 − cdf(floor + 0.5)
         prob = float(1.0 - norm.cdf(floor_strike + 0.5, loc=mean_f, scale=std_f))
+    elif st == "between":
+        if floor_strike is None:
+            raise ValueError("floor_strike is required for strike_type='between'")
+        if cap_strike is None:
+            raise ValueError("cap_strike is required for strike_type='between'")
+        # P(floor ≤ actual < cap): integer settlement → cdf(cap − 0.5) − cdf(floor − 0.5)
+        prob = float(
+            norm.cdf(cap_strike - 0.5, loc=mean_f, scale=std_f)
+            - norm.cdf(floor_strike - 0.5, loc=mean_f, scale=std_f)
+        )
     else:
         raise ValueError(
             f"Unsupported strike_type {strike_type!r}. "
-            "Only 'less' and 'greater' are supported; filter 'between' upstream."
+            "Expected 'less', 'greater', or 'between'."
         )
 
     prob = max(0.0, min(1.0, prob))

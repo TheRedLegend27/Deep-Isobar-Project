@@ -450,7 +450,7 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
             c for c in all_contracts
             if c.target_date == tomorrow
             and c.metric == METRIC
-            and c.strike_type in ("less", "greater")
+            and c.strike_type in ("less", "greater", "between")
         ]
 
         if not tomorrow_contracts:
@@ -495,6 +495,8 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                 return f"P(T<{c.cap_strike})"
             if c.strike_type == "greater":
                 return f"P(T>{c.floor_strike})"
+            if c.strike_type == "between":
+                return f"P({c.floor_strike}≤T<{c.cap_strike})"
             return f"P(?{c.threshold_f})"
 
         logger.info(

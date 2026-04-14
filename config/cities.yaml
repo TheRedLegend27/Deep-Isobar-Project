@@ -8,7 +8,7 @@ cities:
     settlement_source: NWS
     active: true
     kalshi_series: KXHIGHCHI
-    acis_station_id: KMDW
+    acis_station_id: CLIMDW
     nws_lat: 41.786
     nws_lon: -87.752
     # --- Calibrated 2026-04-09 from full KMDW historical dataset (all 12 months, 1364 samples) ---
@@ -46,8 +46,8 @@ cities:
     active: true
     kalshi_series: KXHIGHNY
     acis_station_id: CLINYC
-    nws_lat: 40.633
-    nws_lon: -73.779
+    nws_lat: 40.6413
+    nws_lon: -73.7781
     # --- Calibrated 2026-03-20 from NYC backtest run (Aug 2023) ---
     # GFS mean warm bias = +0.91°F over 32 dates → mean_bias_correction_f = -0.91
     # Brier-optimal sigma = 2.75°F → variance_multiplier = 2.75 / GFS_RMSE(3.23) = 0.85
@@ -85,4 +85,44 @@ cities:
     model_weight_ecmwf: 0.45
     model_weight_nam: 0.20
     heat_bias_adjustment_f: -0.5
+    cold_bias_adjustment_f: 0.0
+  
+  - city: Philadelphia
+    city_code: PHI
+    timezone: America/New_York
+    station_id: KPHL
+    settlement_source: NWS
+    kalshi_series: KXHIGHPHIL
+    acis_station_id: CLIPHL
+    nws_lat: 39.8719
+    nws_lon: -75.2411
+    active: true
+    variance_multiplier: 0.6739
+    mean_bias_correction_f: 3.5117
+    kde_bandwidth: 1.5
+    tail_multiplier: 1.0
+    model_weight_gfs: 0.35
+    model_weight_ecmwf: 0.45
+    model_weight_nam: 0.2
+    heat_bias_adjustment_f: 0.0
+    cold_bias_adjustment_f: 0.0
+
+  - city: Boston
+    city_code: BOS
+    timezone: America/New_York
+    station_id: KBOS
+    settlement_source: NWS
+    kalshi_series: KXHIGHBOS
+    acis_station_id: CLIBOS
+    nws_lat: 42.3631
+    nws_lon: -71.0064
+    active: true
+    variance_multiplier: 0.7275
+    mean_bias_correction_f: 3.4339
+    kde_bandwidth: 1.5
+    tail_multiplier: 1.0
+    model_weight_gfs: 0.35
+    model_weight_ecmwf: 0.45
+    model_weight_nam: 0.2
+    heat_bias_adjustment_f: 0.0
     cold_bias_adjustment_f: 0.0
