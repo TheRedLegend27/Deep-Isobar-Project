@@ -228,10 +228,10 @@ def _ensure_csv(path: Path) -> None:
     """
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", newline="") as fh:
+        with path.open("w", newline="", encoding="utf-8") as fh:
             csv.DictWriter(fh, fieldnames=_CSV_COLUMNS).writeheader()
         return
-    with path.open(newline="") as fh:
+    with path.open(newline="", encoding="utf-8") as fh:
         existing = next(csv.reader(fh), [])
     if existing == _CSV_COLUMNS:
         return  # schema matches exactly — nothing to do
@@ -259,9 +259,9 @@ def _migrate_csv_add_columns(path: Path) -> None:
     empty strings.  This is a forward-only migration — columns already
     present are never removed or reordered.
     """
-    with path.open("r", newline="") as fh:
+    with path.open("r", newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
-    with path.open("w", newline="") as fh:
+    with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=_CSV_COLUMNS, restval="")
         writer.writeheader()
         for row in rows:
@@ -270,7 +270,7 @@ def _migrate_csv_add_columns(path: Path) -> None:
 
 def _append_csv_row(path: Path, row: dict) -> None:
     """Append one row dict to the CSV (header assumed to exist)."""
-    with path.open("a", newline="") as fh:
+    with path.open("a", newline="", encoding="utf-8") as fh:
         csv.DictWriter(fh, fieldnames=_CSV_COLUMNS).writerow(row)
 
 
