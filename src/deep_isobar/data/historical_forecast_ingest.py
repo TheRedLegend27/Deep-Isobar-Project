@@ -402,6 +402,26 @@ def _download_snippet(grib2_url: str, idx_url: str, dest: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _unlink_retry(path: Path, retries: int = 6, delay: float = 0.5) -> None:
+    """Unlink *path*, retrying on Windows PermissionError (WinError 32).
+
+    eccodes releases its internal file handle asynchronously after a GC cycle;
+    a short retry loop covers the window between GC and OS handle release.
+    """
+    for attempt in range(retries):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                logger.warning(
+                    "Could not delete locked cache file %s after %d attempts — skipping delete",
+                    path.name, retries,
+                )
+                return
+            time.sleep(delay)
+
+
 def _extract_fahrenheit(grib_path: Path, lat: float, lon_360: float) -> float:
     """Parse a cached GRIB2 snippet and return the temperature in °F at the nearest point.
 
@@ -440,23 +460,37 @@ def _extract_fahrenheit(grib_path: Path, lat: float, lon_360: float) -> float:
         for stale_idx in grib_path.parent.glob(f"{grib_path.name}.*.idx"):
             stale_idx.unlink(missing_ok=True)
 
-        ds = cfgrib.open_dataset(
-            str(grib_path),
-            filter_by_keys={"typeOfLevel": "heightAboveGround", "level": 2},
-            errors="raise",
-        )
-
-        # cfgrib names 2m temperature "t2m" (CF convention for height-above-ground)
-        var = "t2m" if "t2m" in ds else "t"
-        # .sel() with scalar lat/lon should return a 0-d DataArray, but cfgrib may
-        # leave a residual `step` or `valid_time` dimension when the GRIB2 byte-range
-        # snippet contains multiple records.  Evaluating such a multi-element numpy
-        # array in a boolean or float() context raises:
-        #   "The truth value of an array with more than one element is ambiguous"
-        # or the equivalent "only size-1 arrays can be converted to Python scalars".
-        # .squeeze() collapses all size-1 dimensions first; .flat[0] then extracts
-        # a Python scalar safely regardless of the remaining array shape.
-        arr = ds[var].sel(latitude=lat, longitude=lon_360, method="nearest").squeeze().values
+        try:
+            ds = cfgrib.open_dataset(
+                str(grib_path),
+                filter_by_keys={"typeOfLevel": "heightAboveGround", "level": 2},
+                errors="raise",
+            )
+        except Exception:
+            # open_dataset can fail mid-read (e.g. PrematureEndOfFileError on a
+            # truncated file) before ds is assigned.  eccodes may still hold an
+            # internal handle; calling codes_release on any lingering handles via
+            # gc lets Windows release the file lock so the caller can unlink it.
+            import gc
+            gc.collect()
+            raise
+        try:
+            # cfgrib names 2m temperature "t2m" (CF convention for height-above-ground)
+            var = "t2m" if "t2m" in ds else "t"
+            # .sel() with scalar lat/lon should return a 0-d DataArray, but cfgrib may
+            # leave a residual `step` or `valid_time` dimension when the GRIB2 byte-range
+            # snippet contains multiple records.  Evaluating such a multi-element numpy
+            # array in a boolean or float() context raises:
+            #   "The truth value of an array with more than one element is ambiguous"
+            # or the equivalent "only size-1 arrays can be converted to Python scalars".
+            # .squeeze() collapses all size-1 dimensions first; .flat[0] then extracts
+            # a Python scalar safely regardless of the remaining array shape.
+            arr = ds[var].sel(latitude=lat, longitude=lon_360, method="nearest").squeeze().values
+        finally:
+            # Explicitly close on Windows: the OS holds the file handle open until
+            # the dataset is closed, which would cause PermissionError (WinError 32)
+            # if the caller tries to unlink a corrupted file immediately after.
+            ds.close()
 
     # Pure Python math — no need to hold the lock past the array extraction.
     t_k = float(arr.flat[0])
@@ -642,7 +676,7 @@ def fetch_gfs_forecasts(
                         "cfgrib error for %s  (%s) — deleting cache and retrying",
                         dest.name, exc,
                     )
-                    dest.unlink(missing_ok=True)
+                    _unlink_retry(dest)
                     # Re-resolve URL if we came from a cache hit (grib2_url is None).
                     if grib2_url is None:
                         try:

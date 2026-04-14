@@ -305,8 +305,9 @@ def _fetch_year_gfs(
     year: int,
     config_dir: str,
     cache_dir: str | None,
+    end_date: date | None = None,
 ) -> tuple[int, pd.DataFrame]:
-    """Fetch all 12 months of GFS forecasts for *year*.
+    """Fetch GFS forecasts for *year*, stopping at *end_date* if provided.
 
     Runs entirely within one thread; months are fetched serially so each
     byte-range download does not fight other threads for the same file.
@@ -314,8 +315,9 @@ def _fetch_year_gfs(
     Returns ``(year, concatenated_df)`` so the caller can log per-year
     progress from ``as_completed``.
     """
+    last_month = end_date.month if (end_date and year == end_date.year) else 12
     frames: list[pd.DataFrame] = []
-    for month in range(1, 13):
+    for month in range(1, last_month + 1):
         try:
             df = fetch_gfs_forecasts(
                 city=city,
@@ -341,6 +343,7 @@ def phase2_gfs_fetch(
     config_dir: str,
     cache_dir: str | None,
     workers: int,
+    end_date: date | None = None,
 ) -> None:
     """Pre-fetch GFS history for all years in parallel to warm the GRIB2 cache.
 
@@ -355,19 +358,22 @@ def phase2_gfs_fetch(
         config_dir: Path to the temp ``cities.yaml`` directory.
         cache_dir:  GRIB2 byte-range cache root (``None`` → project default).
         workers:    Max parallel year threads.
+        end_date:   Last date with available archive data; months after this
+                    date in the final year are skipped.
     """
     t0 = time.monotonic()
     n_workers = min(workers, len(years))
+    last_month = end_date.month if (end_date and max(years) == end_date.year) else 12
     logger.info(
         "Phase 2 — Fetching GFS history for %s  years %d–%d  "
-        "(%d year-thread(s), %d months each)",
-        profile.city, min(years), max(years), n_workers, 12,
+        "(%d year-thread(s), up to %d months for final year)",
+        profile.city, min(years), max(years), n_workers, last_month,
     )
 
     total_rows = 0
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
         futures = {
-            ex.submit(_fetch_year_gfs, profile.city, year, config_dir, cache_dir): year
+            ex.submit(_fetch_year_gfs, profile.city, year, config_dir, cache_dir, end_date): year
             for year in years
         }
         for fut in as_completed(futures):
@@ -806,6 +812,7 @@ def main() -> int:
             config_dir=cfg_dir,
             cache_dir=args.cache_dir,
             workers=args.workers,
+            end_date=end_date,
         )
 
         # ── Phase 3: NOAA settlement fetch (preflight validation) ─────────────

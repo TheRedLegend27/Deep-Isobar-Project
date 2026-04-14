@@ -43,65 +43,21 @@ cities:
     timezone: America/New_York
     station_id: KJFK
     settlement_source: NWS
-    active: false
+    active: true
     kalshi_series: KXHIGHNY
-    acis_station_id: KJFK
+    acis_station_id: CLINYC
     nws_lat: 40.633
     nws_lon: -73.779
     # --- Calibrated 2026-03-20 from NYC backtest run (Aug 2023) ---
     # GFS mean warm bias = +0.91°F over 32 dates → mean_bias_correction_f = -0.91
     # Brier-optimal sigma = 2.75°F → variance_multiplier = 2.75 / GFS_RMSE(3.23) = 0.85
     # kde_bandwidth = 2.75 (Brier-optimal sigma; Silverman rule gives 1.46°F)
-    variance_multiplier: 0.85
-    mean_bias_correction_f: -0.91
+    variance_multiplier: 0.7202
+    mean_bias_correction_f: 2.1722
     kde_bandwidth: 2.75
     tail_multiplier: 1.0
     model_weight_gfs: 0.4
     model_weight_ecmwf: 0.4
-    model_weight_nam: 0.2
-    heat_bias_adjustment_f: 0.0
-    cold_bias_adjustment_f: 0.0
-
-  - city: Phoenix
-    city_code: PHX
-    state: AZ
-    country: US
-    timezone: America/Phoenix
-    station_id: KPHX
-    settlement_source: NWS
-    active: false
-    kalshi_series: KXHIGHPHX
-    acis_station_id: KPHX
-    nws_lat: 33.434
-    nws_lon: -112.008
-    variance_multiplier: 0.9
-    mean_bias_correction_f: 0.0
-    kde_bandwidth: 0.9
-    tail_multiplier: 1.0
-    model_weight_gfs: 0.3
-    model_weight_ecmwf: 0.5
-    model_weight_nam: 0.2
-    heat_bias_adjustment_f: 0.0
-    cold_bias_adjustment_f: 0.0
-
-  - city: Denver
-    city_code: DEN
-    state: CO
-    country: US
-    timezone: America/Denver
-    station_id: KDEN
-    settlement_source: NWS
-    active: false
-    kalshi_series: KXHIGHDEN
-    acis_station_id: KDEN
-    nws_lat: 39.856
-    nws_lon: -104.673
-    variance_multiplier: 1.3
-    mean_bias_correction_f: 0.0
-    kde_bandwidth: 1.5
-    tail_multiplier: 1.15
-    model_weight_gfs: 0.35
-    model_weight_ecmwf: 0.45
     model_weight_nam: 0.2
     heat_bias_adjustment_f: 0.0
     cold_bias_adjustment_f: 0.0
