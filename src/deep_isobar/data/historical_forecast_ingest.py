@@ -100,6 +100,8 @@ _STATION_COORDS: dict[str, tuple[float, float]] = {
     "KPHX": (33.4373, 247.9922),                   # Phoenix Sky Harbor
     "KDEN": (39.8561, 255.3263),                   # Denver International
     "KDFW": (32.8998, 262.9597),                   # Dallas/Fort Worth
+    "KPHL": (39.8719, 284.7589),                   # Philadelphia International (360 - 75.2411)
+    "KBOS": (42.3631, 288.9936),                   # Boston Logan (360 - 71.0064)
 }
 
 # Forecast hours that land at 18z UTC (≈ 1 pm CDT) for each lead day
@@ -125,7 +127,7 @@ _OUTPUT_COLUMNS = [
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
-# Serialize cfgrib opens across threads.  Chicago and Dallas share the same
+# Serialize cfgrib opens across threads.  Multiple cities share the same
 # cached GRIB2 snippets (city-agnostic grid files).  When two threads call
 # cfgrib.open_dataset() on the same file simultaneously, one regenerates the
 # stale .*.idx sidecar while the other's eccodes context is mid-read, causing:
@@ -133,6 +135,14 @@ _RETRY_STATUSES = {429, 500, 502, 503, 504}
 # The lock ensures only one thread opens/parses a GRIB file at a time; the
 # scalar extraction (arr.flat[0]) and unit conversion are done outside the lock.
 _GRIB_OPEN_LOCK = threading.Lock()
+
+# Serialize GRIB2 downloads per cache path.  Multiple city threads targeting
+# the same forecast run (e.g. all five cities fetching f042 at startup) will
+# race on the same dest path: all see dest.exists()==False, all write_bytes()
+# concurrently, and one thread reads a half-written file → cfgrib EOFError.
+# Keyed by str(dest) so different forecast files download in parallel.
+_GRIB_DOWNLOAD_LOCKS: dict[str, threading.Lock] = {}
+_GRIB_DOWNLOAD_LOCKS_MUTEX = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Dependency guard
@@ -358,7 +368,9 @@ def _parse_tmp2m_byte_range(idx_text: str) -> tuple[int, int | None]:
 def _download_snippet(grib2_url: str, idx_url: str, dest: Path) -> None:
     """Download the TMP@2m GRIB2 record via idx byte-range into *dest*.
 
-    If *dest* already exists, this is a no-op (cache hit).
+    If *dest* already exists, this is a no-op (cache hit).  Per-path locking
+    prevents multiple threads from racing to write the same cache file, which
+    would cause one thread to read a partially-written file (cfgrib EOFError).
 
     Args:
         grib2_url: Full HTTPS URL to the GRIB2 file on AWS.
@@ -370,31 +382,38 @@ def _download_snippet(grib2_url: str, idx_url: str, dest: Path) -> None:
             whether to skip or abort).
         ValueError: If ``TMP:2 m above ground`` is absent from the idx.
     """
-    if dest.exists():
-        logger.debug("Cache hit: %s", dest)
-        return
+    dest_key = str(dest)
+    with _GRIB_DOWNLOAD_LOCKS_MUTEX:
+        if dest_key not in _GRIB_DOWNLOAD_LOCKS:
+            _GRIB_DOWNLOAD_LOCKS[dest_key] = threading.Lock()
+        file_lock = _GRIB_DOWNLOAD_LOCKS[dest_key]
 
-    logger.info("Fetching idx: %s", idx_url)
-    idx_resp = _get_with_backoff(idx_url)
-    idx_text = idx_resp.text
+    with file_lock:
+        if dest.exists():
+            logger.debug("Cache hit: %s", dest)
+            return
 
-    start_byte, end_byte = _parse_tmp2m_byte_range(idx_text)
-    range_header = (
-        f"bytes={start_byte}-{end_byte}"
-        if end_byte is not None
-        else f"bytes={start_byte}-"
-    )
+        logger.info("Fetching idx: %s", idx_url)
+        idx_resp = _get_with_backoff(idx_url)
+        idx_text = idx_resp.text
 
-    logger.info(
-        "Fetching GRIB2 snippet: %s  Range: %s", grib2_url, range_header
-    )
-    grib_resp = _get_with_backoff(grib2_url, headers={"Range": range_header})
+        start_byte, end_byte = _parse_tmp2m_byte_range(idx_text)
+        range_header = (
+            f"bytes={start_byte}-{end_byte}"
+            if end_byte is not None
+            else f"bytes={start_byte}-"
+        )
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(grib_resp.content)
-    logger.debug(
-        "Cached %d bytes to %s", len(grib_resp.content), dest
-    )
+        logger.info(
+            "Fetching GRIB2 snippet: %s  Range: %s", grib2_url, range_header
+        )
+        grib_resp = _get_with_backoff(grib2_url, headers={"Range": range_header})
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(grib_resp.content)
+        logger.debug(
+            "Cached %d bytes to %s", len(grib_resp.content), dest
+        )
 
 
 # ---------------------------------------------------------------------------
