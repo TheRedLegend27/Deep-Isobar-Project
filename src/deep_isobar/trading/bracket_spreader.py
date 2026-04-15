@@ -60,6 +60,15 @@ def build_spread(
         ValueError: For an unrecognised ``allocation_method``.
     """
     # Filter: BUY only (SELL spreading not implemented — future enhancement).
+    sell_signals = [s for s in signals if s.signal_side == "SELL"]
+    if sell_signals:
+        logger.warning(
+            "build_spread: %d SELL signal(s) skipped — SELL spreading not yet implemented "
+            "(contracts: %s)",
+            len(sell_signals),
+            [s.contract_id for s in sell_signals],
+        )
+
     qualifying = [
         s for s in signals
         if s.signal_side == "BUY" and abs(s.alpha) >= min_alpha

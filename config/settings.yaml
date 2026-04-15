@@ -73,7 +73,6 @@ models:
 markets:
   enabled_sources:
     - Kalshi
-    - Polymarket
   kalshi:
     # Base URL for the Kalshi v2 REST API.
     # Despite the "elections" subdomain this endpoint serves all Kalshi markets.

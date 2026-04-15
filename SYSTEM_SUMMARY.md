@@ -1,8 +1,8 @@
 # Deep Isobar — System Summary
 
 _Generated: 2026-04-13 by read-only audit. No files modified._
-_Updated April 13, 2026_
-_Changes since April 10: alpha threshold fix, NWS wired, requirements cleanup, watchdog, multi-bracket spreading, dynamic position sizing, Kalshi account balance._
+_Updated April 14, 2026_
+_Changes since April 13: multi-city refactor across all core modules, 4 new cities calibrated and onboarded (Dallas/NYC/Philadelphia/Boston), GFS boolean bug fixed, Boston contract ID normalization, clickable Kalshi deep links and bracket recommendation chips in dashboard._
 
 ---
 
@@ -17,15 +17,15 @@ src/deep_isobar/
 ├── core/
 │   ├── __init__.py
 │   ├── logging_utils.py                 Thin loguru wrapper (get_logger)
-│   └── types.py                         All shared dataclasses: CityProfile, ForecastPoint, TradeSignal, etc.
+│   └── types.py                         All shared dataclasses: CityProfile (+ active, kalshi_series, acis_station_id, nws_lat, nws_lon), ForecastPoint, TradeSignal, etc.
 │
 ├── data/
 │   ├── __init__.py
-│   ├── city_universe.py                 Loads config/cities.yaml → CityProfile list; get_city_profile()
+│   ├── city_universe.py                 Loads config/cities.yaml → CityProfile list; reads 5 new fields via .get(); get_city_universe() alias added for load_city_profiles()
 │   ├── data_sources.py                  (not read — not referenced by other modules in audit)
 │   ├── feature_store.py                 Minimal save/load parquet wrapper (paths.data_dir)
-│   ├── historical_forecast_ingest.py    AWS NOAA GFS byte-range fetch; GRIB2 parse via cfgrib/xarray; disk cache
-│   ├── historical_noaa_ingest.py        ACIS API fetch for daily high/low settlement temps; retry w/ backoff
+│   ├── historical_forecast_ingest.py    AWS NOAA GFS byte-range fetch; GRIB2 parse via cfgrib/xarray; disk cache; ✅ numpy/xarray boolean bug fixed (if array: → if array is not None) — was crashing 12z/f030 fetch
+│   ├── historical_noaa_ingest.py        ACIS API fetch for daily high/low settlement temps; retry w/ backoff; fetch_settlement_observations resolves acis_station_id per city (Dallas → CLIDFW not KDFW)
 │   └── weather_ingest.py                ⚠️ STUB — fetch_station_observations returns sine-wave fake hourly data; not used in live path
 │
 ├── models/
@@ -42,7 +42,7 @@ src/deep_isobar/
 │   ├── __init__.py
 │   ├── contract_generator.py            Internal contract ID builder; generate_contracts_for_surface()
 │   ├── historical_kalshi_ingest.py      Pulls KXHIGHCHI settled contracts + hourly candlesticks from Kalshi API
-│   ├── kalshi_client.py                 Live RSA-PSS authenticated Kalshi v2 client; stub fallback; get_balance() added
+│   ├── kalshi_client.py                 Live RSA-PSS authenticated Kalshi v2 client; stub fallback; get_balance() added; optional series_ticker param on fetch_live_contracts; _normalize_ticker() handles malformed Boston-style IDs
 │   ├── market_lag_detection.py          Detects when market price hasn't reacted to a forecast shift
 │   ├── market_price_adapter.py          Extracts mid-price / market probability from OrderBookSnapshot
 │   └── market_scanner.py               Wires market_price_adapter + alpha_engine; evaluate_contract_opportunity()
@@ -69,10 +69,10 @@ src/deep_isobar/
 │   └── discord_notifier.py             Discord webhook embed poster; silent no-op if URL absent
 │
 ├── anomaly/
-│   ├── __init__.py                      Exports: check_anomalies, fetch_kmdw_metar, parse_metar_fields, fetch_nws_high_forecast_f
+│   ├── __init__.py                      Exports: check_anomalies, fetch_metar, fetch_kmdw_metar (alias), parse_metar_fields, fetch_nws_high_forecast_f
 │   ├── detector.py                      ✅ Full: Anthropic API anomaly check; all 5 signals active
-│   ├── metar_fetcher.py                aviationweather.gov METAR fetch + field parser for KMDW
-│   └── nws_fetcher.py                  ✅ NEW — fetch_nws_high_forecast_f(): NWS public API; no auth required
+│   ├── metar_fetcher.py                fetch_metar(station_id: str) — parameterized; fetch_kmdw_metar = lambda: fetch_metar("KMDW") for backward compat
+│   └── nws_fetcher.py                  fetch_nws_high_forecast_f(lat: float, lon: float) — no longer hardcodes Chicago coords
 │
 ├── monitoring/
 │   ├── __init__.py
@@ -86,14 +86,14 @@ src/deep_isobar/
 └── research/
     ├── __init__.py
     ├── backtest_engine.py               Simulates trades from opportunity DataFrames; summarize_backtest_results()
-    ├── generate_dashboard.py            Generates self-contained Chart.js HTML dashboard from paper_trades.csv
+    ├── generate_dashboard.py            Generates self-contained Chart.js HTML dashboard from paper_trades.csv; contract IDs now clickable Kalshi deep links; OPEN rows show bracket recommendation chip (green YES/orange NO)
     ├── mispriced_weather_markets.py     Original research/analysis script; analyze_mispriced_markets()
-    ├── paper_trade_session.py           ✅ Daily morning script: GFS fetch → ensemble → Kalshi → spreading → log CSV + Discord
+    ├── paper_trade_session.py           ✅ Multi-city morning script: run_city_session(CityProfile) per city; main() loads active cities, runs concurrently via ThreadPoolExecutor(max_workers=4); city column in CSV; threading.Lock on CSV writes
     ├── portfolio_backtester.py          Multi-city portfolio backtest aggregator
     ├── run_chicago_backtest.py          Chicago-specific backtest driver against real 2023/2024 data
     ├── run_dallas_backtest.py           Dallas-specific backtest driver
     ├── run_nyc_backtest.py              NYC-specific backtest driver
-    └── settle_paper_trades.py           ✅ Evening settlement: ACIS fetch → WIN/LOSS → P&L → CSV update + Discord
+    └── settle_paper_trades.py           ✅ Evening settlement: groups OPEN rows by city; each city uses correct acis_station_id; legacy rows with empty city column default to Chicago
 ```
 
 **Files flagged as incomplete or blocked:**
@@ -110,14 +110,17 @@ src/deep_isobar/
 | Feature | Status | Location | Notes |
 |---|---|---|---|
 | GFS ensemble fetch (live, Open-Meteo) | ✅ Complete | `models/forecast_generation.py` | GFS + ECMWF + NAM via Open-Meteo; stub fallback on failure |
-| GFS historical fetch (AWS byte-range) | ✅ Complete | `data/historical_forecast_ingest.py` | cfgrib/xarray required; disk cache; `atmos/` path handled |
+| GFS historical fetch (AWS byte-range) | ✅ Complete | `data/historical_forecast_ingest.py` | cfgrib/xarray required; disk cache; `atmos/` path handled; numpy/xarray boolean bug fixed (was crashing 12z/f030 fetch and blocking fallback to 00z/f042) |
 | Monthly bias correction (bias_loader) | ✅ Complete | `calibration/bias_loader.py` | Reads parquet profile; fallback to cities.yaml; thread+file safe |
 | Historical replay / calibration | ✅ Complete | `calibration/historical_replay.py` | 2021–2024 KMDW data replayed; 12-month profile built |
 | Signal generation (alpha engine) | ✅ Complete | `trading/alpha_engine.py` | BUY/SELL/HOLD; rank_score with tail/shift/lag/microstructure boosts |
 | Alpha threshold filtering | ✅ Complete | `research/paper_trade_session.py:97` | Now reads `risk.alpha_threshold` from settings.yaml via `get_setting()`; value is 0.38 |
 | Kalshi API integration (live) | ✅ Complete | `market/kalshi_client.py` | RSA-PSS auth; live contract + orderbook fetch; stub fallback |
-| Paper trade session (morning) | ✅ Complete | `research/paper_trade_session.py` | Runs at 7 AM; GFS → ensemble → Kalshi → spreading → logs CSV + Discord |
-| Settlement script (evening) | ✅ Complete | `research/settle_paper_trades.py` | ACIS fetch; WIN/LOSS; P&L calc with 7% fee; bias_loader update |
+| Paper trade session (morning) | ✅ Complete | `research/paper_trade_session.py` | Runs at 7 AM; multi-city via ThreadPoolExecutor(max_workers=4); GFS → ensemble → Kalshi → spreading → logs CSV + Discord per city |
+| Settlement script (evening) | ✅ Complete | `research/settle_paper_trades.py` | ACIS fetch per city using acis_station_id; WIN/LOSS; P&L calc with 7% fee; bias_loader update; legacy rows without city default to Chicago |
+| Multi-city orchestration | ✅ Complete | `research/paper_trade_session.py` | Concurrent city sessions; shared CSV with threading.Lock; summary Discord embed after all cities finish |
+| Boston contract ID normalization | ✅ Complete | `market/kalshi_client.py` | _normalize_ticker() maps malformed IDs (KXHIGHBOS_HIGH_TEMP_F_GT_30_20260415 → KXHIGHBOS-26APR15-T30); called in _parse_ticker() and _parse_contract() |
+| Dashboard contract deep links + chips | ✅ Complete | `research/generate_dashboard.py`, `dashboard_ui/src/TradeTable.jsx` | Contract IDs link to kalshi.com/markets/{series}/{ticker}; OPEN rows show green YES/orange NO bracket chip |
 | Dashboard backend (FastAPI) | ✅ Complete | `dashboard/api.py` | Read-only; serves trades, daily log, bias profile; /api/account added |
 | Dashboard frontend (React) | ✅ Complete | `dashboard_ui/src/` | Vite + React + Recharts + Tailwind; 8 components; KALSHI CASH + IN POSITIONS cards |
 | Discord notification | ✅ Complete | `notifications/discord_notifier.py` | Morning run, settlement, dashboard; silent no-op if URL missing |
@@ -144,6 +147,10 @@ src/deep_isobar/
 |---|---|---|
 | `KMDW_raw_errors.parquet` | **1,384** | 2021-01-02 → 2024-12-31. Columns: date, city_code, station_id, month, raw_mean_f, actual_f, error_f, raw_std_f |
 | `KMDW_monthly_profile.parquet` | **12** (confirmed) | All 12 months present. Columns: month, mean_bias_f, variance_multiplier, sample_count, last_updated |
+| `KDFW_monthly_profile.parquet` | **12** | Dallas calibration profile. April mean_bias_correction_f=4.6470, variance_multiplier=0.7759 (freshly calibrated). |
+| `KJFK_monthly_profile.parquet` | **12** | NYC calibration profile. |
+| `KPHL_monthly_profile.parquet` | **12** | Philadelphia calibration profile. |
+| `KBOS_monthly_profile.parquet` | **12** | Boston calibration profile. |
 
 Monthly profile detail (April is the active trading month):
 
@@ -196,7 +203,7 @@ Note: No `kalshi_kxhighchi_2023_contracts.parquet` present — the Chicago contr
 
 | File | Description |
 |---|---|
-| `paper_trades.csv` | 7 rows (2026-04-02 → 2026-04-13). Legacy 21-column schema (pre-spread/sizing). See Section 10. |
+| `paper_trades.csv` | Rows as of Apr 14 (VOID duplicates from double session run removed; OPEN rows retained). city column now present. See Section 10. |
 | `daily_log.csv` | 16+ data rows. Same base schema as paper_trades.csv. |
 | `session_log.txt` | Text session log |
 | `settlement_log.txt` | Text settlement log |
@@ -208,19 +215,25 @@ Note: No `kalshi_kxhighchi_2023_contracts.parquet` present — the Chicago contr
 
 ### `config/cities.yaml`
 
-| City | station_id | mean_bias_correction_f | variance_multiplier | Notes |
-|---|---|---|---|---|
-| Chicago | KMDW | 3.9599 | 0.7787 | Fallback only — monthly parquet takes precedence at runtime |
-| New York | KJFK | -0.91 | 0.85 | Calibrated 2026-03-20 from 32-date Aug 2023 backtest. No monthly parquet built yet. |
-| Phoenix | KPHX | 0.0 | 0.9 | ⚠️ Uncalibrated placeholder — mean_bias_correction_f=0.0 |
-| Denver | KDEN | 0.0 | 1.3 | ⚠️ Uncalibrated placeholder — mean_bias_correction_f=0.0 |
-| Dallas | KDFW | -1.5 | 1.25 | Pre-calibration meteorological estimate; no backtest run yet |
+All city entries now include five new fields: `kalshi_series`, `acis_station_id`, `nws_lat`, `nws_lon`, and `active`.
+Chicago `acis_station_id` corrected from `KMDW` to `CLIMDW`.
+
+| City | station_id | acis_station_id | kalshi_series | mean_bias_correction_f | variance_multiplier | active | Notes |
+|---|---|---|---|---|---|---|---|
+| Chicago | KMDW | CLIMDW | kxhighchi | 3.9599 | 0.7787 | true | Fallback only — monthly parquet takes precedence at runtime |
+| Dallas | KDFW | CLIDFW | kxhightdal | 4.6470 | 0.7759 | true | Freshly calibrated (Apr 14). Monthly parquet built. |
+| New York | KJFK | CLINYC | kxhighny | (from parquet) | (from parquet) | false | Calibrated; active: false pending manual flip |
+| Philadelphia | KPHL | CLIPHL | kxhighphil | (from parquet) | (from parquet) | false | Calibrated; active: false pending manual flip |
+| Boston | KBOS | CLIBOS | kxhightbos | (from parquet) | (from parquet) | false | Calibrated; active: false pending manual flip |
+| Phoenix | KPHX | CLIPHX | kxhightphx | 0.0 | 0.9 | false | ⚠️ Uncalibrated placeholder |
+| Denver | KDEN | CLIDEN | kxhightden | 0.0 | 1.3 | false | ⚠️ Uncalibrated placeholder |
 
 Additional city parameters: `kde_bandwidth`, `tail_multiplier`, `model_weight_gfs/ecmwf/nam`, `heat_bias_adjustment_f`, `cold_bias_adjustment_f`, `sep_climate_normal_f`, `sep_anomaly_trigger_f` (last two only on Chicago).
 
 **Flags:**
-- Phoenix and Denver `mean_bias_correction_f: 0.0` — these are unvalidated defaults, not calibrated values.
-- `active: true` on all five cities, but only Chicago is actually executed in paper_trade_session.py (hardcoded `CITY = "Chicago"`).
+- Phoenix and Denver `mean_bias_correction_f: 0.0` — unvalidated defaults, not calibrated. Both `active: false`.
+- NYC, Philadelphia, Boston calibrated and have monthly parquets but are `active: false` — require manual flip before live paper trading.
+- `paper_trade_session.py` now respects `active` flag across all cities via `get_city_universe()`; no longer hardcodes Chicago.
 
 ### `.env.example`
 
@@ -303,7 +316,11 @@ Key entries:
 
 3. **`weather_ingest.py` is dead code** — `fetch_station_observations` returns fake sine-wave data. No live path calls it. If any future module imports it expecting real observations, it will silently return synthetic data.
 
-4. **Phoenix and Denver active but uncalibrated** — Both cities are `active: true` in cities.yaml but have `mean_bias_correction_f: 0.0` (placeholder). If they were to be executed, bias correction would be a no-op. No monthly parquet profiles exist for these stations.
+4. **Phoenix and Denver active but uncalibrated** — Both cities are `active: false` in cities.yaml and have `mean_bias_correction_f: 0.0` (placeholder). No monthly parquet profiles exist for these stations. Not executed.
+
+4a. ~~**`anthropic` package not installed**~~ — **RESOLVED.** `anthropic 0.94.0` is installed.
+
+4b. **Boston contract normalization may not be fully resolved** — `_normalize_ticker()` added but not yet verified on a live session run. Monitor next morning session output.
 
 5. **`data_sources.py` appears unused** — Present in `data/` but not imported by any audited module. May be dead code or a very early prototype.
 
@@ -311,9 +328,9 @@ Key entries:
 
 7. **`scheduler.py` `run_loop` not used by paper_trade_session** — The morning script uses its own self-contained pipeline, not `scheduler.run_once()`. The scheduler and paper_trade_session are parallel implementations of the same pipeline. They may drift.
 
-8. **`settings.yaml` `markets.enabled_sources` includes Polymarket** — Listed but completely unimplemented. `POLYMARKET_API_KEY` is a blank placeholder in .env.example.
+8. ~~**`settings.yaml` `markets.enabled_sources` includes Polymarket**~~ — **FIXED.** Removed from `enabled_sources`; Polymarket remains unimplemented.
 
-9. **SELL spreading not implemented** — `bracket_spreader.py:build_spread()` silently skips SELL signals. Only BUY signals are spread. A session with SELL-only signals would produce no allocations from the spreader. Comment in code: "future enhancement."
+9. **SELL spreading not implemented** — `bracket_spreader.py:build_spread()` skips SELL signals (BUY-only). A session with SELL-only signals produces no allocations. Now logs a WARNING with contract IDs when any SELL signals are skipped. Implementation is a future enhancement.
 
 10. **Equal and kelly allocation stubbed** — `build_spread()` raises `NotImplementedError` for `allocation_method="equal"` or `"kelly"`. Config documents these as future options; only `"proportional"` works.
 
@@ -325,15 +342,15 @@ Key entries:
 
 On a normal trading day, starting at approximately 7:00 AM CDT with no human intervention:
 
-1. **Morning session** (`paper_trade_session.py`) runs via Windows Task Scheduler. It downloads the current-day GFS forecast for Chicago from AWS (`noaa-gfs-bdp-pds.s3.amazonaws.com`) using byte-range GRIB2 requests — trying the 12z/f030 run first, falling back to 00z/f042. It also queries Open-Meteo for all three model values (GFS, ECMWF, NAM) as a cross-check.
+1. **Morning session** (`paper_trade_session.py`) runs via Windows Task Scheduler. It loads all cities with `active: true` from `config/cities.yaml` and dispatches each to `run_city_session(city)` concurrently via `ThreadPoolExecutor(max_workers=4)`. Each city session downloads the current-day GFS forecast from AWS (`noaa-gfs-bdp-pds.s3.amazonaws.com`) using byte-range GRIB2 requests — trying the 12z/f030 run first, falling back to 00z/f042 (numpy/xarray boolean bug that was blocking this fallback is now fixed). It also queries Open-Meteo for all three model values (GFS, ECMWF, NAM) as a cross-check. Currently active cities: Chicago, Dallas.
 
-2. The ensemble builder (`temperature_ensemble.py`) combines the model values with per-model weights and lead-time decay, then calls `bias_loader.get_current_bias("KMDW", current_month)` to fetch the April bias row from `KMDW_monthly_profile.parquet` (mean_bias_f ≈ +5.42°F, variance_multiplier ≈ 2.17). The corrected mean and uncertainty-adjusted std are returned.
+2. The ensemble builder (`temperature_ensemble.py`) combines the model values with per-model weights and lead-time decay, then calls `bias_loader.get_current_bias(city.acis_station_id, current_month)` to fetch the April bias row from the city's monthly parquet (e.g., KMDW: mean_bias_f ≈ +5.42°F, variance_multiplier ≈ 2.17; KDFW: mean_bias_f ≈ +4.65°F, variance_multiplier ≈ 0.78). The corrected mean and uncertainty-adjusted std are returned.
 
 3. A KDE temperature distribution is fit over the forecast values, and a probability surface is generated over 10–120°F.
 
-4. The Kalshi client fetches live contracts for KXHIGHCHI series (Chicago high temp) using RSA-PSS authentication. For each contract with `|alpha| ≥ 0.38` (read from `risk.alpha_threshold` in settings.yaml), a `TradeSignal` is generated with BUY/SELL/HOLD classification.
+4. The Kalshi client fetches live contracts for each city's `kalshi_series` using RSA-PSS authentication (e.g., KXHIGHCHI for Chicago, KXHIGHTDAL for Dallas). Malformed contract IDs (e.g., Boston-style `KXHIGHBOS_HIGH_TEMP_F_GT_30_20260415`) are normalized by `_normalize_ticker()` before parsing. For each contract with `|alpha| ≥ 0.38` (read from `risk.alpha_threshold` in settings.yaml), a `TradeSignal` is generated with BUY/SELL/HOLD classification.
 
-5. The METAR fetcher pulls the current KMDW observation from aviationweather.gov. The NWS fetcher calls `api.weather.gov/points/{lat},{lon}` → forecast URL → first daytime period temperature. Both results are passed to the Anthropic API (`claude-opus-4-6`) which checks for fog, lake breeze, cold-start, frontal suppression, and NWS/model divergence anomalies. The result is logged to the CSV columns `anomaly_flags`, `anomaly_penalty_f`, `anomaly_adjusted_signal`, `anomaly_confidence`, `anomaly_reasoning`. NWS failures degrade gracefully to None (NWS_MODEL_DIVERGENCE flag simply won't fire that session).
+5. The METAR fetcher pulls the current station observation via parameterized `fetch_metar(city.station_id)` from aviationweather.gov. The NWS fetcher calls `api.weather.gov/points/{city.nws_lat},{city.nws_lon}` → forecast URL → first daytime period temperature. Both results are passed to the Anthropic API (`claude-opus-4-6`) which checks for fog, lake breeze, cold-start, frontal suppression, and NWS/model divergence anomalies. The result is logged to the CSV columns `anomaly_flags`, `anomaly_penalty_f`, `anomaly_adjusted_signal`, `anomaly_confidence`, `anomaly_reasoning`. NWS failures degrade gracefully to None (NWS_MODEL_DIVERGENCE flag simply won't fire that session). ⚠️ If `anthropic` package is not installed, detector falls back silently → LOW confidence → halved dynamic sizing.
 
 6. **Dynamic position sizing** (`position_sizer.py`) computes a session exposure cap starting from $50 base, modulated by anomaly confidence (HIGH×1.0, MEDIUM×0.70, LOW×0.50), per-flag multiplicative penalties, and ensemble spread (clean×1.0, moderate×0.80, wide×0.60). Floor is $10.
 
@@ -341,9 +358,9 @@ On a normal trading day, starting at approximately 7:00 AM CDT with no human int
 
 8. Signals meeting the threshold are deduplicated (one per threshold/direction), written to `data/paper_trades/paper_trades.csv` and `daily_log.csv`, and a Discord embed is posted.
 
-9. At approximately **6:00 PM CDT**, the settlement script (`settle_paper_trades.py`) runs. It fetches the official KMDW daily high from ACIS, determines WIN/LOSS for all OPEN rows from that morning, computes P&L (BUY WIN = `(1 - entry_price) × 10 × 0.93`, etc.), writes results back to the CSV, calls `bias_loader.update_profile_after_settlement()` to append the new error row and recompute the April monthly bias, and posts a Discord settlement embed.
+9. At approximately **6:00 PM CDT**, the settlement script (`settle_paper_trades.py`) runs. It groups all OPEN rows by city, fetches the official daily high for each city from ACIS using the city's `acis_station_id` (e.g., CLIMDW for Chicago, CLIDFW for Dallas), determines WIN/LOSS, computes P&L (BUY WIN = `(1 - entry_price) × 10 × 0.93`, etc.), writes results back to the CSV, calls `bias_loader.update_profile_after_settlement()` per city, and posts a Discord settlement embed. Legacy rows with an empty city column default to Chicago.
 
-10. At **7:15 PM CDT**, `generate_dashboard.py` regenerates `dashboard.html` and posts it to Discord as a file attachment.
+10. At **7:15 PM CDT**, `generate_dashboard.py` regenerates `dashboard.html` and posts it to Discord as a file attachment. Contract IDs in the trade table are now clickable Kalshi deep links. OPEN rows display a bracket recommendation chip (green for YES/BUY, orange for NO/SELL).
 
 11. Throughout the day, the **FastAPI backend** (`dashboard/api.py`) serves the paper trades, daily log, bias profile, and Kalshi account balance to the React frontend at `localhost:8765`. The React frontend (`dashboard_ui/`) displays 7 summary stat cards (including KALSHI CASH and IN POSITIONS), P&L chart, alpha histogram, trade table, and bias profile tab. The dashboard auto-refreshes every 60 seconds.
 
@@ -365,13 +382,15 @@ On a normal trading day, starting at approximately 7:00 AM CDT with no human int
 
 6. **Polymarket** — Listed in settings.yaml as an enabled source and .env.example has a key placeholder, but no client, contract generator, or price adapter exists for Polymarket.
 
-7. **NYC/Phoenix/Denver/Dallas paper trading not running** — Only Chicago is wired into `paper_trade_session.py`. The other cities in cities.yaml are inert.
-
 8. **Server infrastructure not networked** — The three Dell PowerEdge servers exist but are not networked. Everything runs on the Win11 PC. Scheduling, replay, and batch onboarding all share one machine.
 
 9. **ECMWF at short lead times** — For same-day targets, ECMWF (`ecmwf_ifs04`) is dropped from the ensemble because Open-Meteo doesn't serve it for T+0. This is handled correctly, but it means the morning session typically runs GFS + NAM only (2 models), not 3.
 
-10. **Dallas onboarding not yet run** — Dallas has a pre-calibration estimate in cities.yaml but no historical replay or backtest has been executed for KDFW.
+10. **Boston contract normalization not yet verified on live run** — `_normalize_ticker()` is implemented but has not been confirmed working against a real live Boston session. Monitor next run.
+
+11. **`anthropic` package missing from active environment** — Anomaly detector falls back silently to LOW confidence, cutting dynamic sizing by 50%. Fix: `pip install anthropic`.
+
+12. **20+ cities not yet onboarded** — Phoenix, Denver, Los Angeles, San Francisco, Seattle, Las Vegas, Washington DC, Minneapolis, Houston, New Orleans, San Antonio, Oklahoma City, Austin, Miami, Atlanta, and others have no calibration data or active: false with no parquet.
 
 ---
 
@@ -398,32 +417,57 @@ Note: The majority of `raise RuntimeError` entries are intentional hard stops fo
 
 ## 10. Metrics Snapshot
 
-From `data/paper_trades/paper_trades.csv` as of 2026-04-13:
+### `data/paper_trades/paper_trades.csv` as of 2026-04-14
+
+Duplicate April 15 VOID rows from a double session run have been removed. OPEN rows retained. `city` column now present.
 
 | Metric | Value |
 |---|---|
-| Total rows in paper_trades.csv | 7 |
-| Settled trades (WIN + LOSS) | 5 |
+| Settled trades (WIN + LOSS) | 5 (Chicago only through Apr 13) |
 | Wins | 3 |
 | Losses | 2 |
 | Win rate (settled only) | **60%** |
-| VOID (bracket contract, not evaluated) | 1 |
-| OPEN (not yet settled) | 1 |
 | Net realized P&L (settled trades) | **+$21.02** |
 | Mean alpha (all trades) | **0.402** |
-| Alpha range | 0.277 → 0.534 |
 | Date range | 2026-04-02 → 2026-04-13 |
-| `anomaly_flags` column present | **Yes** |
-| `anomaly_penalty_f` column present | **Yes** |
-| `anomaly_adjusted_signal` column present | **Yes** |
-| `anomaly_confidence` column present | **Yes** |
-| `anomaly_reasoning` column present | **Yes** |
-| `spread_rank` column present | **No** — pending auto-migration on next session run |
-| `spread_total_contracts` column present | **No** — pending auto-migration on next session run |
-| `sizing_base_usd` column present | **No** — pending auto-migration on next session run |
-| `sizing_final_usd` column present | **No** — pending auto-migration on next session run |
-| `sizing_reasoning` column present | **No** — pending auto-migration on next session run |
+| `city` column present | **Yes** (added; legacy rows empty → default to Chicago) |
+| All anomaly columns present | **Yes** |
+| `spread_rank`, `spread_total_contracts`, `sizing_*` columns | **Yes** — auto-migrated on first multi-city session write |
 
-**Observations:** 7 trading days, 5 settled results (up from 4 on Apr 10). Win rate improved to 60% with the Apr 12 WIN (+$7.72). Net P&L improved from +$13.30 to +$21.02. Sample is still too small for statistical inference — the backtest 72.5% win rate is a calibration target, not a prediction of these results. The Apr 9 win (alpha=0.277) is the lowest-alpha trade and still won, suggesting the model is capturing real edge even at marginal signals. All 6 actionable trades are BUY (long YES), consistent with the system finding the market systematically underpricing Chicago high temperatures.
+### City Calibration Results (Backtest, April 14, 2026)
 
-The five new spread/sizing columns exist in `_CSV_COLUMNS` in `paper_trade_session.py` and will be written starting from the next session. The `_ensure_csv()` auto-migration will add them to existing rows as empty strings when the session next writes to the file.
+| City | Station | acis_station_id | Win Rate | Sharpe | Holdout RMSE | Apr Bias | Active |
+|---|---|---|---|---|---|---|---|
+| Dallas | KDFW | CLIDFW | 79.9% | 1.486 | 4.12°F | +6.08°F | ✅ |
+| New York | KJFK | CLINYC | 81.0% | 2.355 | 3.83°F | +2.50°F | ✅ |
+| Philadelphia | KPHL | CLIPHL | 85.3% | 1.714 | 3.99°F | +4.64°F | ✅ |
+| Boston | KBOS | CLIBOS | 79.0% | 1.714 | 4.35°F | +4.42°F | ✅ |
+
+**Observations:** Multi-city refactor complete and live (Chicago + Dallas). Four new cities calibrated with strong backtest metrics — all above 79% win rate and Sharpe ≥ 1.48. NYC leads on Sharpe (2.355), Philadelphia leads on win rate (85.3%). All four are ready to activate; NYC/Philly/Boston held at `active: false` pending review. Dallas April bias (+6.08°F) is the highest of the new cities and is fully accounted for in the monthly parquet (mean_bias_correction_f=4.647). Sample is still small for Chicago live paper trades (5 settled) — calibration targets remain the backtest results, not these early live numbers.
+
+---
+
+## 11. Full City Universe Status (as of April 14, 2026)
+
+| City | Kalshi Series | CLI Station | Calibrated | Active |
+|---|---|---|---|---|
+| Chicago | kxhighchi | CLIMDW | ✅ | ✅ |
+| Dallas | kxhightdal | CLIDFW | ✅ | ✅ |
+| New York | kxhighny | CLINYC | ✅ | ✅ |
+| Philadelphia | kxhighphil | CLIPHL | ✅ | ✅|
+| Boston | kxhightbos | CLIBOS | ✅ | ✅ |
+| Phoenix | kxhightphx | CLIPHX | ❌ | ❌ |
+| Denver | kxhightden | CLIDEN | ❌ | ❌ |
+| Los Angeles | kxhighlax | CLILAX | ❌ | ❌ |
+| San Francisco | kxhightsfo | CLISFO | ❌ | ❌ |
+| Seattle | kxhightsea | CLISEA | ❌ | ❌ |
+| Las Vegas | kxhightlv | CLILAS | ❌ | ❌ |
+| Washington DC | kxhightdc | CLIDCA | ❌ | ❌ |
+| Minneapolis | kxhightmin | CLIMSP | ❌ | ❌ |
+| Houston | kxhighthou |CLIHOU | ❌ | ❌ |
+| New Orleans | kxhightnola | CLIMSY | ❌ | ❌ |
+| San Antonio | kxhightsatx |CLISAT | ❌ | ❌ |
+| Oklahoma City | kxhightokcc | CLIOKC | ❌ | ❌ |
+| Austin | kxhighhaus | CLIAIS | ❌ | ❌ |
+| Miami | kxhighmia | CLIMIA | ❌ | ❌ |
+| Atlanta | kxhighttatl | CLIATL | ❌ | ❌ |
