@@ -22,6 +22,13 @@ runtime:
     - "19:00-21:00"
     - "21:00-22:00"
 
+anomaly:
+  # Claude-powered anomaly detector. Paused 2026-06-11 — Anthropic API
+  # credits exhausted. Set true again once the account is funded.
+  # While false: no API calls, anomaly=None, position sizer applies the
+  # NONE multiplier (1.0) instead of penalizing every trade as LOW (0.5).
+  enabled: false
+
 risk:
   alpha_threshold: 0.38
   max_position_per_contract: 100

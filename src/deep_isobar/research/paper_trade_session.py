@@ -380,6 +380,21 @@ def _append_csv_row(path: Path, row: dict) -> None:
         csv.DictWriter(fh, fieldnames=_CSV_COLUMNS).writerow(row)
 
 
+def _logged_trade_keys(path: Path) -> set[tuple[str, str]]:
+    """Return ``(date, contract_ticker)`` pairs already logged to *path*.
+
+    Used to guard against duplicate trades when the session is run more
+    than once on the same day (e.g. a manual re-run after a crash).
+    """
+    if not path.exists():
+        return set()
+    with path.open(newline="", encoding="utf-8") as fh:
+        return {
+            (r.get("date", ""), r.get("contract_ticker", ""))
+            for r in csv.DictReader(fh)
+        }
+
+
 # ---------------------------------------------------------------------------
 # Signal printer (dry-run)
 # ---------------------------------------------------------------------------
@@ -484,47 +499,54 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
 
     # ── Anomaly detection ─────────────────────────────────────────────────
     # Use city.nws_lat/nws_lon for NWS; city.station_id for METAR.
-    try:
-        from deep_isobar.anomaly import check_anomalies, parse_metar_fields
-        from deep_isobar.anomaly.metar_fetcher import fetch_metar
-        from deep_isobar.anomaly.nws_fetcher import fetch_nws_high_forecast_f
-
-        raw_metar = fetch_metar(city.station_id)
-        metar_fields = parse_metar_fields(raw_metar)
-
-        nws_lat = city.nws_lat if city.nws_lat != 0.0 else None
-        nws_lon = city.nws_lon if city.nws_lon != 0.0 else None
-
-        nws_forecast_f = None
-        if nws_lat is not None and nws_lon is not None:
-            try:
-                nws_forecast_f = fetch_nws_high_forecast_f(lat=nws_lat, lon=nws_lon)
-            except Exception:
-                logger.debug("[%s] NWS fetcher raised unexpectedly — defaulting to None", city_label)
-
-        if nws_forecast_f is not None:
-            logger.info("[%s] NWS forecast high: %.1f°F", city_label, nws_forecast_f)
-        else:
-            logger.debug("[%s] NWS forecast unavailable — NWS_MODEL_DIVERGENCE will not fire", city_label)
-
-        anomaly = check_anomalies(
-            metar=raw_metar,
-            nws_forecast_f=nws_forecast_f,
-            model_mean_f=ensemble.ensemble_mean_f,
-            wind_dir=metar_fields.get("wind_dir", ""),
-            sky_cover=metar_fields.get("sky_cover", ""),
-        )
-        logger.info(
-            "[%s] Anomaly check: flags=%s  penalty=%.1f°F  signal=%s  confidence=%s",
-            city_label,
-            [f.code for f in anomaly.flags],
-            anomaly.total_temp_penalty_f,
-            anomaly.adjusted_signal,
-            anomaly.confidence,
-        )
-    except Exception as e:
+    # When anomaly.enabled is false, skip entirely: anomaly=None means the
+    # position sizer applies the NONE multiplier (1.0 — no penalty) instead
+    # of the LOW multiplier (0.5) that a failed API call would trigger.
+    if not get_setting("anomaly.enabled", default=True):
         anomaly = None
-        logger.debug("[%s] Anomaly check skipped: %s", city_label, e)
+        logger.info("[%s] Anomaly check disabled via config (anomaly.enabled=false)", city_label)
+    else:
+        try:
+            from deep_isobar.anomaly import check_anomalies, parse_metar_fields
+            from deep_isobar.anomaly.metar_fetcher import fetch_metar
+            from deep_isobar.anomaly.nws_fetcher import fetch_nws_high_forecast_f
+
+            raw_metar = fetch_metar(city.station_id)
+            metar_fields = parse_metar_fields(raw_metar)
+
+            nws_lat = city.nws_lat if city.nws_lat != 0.0 else None
+            nws_lon = city.nws_lon if city.nws_lon != 0.0 else None
+
+            nws_forecast_f = None
+            if nws_lat is not None and nws_lon is not None:
+                try:
+                    nws_forecast_f = fetch_nws_high_forecast_f(lat=nws_lat, lon=nws_lon)
+                except Exception:
+                    logger.debug("[%s] NWS fetcher raised unexpectedly — defaulting to None", city_label)
+
+            if nws_forecast_f is not None:
+                logger.info("[%s] NWS forecast high: %.1f°F", city_label, nws_forecast_f)
+            else:
+                logger.debug("[%s] NWS forecast unavailable — NWS_MODEL_DIVERGENCE will not fire", city_label)
+
+            anomaly = check_anomalies(
+                metar=raw_metar,
+                nws_forecast_f=nws_forecast_f,
+                model_mean_f=ensemble.ensemble_mean_f,
+                wind_dir=metar_fields.get("wind_dir", ""),
+                sky_cover=metar_fields.get("sky_cover", ""),
+            )
+            logger.info(
+                "[%s] Anomaly check: flags=%s  penalty=%.1f°F  signal=%s  confidence=%s",
+                city_label,
+                [f.code for f in anomaly.flags],
+                anomaly.total_temp_penalty_f,
+                anomaly.adjusted_signal,
+                anomaly.confidence,
+            )
+        except Exception as e:
+            anomaly = None
+            logger.debug("[%s] Anomaly check skipped: %s", city_label, e)
 
     if not dry_run:
         post_embed(
@@ -773,6 +795,27 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                         else:
                             row["status"] = "SPREAD_SKIP"
                             row["spread_total_contracts"] = n_total
+
+        # ── Same-day duplicate guard (across session re-runs) ─────────────
+        # The dedup above only covers rows produced in this run. If the
+        # session is executed again on the same day, every signal would be
+        # logged a second time — so check paper_trades.csv for trades
+        # already logged for this (date, ticker) and skip them.
+        with _CSV_LOCK:
+            already_logged = _logged_trade_keys(_PAPER_TRADES_CSV)
+        for row in all_rows:
+            if (
+                row["status"] == "OPEN"
+                and (row["date"], row["contract_ticker"]) in already_logged
+            ):
+                row["status"] = "DUP_SKIP"
+                logger.warning(
+                    "[%s] Skipping duplicate trade: %s already logged for %s "
+                    "in an earlier session run today",
+                    city_label,
+                    row["contract_ticker"],
+                    row["date"],
+                )
 
         # ── Dry-run output ─────────────────────────────────────────────────
         if dry_run:
