@@ -24,6 +24,8 @@ cities:
     model_weight_gfs: 0.35
     model_weight_ecmwf: 0.50
     model_weight_nam: 0.15
+    model_weight_icon: 0.15
+    model_weight_gem: 0.10
     heat_bias_adjustment_f: 0.0
     cold_bias_adjustment_f: 0.0
     # September climate normal and anomaly trigger for conditional heat-bias adjustment.
@@ -59,6 +61,8 @@ cities:
     model_weight_gfs: 0.4
     model_weight_ecmwf: 0.4
     model_weight_nam: 0.2
+    model_weight_icon: 0.15
+    model_weight_gem: 0.10
     heat_bias_adjustment_f: 0.0
     cold_bias_adjustment_f: 0.0
 
@@ -84,6 +88,8 @@ cities:
     model_weight_gfs: 0.35
     model_weight_ecmwf: 0.45
     model_weight_nam: 0.20
+    model_weight_icon: 0.15
+    model_weight_gem: 0.10
     heat_bias_adjustment_f: -0.5
     cold_bias_adjustment_f: 0.0
   
@@ -104,6 +110,8 @@ cities:
     model_weight_gfs: 0.35
     model_weight_ecmwf: 0.45
     model_weight_nam: 0.2
+    model_weight_icon: 0.15
+    model_weight_gem: 0.10
     heat_bias_adjustment_f: 0.0
     cold_bias_adjustment_f: 0.0
 
@@ -124,5 +132,7 @@ cities:
     model_weight_gfs: 0.35
     model_weight_ecmwf: 0.45
     model_weight_nam: 0.2
+    model_weight_icon: 0.15
+    model_weight_gem: 0.10
     heat_bias_adjustment_f: 0.0
     cold_bias_adjustment_f: 0.0

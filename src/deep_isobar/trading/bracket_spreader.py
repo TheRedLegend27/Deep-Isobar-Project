@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 from deep_isobar.core.types import TradeSignal
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class BracketAllocation:

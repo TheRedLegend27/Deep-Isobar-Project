@@ -165,6 +165,8 @@ def _build_profile(entry: dict[str, Any]) -> CityProfile:
         model_weight_gfs=entry.get("model_weight_gfs"),
         model_weight_ecmwf=entry.get("model_weight_ecmwf"),
         model_weight_nam=entry.get("model_weight_nam"),
+        model_weight_icon=entry.get("model_weight_icon"),
+        model_weight_gem=entry.get("model_weight_gem"),
         heat_bias_adjustment_f=float(entry.get("heat_bias_adjustment_f", 0.0)),
         cold_bias_adjustment_f=float(entry.get("cold_bias_adjustment_f", 0.0)),
         sep_climate_normal_f=entry.get("sep_climate_normal_f"),

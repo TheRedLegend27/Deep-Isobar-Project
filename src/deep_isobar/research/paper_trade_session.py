@@ -144,20 +144,31 @@ _CSV_COLUMNS = [
 
 
 # ---------------------------------------------------------------------------
-# GFS live fetch
+# Live forecast fetch (GFS via GRIB2/AWS + ECMWF/ICON/GEM via Open-Meteo)
 # ---------------------------------------------------------------------------
 
+# Open-Meteo model identifiers per Deep Isobar model name.  GFS from
+# Open-Meteo is only used when the GRIB2/AWS path fails — the GRIB path is
+# what the bias profiles were calibrated on and stays the primary source.
+_OPEN_METEO_MODELS: dict[str, str] = {
+    "GFS":   "gfs_seamless",
+    "ECMWF": "ecmwf_ifs025",
+    "ICON":  "icon_seamless",
+    "GEM":   "gem_seamless",
+}
+_EXTRA_MODELS = ("ECMWF", "ICON", "GEM")
 
-def _fetch_live_gfs_t24(city_profile: CityProfile, run_date: date) -> list[ForecastPoint]:
-    """Download GFS T+24 forecasts for *run_date*, targeting tomorrow's high.
 
-    Tries the GRIB2/AWS path (12z f030, then 00z f042) first.  If cfgrib or
-    the native ecCodes library is unavailable (e.g. Windows Application
-    Control), falls back to the Open-Meteo JSON API which exposes the same
-    GFS-seamless output without any native dependencies.
+def _fetch_live_forecasts_t24(city_profile: CityProfile, run_date: date) -> list[ForecastPoint]:
+    """Fetch all model forecasts for *run_date*, targeting tomorrow's high.
+
+    GFS comes from the GRIB2/AWS path (12z f030, then 00z f042) — the same
+    source the bias profiles were calibrated on.  ECMWF, ICON, and GEM come
+    from a single Open-Meteo call.  If the GRIB path is unavailable (cfgrib
+    missing or AWS down), Open-Meteo GFS fills in.
 
     Returns all successfully retrieved points so the ensemble builder can
-    weight them.  An empty list means no data was available from either path.
+    weight them.  An empty list means no data was available from any path.
     """
     station_id = city_profile.station_id
     city_lat, city_lon_360 = _STATION_COORDS.get(
@@ -165,15 +176,46 @@ def _fetch_live_gfs_t24(city_profile: CityProfile, run_date: date) -> list[Forec
     )
     tomorrow = run_date + timedelta(days=1)
 
-    # ── Attempt GRIB2/AWS path ───────────────────────────────────────────────
+    # ── GFS via GRIB2/AWS ────────────────────────────────────────────────────
+    gfs_points = _fetch_grib_gfs_t24(city_profile, city_lat, city_lon_360, run_date, tomorrow)
+
+    # ── ECMWF / ICON / GEM (plus GFS fallback) via Open-Meteo ───────────────
+    om_models = _EXTRA_MODELS if gfs_points else ("GFS",) + _EXTRA_MODELS
+    om_points = _fetch_open_meteo_models(
+        city_profile, city_lat, city_lon_360, run_date, tomorrow, om_models
+    )
+
+    points = gfs_points + om_points
+    if points:
+        logger.info(
+            "[%s] Forecast points: %s",
+            city_profile.city,
+            {f"{p.model_name}({p.source_name})": round(p.forecast_value_f, 1) for p in points},
+        )
+    return points
+
+
+def _fetch_grib_gfs_t24(
+    city_profile: CityProfile,
+    city_lat: float,
+    city_lon_360: float,
+    run_date: date,
+    tomorrow: date,
+) -> list[ForecastPoint]:
+    """Download GFS T+24 forecasts from the GRIB2/AWS path (12z, then 00z).
+
+    Returns an empty list when cfgrib/ecCodes is unavailable or no run could
+    be retrieved — the caller falls back to Open-Meteo GFS in that case.
+    """
+    station_id = city_profile.station_id
     try:
         _check_cfgrib()
     except (ImportError, RuntimeError, OSError) as exc:
         logger.info(
-            "[%s] cfgrib/ecCodes unavailable (%s) — using Open-Meteo fallback",
+            "[%s] cfgrib/ecCodes unavailable (%s) — GFS will come from Open-Meteo",
             city_profile.city, exc,
         )
-        return _fetch_open_meteo_gfs(city_profile, city_lat, city_lon_360, run_date, tomorrow)
+        return []
 
     points: list[ForecastPoint] = []
     for cycle in ("12", "00"):
@@ -221,37 +263,37 @@ def _fetch_live_gfs_t24(city_profile: CityProfile, run_date: date) -> list[Forec
 
     if not points:
         logger.info(
-            "[%s] GRIB2 path returned no points — using Open-Meteo fallback",
+            "[%s] GRIB2 path returned no GFS points — Open-Meteo GFS will fill in",
             city_profile.city,
         )
-        return _fetch_open_meteo_gfs(city_profile, city_lat, city_lon_360, run_date, tomorrow)
-
     return points
 
 
-def _fetch_open_meteo_gfs(
+def _fetch_open_meteo_models(
     city_profile: CityProfile,
     city_lat: float,
     city_lon_360: float,
     run_date: date,
     tomorrow: date,
+    models: tuple[str, ...] = _EXTRA_MODELS,
 ) -> list[ForecastPoint]:
-    """Fetch GFS 2m temperature via Open-Meteo JSON API.
+    """Fetch 2m temperature for several models via one Open-Meteo call.
 
-    Queries the GFS-seamless model for hourly 2m temperature in Fahrenheit
-    and extracts the 18:00 UTC value on *tomorrow* — the same afternoon-high
-    proxy used by the GRIB2 path.  Returns one ForecastPoint per GFS cycle
-    (12z / 00z) with the appropriate lead-hour metadata so the ensemble
-    builder treats them identically to GRIB2-sourced points.
+    Extracts the 18:00 UTC value on *tomorrow* for each requested model —
+    the same afternoon-high proxy the GRIB2 path uses, so the station bias
+    correction (which mostly absorbs the snapshot-vs-daily-high offset)
+    applies consistently across models.  Returns one ForecastPoint per
+    model that had data; models with a null/missing value are skipped.
     """
     station_id = city_profile.station_id
     city_lon = city_lon_360 - 360.0  # 360-lon → standard (-180 … 180)
 
+    om_ids = ",".join(_OPEN_METEO_MODELS[m] for m in models)
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={city_lat}&longitude={city_lon}"
         "&hourly=temperature_2m"
-        "&models=gfs_seamless"
+        f"&models={om_ids}"
         "&temperature_unit=fahrenheit"
         "&forecast_days=3"
         "&timezone=UTC"
@@ -265,8 +307,8 @@ def _fetch_open_meteo_gfs(
         logger.warning("[%s] Open-Meteo request failed: %s", city_profile.city, exc)
         return []
 
-    hourly_times: list[str] = data.get("hourly", {}).get("time", [])
-    hourly_temps: list[float | None] = data.get("hourly", {}).get("temperature_2m", [])
+    hourly: dict = data.get("hourly", {})
+    hourly_times: list[str] = hourly.get("time", [])
 
     # Target: 18:00 UTC on tomorrow (afternoon-high proxy)
     target_str = tomorrow.strftime("%Y-%m-%d") + "T18:00"
@@ -279,36 +321,41 @@ def _fetch_open_meteo_gfs(
         )
         return []
 
-    t_f = hourly_temps[idx]
-    if t_f is None:
-        logger.warning(
-            "[%s] Open-Meteo: null temperature at %s", city_profile.city, target_str
-        )
-        return []
-
-    logger.info(
-        "[%s] Open-Meteo GFS 18z UTC: run=%s → %.1f°F  (target %s)",
-        city_profile.city, run_date, t_f, tomorrow,
+    # 12z run of run_date → 18z tomorrow = 30 h lead.
+    run_time_utc = datetime(
+        run_date.year, run_date.month, run_date.day, 12, 0, 0, tzinfo=timezone.utc,
     )
+    lead_hours = 30
 
-    # Return one point per cycle so the ensemble sees the same structure it
-    # would from the GRIB2 path (two GFS runs weighted together).
     points: list[ForecastPoint] = []
-    for cycle in ("12", "00"):
-        fhour = _LEAD_FHOUR[cycle][1]
-        run_time_utc = datetime(
-            run_date.year, run_date.month, run_date.day,
-            int(cycle), 0, 0, tzinfo=timezone.utc,
+    for model in models:
+        # Multi-model responses suffix the key with the model id; a
+        # single-model request returns a plain "temperature_2m" key.
+        key = f"temperature_2m_{_OPEN_METEO_MODELS[model]}"
+        temps = hourly.get(key)
+        if temps is None and len(models) == 1:
+            temps = hourly.get("temperature_2m")
+        t_f = temps[idx] if temps and idx < len(temps) else None
+        if t_f is None:
+            logger.warning(
+                "[%s] Open-Meteo: no %s value at %s — skipping model",
+                city_profile.city, model, target_str,
+            )
+            continue
+
+        logger.info(
+            "[%s] Open-Meteo %s 18z UTC: run=%s → %.1f°F  (target %s)",
+            city_profile.city, model, run_date, t_f, tomorrow,
         )
         points.append(ForecastPoint(
             city=city_profile.city,
             station_id=station_id,
-            model_name="GFS",
+            model_name=model,
             run_time_utc=run_time_utc,
             target_date=tomorrow,
             metric=METRIC,
-            forecast_value_f=t_f,
-            lead_hours=fhour,
+            forecast_value_f=float(t_f),
+            lead_hours=lead_hours,
             source_name="Open-Meteo",
         ))
 
@@ -460,9 +507,9 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
 
     result: dict = {"city": city_label, "signals": 0, "error": None}
 
-    # ── GFS forecast ───────────────────────────────────────────────────────
+    # ── Model forecasts (GFS + ECMWF/ICON/GEM) ─────────────────────────────
     try:
-        forecast_points = _fetch_live_gfs_t24(city, today)
+        forecast_points = _fetch_live_forecasts_t24(city, today)
     except (ImportError, RuntimeError, OSError) as exc:
         logger.error("[%s] cfgrib/xarray/eccodes not installed: %s", city_label, exc)
         result["error"] = f"cfgrib not installed: {exc}"
@@ -470,8 +517,8 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
 
     if not forecast_points:
         msg = (
-            f"No GFS T+24 forecast available for {city_label} run_date={today}. "
-            "Check that the 00z or 12z run has been posted to AWS."
+            f"No T+24 forecasts available for {city_label} run_date={today} "
+            "from either the GRIB2/AWS path or Open-Meteo."
         )
         logger.error("[%s] %s", city_label, msg)
         result["error"] = msg

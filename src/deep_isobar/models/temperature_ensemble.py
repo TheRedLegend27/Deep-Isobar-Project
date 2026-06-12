@@ -27,10 +27,15 @@ logger = logging.getLogger(__name__)
 _VALID_METRICS = {"high_temp_f", "low_temp_f"}
 
 # Lead-time activity windows (inclusive, in hours) per model source.
+# ECMWF was originally windowed to 72-240h (long-lead only), which masked it
+# to zero weight at the T+24-42h leads the live session trades — widened to
+# 6h so live ECMWF points actually contribute.
 _SOURCE_WINDOWS: dict[str, tuple[int, int]] = {
     "NAM":   (6, 48),
     "GFS":   (6, 240),
-    "ECMWF": (72, 240),
+    "ECMWF": (6, 240),
+    "ICON":  (6, 180),
+    "GEM":   (6, 240),
 }
 
 
@@ -110,6 +115,8 @@ def _build_weights(
         "GFS":   city_profile.model_weight_gfs,
         "ECMWF": city_profile.model_weight_ecmwf,
         "NAM":   city_profile.model_weight_nam,
+        "ICON":  city_profile.model_weight_icon,
+        "GEM":   city_profile.model_weight_gem,
     }
     all_none = all(v is None for v in profile_weights.values())
 

@@ -13,6 +13,25 @@ paths:
   backtests_dir: data/backtests
   logs_dir: data/logs
 
+scheduler:
+  # Daily jobs run by deep_isobar.supervisor (single long-running process,
+  # registered once in Task Scheduler at logon — see start_supervisor.bat).
+  # Times are LOCAL MACHINE time. Missed jobs (PC asleep) run on catch-up.
+  poll_seconds: 60
+  jobs:
+    - name: paper_trade_session
+      module: deep_isobar.research.paper_trade_session
+      at: "07:00"
+    - name: intraday_check
+      module: deep_isobar.research.intraday_check
+      at: "14:00"
+    - name: settle_paper_trades
+      module: deep_isobar.research.settle_paper_trades
+      at: "18:00"
+    - name: generate_dashboard
+      module: deep_isobar.research.generate_dashboard
+      at: "19:15"
+
 runtime:
   paper_trade: true
   scheduler_interval_seconds: 300

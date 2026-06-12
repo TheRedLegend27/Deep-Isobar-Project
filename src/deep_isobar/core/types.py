@@ -65,6 +65,8 @@ class CityProfile:
     model_weight_gfs: Optional[float] = None
     model_weight_ecmwf: Optional[float] = None
     model_weight_nam: Optional[float] = None
+    model_weight_icon: Optional[float] = None
+    model_weight_gem: Optional[float] = None
     heat_bias_adjustment_f: float = 0.0
     cold_bias_adjustment_f: float = 0.0
     sep_climate_normal_f: Optional[float] = None
