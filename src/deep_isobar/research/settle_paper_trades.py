@@ -399,6 +399,40 @@ def _update_bias_profile(
         )
 
 
+def _refresh_emos_calibration() -> None:
+    """Nightly EMOS refresh: extend training parquets and refit all stations.
+
+    Re-fetches the previous-runs forecast window (so the training history
+    keeps growing past the API's ~92-day limit) and refits the rolling-window
+    EMOS parameters used by tomorrow's session.  Never raises — a refresh
+    failure must not abort settlement; the session simply keeps using the
+    last good parameters.
+    """
+    try:
+        from deep_isobar.calibration.emos_training import (
+            build_training_data,
+            fit_station,
+        )
+        from deep_isobar.data.city_universe import get_city_universe
+
+        for city in get_city_universe():
+            if not city.active:
+                continue
+            try:
+                build_training_data(city)
+                params = fit_station(city)
+                logger.info(
+                    "[%s] EMOS refit: n=%d  train CRPS=%.3f°F",
+                    city.city, params.n_train, params.train_crps,
+                )
+            except Exception:
+                logger.exception(
+                    "[%s] EMOS refresh failed — keeping previous params", city.city
+                )
+    except Exception:
+        logger.exception("EMOS calibration refresh failed entirely")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -449,6 +483,7 @@ def settle(settle_date: date) -> None:
     if open_today.empty:
         logger.info("No OPEN trades for %s — nothing to settle.", settle_date)
         _print_pnl_summary(df)
+        _refresh_emos_calibration()
         return
 
     # Resolve the city for each open row.  The 'city' column was added in the
@@ -565,6 +600,9 @@ def settle(settle_date: date) -> None:
         )
 
     _print_pnl_summary(df)
+
+    # ── Nightly EMOS calibration refresh ──────────────────────────────────
+    _refresh_emos_calibration()
 
 
 # ---------------------------------------------------------------------------

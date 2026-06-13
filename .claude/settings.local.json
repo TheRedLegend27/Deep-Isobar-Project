@@ -20,7 +20,20 @@
       "PowerShell(.venv\\\\Scripts\\\\python.exe -m deep_isobar.research.paper_trade_session --dry-run > data\\\\logs\\\\dryrun_test.txt 2>&1; \"exit=$LASTEXITCODE\"; Get-Content data\\\\logs\\\\dryrun_test.txt -Tail 30)",
       "PowerShell(schtasks /run /tn \"DeepIsobarSupervisor\")",
       "PowerShell(Select-String -Path \"data\\\\logs\\\\jobs\\\\paper_trade_session_20260611.log\" -Pattern \"NameError\" -Context 12,2 | Select-Object -First 1 | ForEach-Object { $_.Context.PreContext; $_.Line; $_.Context.PostContext })",
-      "PowerShell(.venv\\\\Scripts\\\\python.exe -m deep_isobar.supervisor --run-now paper_trade_session; \"exit=$LASTEXITCODE\"; Get-Content data\\\\paper_trades\\\\session_log.txt -Tail 7; Write-Output '--- ledger ---'; Import-Csv data\\\\paper_trades\\\\paper_trades.csv | Format-Table date, city, contract_ticker, direction, alpha, entry_price, position_size, status -AutoSize)"
+      "PowerShell(.venv\\\\Scripts\\\\python.exe -m deep_isobar.supervisor --run-now paper_trade_session; \"exit=$LASTEXITCODE\"; Get-Content data\\\\paper_trades\\\\session_log.txt -Tail 7; Write-Output '--- ledger ---'; Import-Csv data\\\\paper_trades\\\\paper_trades.csv | Format-Table date, city, contract_ticker, direction, alpha, entry_price, position_size, status -AutoSize)",
+      "Bash(curl -s \"https://previous-runs-api.open-meteo.com/v1/forecast?latitude=41.786&longitude=-87.752&hourly=temperature_2m_previous_day1&models=gfs_seamless,ecmwf_ifs025,icon_seamless,gem_seamless&temperature_unit=fahrenheit&timezone=America%2FChicago&past_days=5&forecast_days=1\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests\\\\test_emos.py -q 2>$null)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m deep_isobar.calibration.emos_training --window-days 90)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m deep_isobar.calibration.emos_training --window-days 90 2>$null)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m deep_isobar.research.forecast_evaluation --holdout-days 15 2>$null)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests -q -x --ignore=tests\\\\test_kalshi_client.py 2>$null)",
+      "PowerShell(git stash -q)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests\\\\test_alpha_engine.py::test_build_trade_signal_optional_flags_set -q 2>$null)",
+      "PowerShell(git stash pop -q)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests -q --deselect tests/test_alpha_engine.py::test_build_trade_signal_optional_flags_set 2>$null)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests -q --deselect tests/test_alpha_engine.py::test_build_trade_signal_optional_flags_set 2>$null | Select-String \"FAILED\" | ForEach-Object { $_.Line } | Select-Object -First 40)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests -q 2>$null)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m deep_isobar.research.paper_trade_session --dry-run 2>&1)"
     ]
   }
 }

@@ -58,6 +58,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, etc.
 
+from deep_isobar.calibration.emos import emos_predict, load_params as load_emos_params
 from deep_isobar.core.types import CityProfile, ForecastPoint, TradeSignal
 from deep_isobar.data.city_universe import get_city_universe
 from deep_isobar.data.historical_forecast_ingest import (
@@ -105,8 +106,11 @@ SIGNAL_THRESHOLD: float = get_setting("risk.alpha_threshold", default=0.25)
 logger.info(f"Signal threshold loaded from config: {SIGNAL_THRESHOLD}")
 POSITION_SIZE = 10.0        # contracts per trade (paper)
 METRIC = "high_temp_f"
-# Minimum ensemble std applied when only one GFS run is available.
-# Matches the floor used in the Chicago backtest.
+# LEGACY-ONLY floor, applied when a station has no fitted EMOS params and
+# the session falls back to the snapshot + bias-profile pipeline.  Stations
+# with EMOS params use the calibrated sigma (floored at ~1.3 F inside
+# emos_predict) — the 5.5 F floor was identified as the root cause of the
+# chronic under-confidence in the 2026-06-11 research report.
 _MIN_ENSEMBLE_STD_F = 5.5
 
 # Thread lock for CSV writes — multiple cities run concurrently.
@@ -159,22 +163,48 @@ _OPEN_METEO_MODELS: dict[str, str] = {
 _EXTRA_MODELS = ("ECMWF", "ICON", "GEM")
 
 
-def _fetch_live_forecasts_t24(city_profile: CityProfile, run_date: date) -> list[ForecastPoint]:
+def _fetch_live_forecasts_t24(
+    city_profile: CityProfile,
+    run_date: date,
+    daily_max: bool = False,
+) -> list[ForecastPoint]:
     """Fetch all model forecasts for *run_date*, targeting tomorrow's high.
 
-    GFS comes from the GRIB2/AWS path (12z f030, then 00z f042) — the same
-    source the bias profiles were calibrated on.  ECMWF, ICON, and GEM come
-    from a single Open-Meteo call.  If the GRIB path is unavailable (cfgrib
-    missing or AWS down), Open-Meteo GFS fills in.
+    When *daily_max* is True (station has fitted EMOS params), every model
+    comes from one Open-Meteo call requesting the native ``temperature_2m_max``
+    daily variable over the local settlement day — the max-of-trace quantity
+    the EMOS coefficients were trained on.
 
-    Returns all successfully retrieved points so the ensemble builder can
-    weight them.  An empty list means no data was available from any path.
+    Legacy mode (no EMOS params): GFS comes from the GRIB2/AWS 18z-snapshot
+    path (the source the old bias profiles were calibrated on), ECMWF / ICON /
+    GEM from the Open-Meteo 18z hourly value, with Open-Meteo GFS as fill-in.
+
+    Returns all successfully retrieved points.  An empty list means no data
+    was available from any path.
     """
     station_id = city_profile.station_id
     city_lat, city_lon_360 = _STATION_COORDS.get(
         station_id, (41.7868, 272.2478)  # KMDW fallback
     )
+    # Prefer settlement-station coordinates from cities.yaml when present —
+    # _STATION_COORDS may not know newly added stations (e.g. KNYC).
+    if city_profile.nws_lat and city_profile.nws_lon:
+        city_lat = city_profile.nws_lat
+        city_lon_360 = city_profile.nws_lon % 360.0
     tomorrow = run_date + timedelta(days=1)
+
+    if daily_max:
+        points = _fetch_open_meteo_daily_max(
+            city_profile, city_lat, city_lon_360, run_date, tomorrow,
+            ("GFS",) + _EXTRA_MODELS,
+        )
+        if points:
+            logger.info(
+                "[%s] Forecast points (daily max-of-trace): %s",
+                city_profile.city,
+                {f"{p.model_name}({p.source_name})": round(p.forecast_value_f, 1) for p in points},
+            )
+        return points
 
     # ── GFS via GRIB2/AWS ────────────────────────────────────────────────────
     gfs_points = _fetch_grib_gfs_t24(city_profile, city_lat, city_lon_360, run_date, tomorrow)
@@ -362,6 +392,91 @@ def _fetch_open_meteo_models(
     return points
 
 
+def _fetch_open_meteo_daily_max(
+    city_profile: CityProfile,
+    city_lat: float,
+    city_lon_360: float,
+    run_date: date,
+    tomorrow: date,
+    models: tuple[str, ...] = ("GFS",) + _EXTRA_MODELS,
+) -> list[ForecastPoint]:
+    """Fetch native daily-max temperature for several models in one call.
+
+    Requests Open-Meteo's ``temperature_2m_max`` daily variable aggregated in
+    the city's **local timezone** — i.e. the max over the hourly trace of the
+    settlement day, matching how NWS computes the climate-report high and how
+    the EMOS training data was built.  This replaces the 18z snapshot, which
+    sampled hours before the afternoon peak (the Dallas cold-bias bug).
+    """
+    station_id = city_profile.station_id
+    city_lon = city_lon_360 - 360.0 if city_lon_360 > 180.0 else city_lon_360
+
+    om_ids = ",".join(_OPEN_METEO_MODELS[m] for m in models)
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={city_lat}&longitude={city_lon}"
+        "&daily=temperature_2m_max"
+        f"&models={om_ids}"
+        "&temperature_unit=fahrenheit"
+        "&forecast_days=3"
+        f"&timezone={city_profile.timezone.replace('/', '%2F')}"
+    )
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "deep-isobar/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[%s] Open-Meteo daily-max request failed: %s", city_profile.city, exc)
+        return []
+
+    daily: dict = data.get("daily", {})
+    days: list[str] = daily.get("time", [])
+    target_str = tomorrow.strftime("%Y-%m-%d")
+    try:
+        idx = days.index(target_str)
+    except ValueError:
+        logger.warning(
+            "[%s] Open-Meteo daily-max: target day %s not in response",
+            city_profile.city, target_str,
+        )
+        return []
+
+    run_time_utc = datetime(
+        run_date.year, run_date.month, run_date.day, 12, 0, 0, tzinfo=timezone.utc,
+    )
+
+    points: list[ForecastPoint] = []
+    for model in models:
+        # Multi-model responses suffix the key with the model id; a
+        # single-model request returns a plain "temperature_2m_max" key.
+        key = f"temperature_2m_max_{_OPEN_METEO_MODELS[model]}"
+        vals = daily.get(key)
+        if vals is None and len(models) == 1:
+            vals = daily.get("temperature_2m_max")
+        t_f = vals[idx] if vals and idx < len(vals) else None
+        if t_f is None:
+            logger.warning(
+                "[%s] Open-Meteo daily-max: no %s value for %s — skipping model",
+                city_profile.city, model, target_str,
+            )
+            continue
+
+        points.append(ForecastPoint(
+            city=city_profile.city,
+            station_id=station_id,
+            model_name=model,
+            run_time_utc=run_time_utc,
+            target_date=tomorrow,
+            metric=METRIC,
+            forecast_value_f=float(t_f),
+            lead_hours=30,
+            source_name="Open-Meteo-MaxT",
+        ))
+
+    return points
+
+
 # ---------------------------------------------------------------------------
 # CSV helpers
 # ---------------------------------------------------------------------------
@@ -507,9 +622,17 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
 
     result: dict = {"city": city_label, "signals": 0, "error": None}
 
+    # ── EMOS calibrated distribution (research upgrade 2026-06) ────────────
+    # When fitted params exist, the session fetches native daily-max
+    # forecasts and uses the EMOS (mu, sigma) directly; otherwise it falls
+    # back to the legacy snapshot + bias-profile + 5.5 F floor pipeline.
+    emos_params = load_emos_params(city.station_id)
+
     # ── Model forecasts (GFS + ECMWF/ICON/GEM) ─────────────────────────────
     try:
-        forecast_points = _fetch_live_forecasts_t24(city, today)
+        forecast_points = _fetch_live_forecasts_t24(
+            city, today, daily_max=emos_params is not None
+        )
     except (ImportError, RuntimeError, OSError) as exc:
         logger.error("[%s] cfgrib/xarray/eccodes not installed: %s", city_label, exc)
         result["error"] = f"cfgrib not installed: {exc}"
@@ -532,15 +655,34 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
         metric=METRIC,
         ensemble_run_time_utc=forecast_points[0].run_time_utc,
     )
-    effective_std = max(ensemble.adjusted_std_f, _MIN_ENSEMBLE_STD_F)
+
+    if emos_params is not None:
+        # The legacy bias profiles were calibrated on 18z snapshots and do
+        # NOT apply to daily-max inputs — never mix the two pipelines.  If
+        # EMOS cannot produce a distribution, skip the city.
+        try:
+            effective_mean, effective_std = emos_predict(
+                emos_params,
+                {p.model_name: p.forecast_value_f for p in forecast_points},
+            )
+        except ValueError as exc:
+            msg = f"EMOS predict failed ({exc}) — skipping city rather than trading uncalibrated."
+            logger.error("[%s] %s", city_label, msg)
+            result["error"] = msg
+            return result
+        dist_source = "EMOS"
+    else:
+        effective_mean = ensemble.bias_corrected_mean_f
+        effective_std = max(ensemble.adjusted_std_f, _MIN_ENSEMBLE_STD_F)
+        dist_source = "legacy"
 
     logger.info(
-        "[%s] Ensemble: raw_mean=%.1f°F  bias_corrected=%.1f°F  "
-        "adjusted_std=%.1f°F  (effective=%.1f°F)",
+        "[%s] Distribution (%s): raw_mean=%.1f°F  calibrated_mean=%.1f°F  "
+        "sigma=%.2f°F",
         city_label,
+        dist_source,
         ensemble.ensemble_mean_f,
-        ensemble.bias_corrected_mean_f,
-        ensemble.adjusted_std_f,
+        effective_mean,
         effective_std,
     )
 
@@ -601,9 +743,10 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
             color=COLOR_BLUE,
             fields=[
                 {"name": "Target date",        "value": str(tomorrow)},
-                {"name": "GFS raw mean",       "value": f"{ensemble.ensemble_mean_f:.1f}\u00b0F"},
-                {"name": "Bias-corrected mean","value": f"{ensemble.bias_corrected_mean_f:.1f}\u00b0F"},
-                {"name": "Effective std",      "value": f"{effective_std:.1f}\u00b0F"},
+                {"name": "Distribution",       "value": dist_source},
+                {"name": "Raw ensemble mean",  "value": f"{ensemble.ensemble_mean_f:.1f}\u00b0F"},
+                {"name": "Calibrated mean",    "value": f"{effective_mean:.1f}\u00b0F"},
+                {"name": "Sigma",              "value": f"{effective_std:.2f}\u00b0F"},
             ],
         )
 
@@ -652,7 +795,7 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                 strike_type=_c.strike_type,
                 floor_strike=_c.floor_strike,
                 cap_strike=_c.cap_strike,
-                mean_f=ensemble.bias_corrected_mean_f,
+                mean_f=effective_mean,
                 std_f=effective_std,
             )
 
@@ -683,7 +826,7 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
 
             micro_score = compute_microstructure_score(orderbook, now_utc)
             tail_flag = is_tail_threshold(
-                ensemble_mean_f=ensemble.bias_corrected_mean_f,
+                ensemble_mean_f=effective_mean,
                 threshold_f=contract.threshold_f,
                 adjusted_std_f=effective_std,
             )

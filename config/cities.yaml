@@ -8,7 +8,10 @@ cities:
     settlement_source: NWS
     active: true
     kalshi_series: KXHIGHCHI
-    acis_station_id: CLIMDW
+    # ACIS sid (ICAO form). The previous CLIMDW-style ids were NWS CLI product
+    # codes, which ACIS rejects ("no data available") — that silently broke
+    # fetch_settlement_observations for every city (found 2026-06-12).
+    acis_station_id: KMDW
     nws_lat: 41.786
     nws_lon: -87.752
     # --- Calibrated 2026-04-09 from full KMDW historical dataset (all 12 months, 1364 samples) ---
@@ -43,13 +46,18 @@ cities:
     state: NY
     country: US
     timezone: America/New_York
-    station_id: KJFK
+    # Settlement station is Central Park (KNYC / CLINYC), NOT JFK.  The old
+    # KJFK config forecast a coastal sea-breeze microclimate to settle a
+    # vegetated inland park — flagged as a real bug in the 2026-06-11
+    # research report.  Legacy KJFK bias profiles are orphaned by design;
+    # NYC now runs on EMOS params keyed to KNYC.
+    station_id: KNYC
     settlement_source: NWS
     active: true
     kalshi_series: KXHIGHNY
-    acis_station_id: CLINYC
-    nws_lat: 40.6413
-    nws_lon: -73.7781
+    acis_station_id: KNYC
+    nws_lat: 40.7789
+    nws_lon: -73.9692
     # --- Calibrated 2026-03-20 from NYC backtest run (Aug 2023) ---
     # GFS mean warm bias = +0.91°F over 32 dates → mean_bias_correction_f = -0.91
     # Brier-optimal sigma = 2.75°F → variance_multiplier = 2.75 / GFS_RMSE(3.23) = 0.85
@@ -75,7 +83,7 @@ cities:
     settlement_source: NWS
     active: true
     kalshi_series: KXHIGHTDAL
-    acis_station_id: CLIDFW
+    acis_station_id: KDFW
     nws_lat: 32.897
     nws_lon: -97.037
     # --- Calibrated 2026-04-14 from KDFW historical dataset ---
@@ -99,7 +107,7 @@ cities:
     station_id: KPHL
     settlement_source: NWS
     kalshi_series: KXHIGHPHIL
-    acis_station_id: CLIPHL
+    acis_station_id: KPHL
     nws_lat: 39.8719
     nws_lon: -75.2411
     active: true
@@ -121,7 +129,7 @@ cities:
     station_id: KBOS
     settlement_source: NWS
     kalshi_series: KXHIGHTBOS
-    acis_station_id: CLIBOS
+    acis_station_id: KBOS
     nws_lat: 42.3631
     nws_lon: -71.0064
     active: true

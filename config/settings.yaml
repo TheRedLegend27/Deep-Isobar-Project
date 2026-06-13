@@ -49,14 +49,19 @@ anomaly:
   enabled: false
 
 risk:
-  alpha_threshold: 0.38
+  # Lowered 0.38 -> 0.10 with the EMOS calibration upgrade (2026-06-12).
+  # The 0.38 threshold was a symptom of the mis-specified distribution
+  # (5.5F std floor); with calibrated probabilities legitimate edges are
+  # ~3-10 points, and 0.38 would never trade.  0.10 stays comfortably
+  # above the Kalshi taker-fee peak (~1.75% of contract value at P=0.5).
+  alpha_threshold: 0.10
   max_position_per_contract: 100
   max_daily_exposure: 1000
   multi_bracket:
     enabled: true
     max_contracts_per_session: 3      # max number of brackets to enter
     daily_exposure_cap_usd: 50.0      # total $ at risk across all brackets today (static fallback)
-    min_alpha_to_spread: 0.38         # must clear same threshold as primary signal
+    min_alpha_to_spread: 0.10         # must clear same threshold as primary signal
     allocation_method: proportional   # proportional | equal | kelly (only proportional
                                       # implemented now — others are stubs)
     dynamic_sizing:
