@@ -1028,12 +1028,29 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
             open_signals = [signal_lookup[r["contract_ticker"]] for r in open_rows_pre_spread]
 
             if open_signals:
+                # Actual fill prices (BUY at ask / SELL at bid) — kelly sizes
+                # on these, and they convert risk dollars to contract counts.
+                entry_prices = {
+                    r["contract_ticker"]: float(r["entry_price"])
+                    for r in open_rows_pre_spread
+                    if r["entry_price"] != ""
+                }
+                kelly_cfg = dict(multi_bracket_cfg.get("kelly", {}))
+                # Haircut for same-airmass correlation: every active city
+                # trades the same day, so N defaults to the city count.
+                kelly_cfg.setdefault(
+                    "n_correlated_bets",
+                    sum(1 for c in get_city_universe() if c.active),
+                )
+
                 allocations = build_spread(
                     signals=open_signals,
                     daily_exposure_cap_usd=daily_exposure_cap_usd,
                     max_contracts=multi_bracket_cfg.get("max_contracts_per_session", 3),
                     min_alpha=multi_bracket_cfg.get("min_alpha_to_spread", SIGNAL_THRESHOLD),
                     allocation_method=multi_bracket_cfg.get("allocation_method", "proportional"),
+                    entry_prices=entry_prices,
+                    kelly_cfg=kelly_cfg,
                 )
                 log_spread_summary(allocations, logger)
 
@@ -1047,7 +1064,13 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                         ticker = row["contract_ticker"]
                         if ticker in alloc_by_id:
                             alloc = alloc_by_id[ticker]
-                            row["position_size"] = alloc.allocated_usd
+                            # position_size is CONTRACTS (settlement P&L
+                            # multiplies price moves by it); fall back to
+                            # risk dollars only when no fill price existed.
+                            row["position_size"] = (
+                                alloc.contracts if alloc.contracts is not None
+                                else alloc.allocated_usd
+                            )
                             row["spread_rank"] = alloc.rank
                             row["spread_total_contracts"] = n_total
                         else:

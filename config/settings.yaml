@@ -70,11 +70,19 @@ risk:
   max_daily_exposure: 1000
   multi_bracket:
     enabled: true
-    max_contracts_per_session: 3      # max number of brackets to enter
-    daily_exposure_cap_usd: 50.0      # total $ at risk across all brackets today (static fallback)
+    max_contracts_per_session: 3      # max number of brackets to enter (per city)
+    daily_exposure_cap_usd: 50.0      # hard cap on risk $ per city (static fallback)
     min_alpha_to_spread: 0.10         # must clear same threshold as primary signal
-    allocation_method: proportional   # proportional | equal | kelly (only proportional
-                                      # implemented now — others are stubs)
+    allocation_method: kelly          # proportional | equal | kelly
+    # Fee-adjusted fractional Kelly (research report 2026-06, Q6).  BUY and
+    # SELL both spread; edges that die to the 0.07*P*(1-P) taker fee size
+    # to zero.  Per-bet fraction is divided by 1+(N-1)*rho for same-day
+    # cross-city airmass correlation (N = active cities unless overridden).
+    kelly:
+      bankroll_usd: 1000.0            # paper bankroll Kelly fractions apply to
+      fraction: 0.25                  # fractional Kelly (raw Kelly overbets)
+      avg_pairwise_correlation: 0.6   # same-day city outcome correlation
+      # n_correlated_bets: 5          # default: number of active cities
     dynamic_sizing:
       enabled: true
       base_exposure_usd: 50.0        # replaces the static daily_exposure_cap_usd

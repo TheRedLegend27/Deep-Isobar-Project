@@ -1,182 +1,151 @@
 # Deep Isobar
 
-## Quick Start
+Autonomous weather-intelligence and prediction-market trading system.
 
-**Prerequisites:** Python 3.11+, Node 18+, ecCodes / cfgrib (for GRIB2 parsing)
+Deep Isobar identifies **mispriced daily-high-temperature contracts** by building a
+calibrated probabilistic forecast for each settlement station and comparing it
+against market-implied probabilities, executing (paper) trades when the edge
+clears risk thresholds.
 
-```bash
-# Install Python deps
-pip install -r requirements.txt
-
-# Install dashboard deps
-cd dashboard_ui && npm install && cd ..
-
-# Copy and fill in credentials
-cp .env.example .env
-```
-
-Start everything with one command:
-
-```bash
-make up
-```
-
-| Service | URL |
-|---|---|
-| API health | http://localhost:8765/api/health |
-| Dashboard | http://localhost:5173 |
-
-**On LAN / phone:** replace `localhost` with your machine's local IP (e.g. `192.168.1.x`).
-
-**Windows (no Make):** double-click `start_all.bat` — opens both servers in separate windows.
-
-### Daily commands
-
-```bash
-make dry      # dry-run: score today's markets, print signals, place nothing
-make trade    # live paper-trade session (writes to data/paper_trades/)
-make settle   # settle yesterday's contracts against NOAA observed temps
-```
-
-### Other useful targets
-
-```bash
-make replay          # re-run KMDW historical calibration (2021-2024)
-make onboard-dallas  # onboard KDFW (Dallas) as a new city
-make audit           # print parquet row counts + April bias values
-make logs            # tail the most recent log file in data/paper_trades/
-make status          # today's date, last CSV row, last error row, API health
-make down            # kill both dev servers
-```
-
----
-
-Autonomous weather-intelligence and prediction market trading system.
-
-Deep Isobar identifies **mispriced weather contracts** by comparing ensemble weather model probabilities against market-implied probabilities, then executes trades when the edge clears risk thresholds.
-
-**Current MVP:** Chicago daily high temperature (KXHIGHCHI on Kalshi), paper trading only.
-
----
-
-## How It Works
+**Current status:** paper trading five cities on Kalshi (Chicago, New York,
+Dallas, Philadelphia, Boston) with per-station EMOS-calibrated distributions,
+running unattended on a daily schedule.
 
 ```
 alpha = model_probability − market_probability
 ```
 
-When a market prices a contract at 52% but the ensemble assigns 31%, the contract is overpriced — sell it. The edge is only real when it's large enough, consistent enough, and the market is liquid enough to exit. Every layer of the pipeline pressure-tests that claim before a dollar is risked.
+When a market prices a contract at 52% and the calibrated distribution assigns
+31%, the contract is overpriced — sell it. The edge is only real when it's
+large enough, consistent enough, and the market is liquid enough to exit.
+Every layer of the pipeline pressure-tests that claim before a dollar is risked.
 
 ---
 
-## Backtest Results (Chicago KMDW)
+## Quick Start
 
-| Metric | Value |
-|---|---|
-| Holdout win rate | 72.5% |
-| Holdout raw Sharpe | 1.944 |
-| 2024 OOT RMSE | 3.725°F |
-| 2024 OOT transfer score | +0.009 |
-| Look-ahead bias | None |
-| Fill model | BUY at ask / SELL at bid |
-| Fee model | 7% on winning trades only |
+**Prerequisites:** Python 3.11+ (Node 18+ only for the web dashboard;
+ecCodes/cfgrib only for the legacy GRIB2 path — the EMOS pipeline doesn't need it)
+
+```bash
+# Python env (uv)
+uv venv && uv pip install -e .
+#   — or classic pip:  pip install -r requirements.txt
+
+# Credentials (Kalshi key ID + RSA PEM; Discord webhook optional)
+cp .env.example .env
+
+# Fit calibration for all active cities (needs network; ~5 min)
+make train
+
+# Score today's markets without trading anything
+make dry
+```
+
+### Daily commands
+
+```bash
+make dry        # dry-run: score today's markets, print signals, place nothing
+make trade      # live paper-trade session (writes to data/paper_trades/)
+make settle     # settle contracts against NOAA observed temps
+make scorecard  # calibration + P&L scorecard (also runs nightly at 18:45)
+make train      # rebuild EMOS training data + refit all stations
+```
+
+### Other useful targets
+
+```bash
+make mac-install    # register the launchd agent (see Live Paper Trading)
+make mac-status     # agent state + full job schedule + last-run times
+make mac-uninstall  # remove the agent
+make up / make down # web dashboard dev servers (API :8765, UI :5173)
+make logs           # tail the most recent log in data/paper_trades/
+make status         # today's date, last CSV row, API health
+```
+
+**Windows (no Make):** use the `start_*.bat` equivalents.
 
 ---
 
 ## Pipeline
 
 ```
-GFS Forecast Ingestion
+Forecast fetch (Open-Meteo daily MaxT: GFS · ECMWF · ICON · GEM · NBM)
+        +  GEFS-31 / ECMWF-EPS-51 member spread (Open-Meteo Ensemble API)
         ↓
-Temperature Ensemble  ←  Adaptive Bias Calibration (per city, per month)
+EMOS calibrated distribution        μ = a₀ + Σ aᵢ·modelᵢ
+  (per-station, min-CRPS fit)       σ² = c + d·S²   (floor 1.3°F)
         ↓
-KDE Probability Engine
+Probability surface per contract threshold
         ↓
-Market Price Adapter  ←  Kalshi Client
+Market Price Adapter  ←  Kalshi client (RSA-PSS; stub mode without creds)
         ↓
 Alpha Engine  ←  Distribution Tail Alpha
         ↓
-Market Microstructure Scanner
+Microstructure scanner → dedup → multi-bracket spreader → position sizing
         ↓
-Risk Manager
-        ↓
-Trade Execution
+Paper trade log  →  settlement (ACIS)  →  scorecard / dashboard
 ```
+
+Stations without fitted EMOS params fall back to the legacy pipeline
+(18z GFS snapshot + monthly bias profile + 5.5°F std floor). The two paths
+are never mixed for one station.
 
 ---
 
-## Calibration
+## Calibration (EMOS)
 
-GFS runs warm for Chicago in April due to Lake Michigan (still ~42°F, lake breeze suppresses afternoon highs 5–10°F on east-wind days). A static seasonal constant doesn't capture this.
+Each station gets an **EMOS / non-homogeneous Gaussian regression** fit by
+minimum CRPS over a rolling ~90-day window (Gneiting et al. 2005), refit
+every morning at 6:15:
 
-The **Adaptive Calibration Engine** solves this permanently. Every city gets a monthly bias profile derived from a 5-year historical replay of GFS vs. NOAA actuals:
+- **Mean** — linear in five model forecasts of the *daily max over the local
+  settlement day* (max-of-trace, never a fixed-hour snapshot). NBM — NOAA's
+  operationally calibrated blend — is both a member and an external sanity
+  benchmark: the session warns when |μ − NBM| > 4°F.
+- **Variance** — `c + d·S²` where S² is the pooled GEFS/EPS member variance
+  (flow-dependent uncertainty). Historical member spread is not retrievable
+  from free APIs, so the spread history **accumulates forward** one day per
+  run (`data/emos_training/{station}_t1_spread.parquet`); until coverage
+  reaches 60% of the window, the fit uses deterministic-member variance and
+  the params are marked `spread_source: members`.
+- **Floor** — σ ≥ 1.3°F (sensor + integer-settlement discretization), not the
+  legacy 5.5°F floor that caused chronic under-confidence.
 
-```
-data/bias_profiles/
-  KMDW_raw_errors.parquet       # full row-level history
-  KMDW_monthly_profile.parquet  # 12-row table: mean_bias_f, variance_multiplier
-  KDFW_monthly_profile.parquet
-  ...
-```
-
-At runtime, `bias_loader.py` reads the current month's row and applies it to the ensemble. After each settlement, the profile updates incrementally. No manual tuning.
-
-**Current status:** `historical_replay.py` is built and running the KMDW backfill (2021–2024). `bias_loader.py` and the remaining calibration modules are next.
-
----
-
-## Locked Calibration Parameters (KMDW — current)
-
-```yaml
-station_id: KMDW
-mean_bias_correction_f: 3.1493
-variance_multiplier: 0.82
-sep_climate_normal_f: 72.7
-sep_anomaly_trigger_f: 5.0
-sep_heat_bias_adjustment_f: -2.0
-alpha_threshold: 0.38
-lead_decay_halflife_hours: 48.0
-```
+Artifacts: `data/emos_params/{station}_emos.json`,
+`data/emos_training/{station}_t1_training.parquet`.
+Legacy monthly bias profiles (`data/bias_profiles/`) remain only as the
+fallback path and for stations not yet fitted.
 
 ---
 
 ## Key Architectural Decisions
 
-**Station KMDW not KORD** — Kalshi settles Chicago contracts on Midway Airport. GFS reads ~2°F warmer at KORD. All coordinates are KMDW (41.7868°N, 87.7522°W).
+**Settlement stations, not city names** — forecasts target the exact station
+each venue settles on:
 
-**T-type contracts only** — Bracket (B-type) contracts filtered at parse. Only `less` and `greater` directional contracts evaluated.
+| City | Kalshi settles | Notes |
+|---|---|---|
+| Chicago | KMDW (Midway) | Polymarket uses KORD — several °F apart on lake-breeze days |
+| New York | KNYC (Central Park) | *Not* KJFK — the sea-breeze microclimate is different |
+| Dallas | KDFW | Polymarket uses KDAL (~0.5–1°F warmer) |
+| Philadelphia | KPHL | Well-behaved, low mesoscale noise |
+| Boston | KBOS | Sea-breeze driven; highest forecast variance |
 
-**Correct probability formula:**
+**T-type contracts only** — bracket (B-type) contracts filtered at parse.
+
+**Probability with integer settlement:**
 ```
-less:    P(actual < cap)   = norm.cdf(cap − 0.5, mean, std)
-greater: P(actual > floor) = 1 − norm.cdf(floor + 0.5, mean, std)
+less:    P(actual < cap)   = norm.cdf(cap − 0.5, μ, σ)
+greater: P(actual > floor) = 1 − norm.cdf(floor + 0.5, μ, σ)
 ```
 
-**Fill price convention** — BUY at ask, SELL at bid. Mid-price fills overstate edge.
+**Fill price convention** — BUY at ask, SELL at bid; mid-price fills overstate edge.
 
-**Deduplication** — One signal per (threshold, direction, date). Highest alpha wins; others marked `DEDUP_DROP`.
+**Alpha threshold 0.10** — lowered from 0.38 with the EMOS upgrade; calibrated
+edges are ~3–10 points, and 0.10 stays above Kalshi's taker-fee peak (~1.75%).
 
----
-
-## Source Layout
-
-```
-src/
-  deep_isobar/
-    core/           # Types, logging, scheduler
-    data/           # City universe, NOAA ingest, GFS ingest, feature store
-    models/         # Ensemble, KDE, probability engine, forecast error,
-                    # volatility, shift detection, probability surface
-    market/         # Kalshi client, contract generator, market scanner,
-                    # microstructure scanner, market lag detection
-    trading/        # Alpha engine, tail alpha, risk manager, trade execution
-    calibration/    # historical_replay, bias_loader (in progress),
-                    # onboard_city, batch_onboard
-
-docs/modules/       # Per-module design specs (25 modules)
-tests/
-config/
-```
+**Deduplication** — one signal per (threshold, direction, date); highest |alpha| wins.
 
 ---
 
@@ -191,93 +160,106 @@ config/
 | Morning session | 7:00 AM | `research.paper_trade_session` |
 | Intraday lock-in check | 2:00 PM | `research.intraday_check` |
 | Settlement | 6:00 PM | `research.settle_paper_trades` |
-| **Daily scorecard** | 6:45 PM | `research.daily_scorecard` |
+| Daily scorecard | 6:45 PM | `research.daily_scorecard` |
 | Dashboard | 7:15 PM | `research.generate_dashboard` |
 
 **Runtime registration:**
 
-- **Windows** — Task Scheduler at logon: `start_supervisor.bat`
-- **macOS** — launchd agent: `make mac-install` (status: `make mac-status`,
-  remove: `make mac-uninstall`). Runs at login, restarts on crash, catches
-  up jobs missed while the laptop was asleep.
+- **macOS (current runtime)** — launchd agent: `make mac-install`
+  (status: `make mac-status`, remove: `make mac-uninstall`). Runs at login,
+  restarts on crash, catches up jobs missed while the laptop was asleep.
+- **Windows** — Task Scheduler at logon: `start_supervisor.bat`.
 
-> **⚠️ iCloud warning (macOS):** if the project lives under `~/Desktop` or
-> `~/Documents` with iCloud "Desktop & Documents" sync on, iCloud can evict
-> file contents (`dataless`) and set the hidden flag on files — observed
-> 2026-07-02 breaking the venv's `.pth` (Python skips hidden `.pth` files)
-> and capable of evicting `data/` parquets/CSVs out from under the runtime.
-> Prefer a non-synced location (e.g. `~/deep-isobar`); after moving, rerun
-> `make mac-install` to re-render the agent's absolute paths. The agent sets
-> `PYTHONPATH=src` as a guard, but data files have no such fallback.
+> **⚠️ iCloud warning (macOS):** never run this project from an iCloud-synced
+> folder (`~/Desktop`, `~/Documents` with sync on). iCloud evicts file
+> contents and sets hidden flags — observed 2026-07-02 breaking the venv
+> (Python skips hidden `.pth` files) and deleting the working tree out from
+> under the runtime. Use a non-synced path such as `~/deep-isobar`; after
+> moving, rebuild the venv and rerun `make mac-install` (the agent renders
+> absolute paths).
 
-**Day-to-day watch:** the scorecard writes `data/reports/scorecard_YYYY-MM-DD.md`
-and posts a Discord embed. It shows the day's settled trades, rolling 7d/30d
-P&L + win rate + Brier-edge-vs-market (are our probabilities beating the
-market's?), and per-station calibration (CRPS, MAE vs NBM, PIT histogram,
-ensemble-spread coverage toward the 60% variance gate). Run manually any
-time with `make scorecard`.
- 
+**Day-to-day watch:** the scorecard writes
+`data/reports/scorecard_YYYY-MM-DD.md` (and a Discord embed when a webhook is
+configured). It shows the day's settled trades, rolling 7d/30d P&L + win rate
++ **Brier edge vs the market** (were our probabilities closer to reality than
+the market's — the honest edge measure), and per-station calibration: CRPS,
+MAE vs the NBM benchmark, PIT histogram (flat = calibrated), and
+ensemble-spread coverage toward the 60% variance-source gate.
+
 **Data sources:**
 
 | Source | Notes |
 |---|---|
-| GFS | `noaa-gfs-bdp-pds.s3.amazonaws.com`, byte-range GRIB2, disk-cached |
-| Kalshi live prices | RSA-PSS API key; stub mode if credentials missing |
-| NOAA actuals | ACIS API, posts 6–11 PM CDT |
+| Open-Meteo forecast API | Daily MaxT for GFS/ECMWF/ICON/GEM/NBM (EMOS path) |
+| Open-Meteo Ensemble API | GEFS 31-member + ECMWF-EPS 51-member daily MaxT |
+| Open-Meteo Previous Runs | T+1-lead training pairs (~92-day history) |
+| GFS GRIB2 (AWS S3) | Legacy 18z snapshot path only; needs cfgrib |
+| Kalshi API | RSA-PSS key; deterministic stub mode without credentials |
+| NOAA ACIS | Settlement observations, posts evenings local |
+
+---
+
+## Evaluation
+
+Performance claims are tracked, not assumed:
+
+- `research/forecast_evaluation.py` — holdout comparison of EMOS vs the legacy
+  pipeline (CRPS, MAE, modal-bucket probability, PIT).
+- The nightly scorecard tracks the same metrics forward-looking, per station,
+  plus trading results. Early single-city backtest numbers (Chicago 72.5% win
+  rate, Sharpe 1.9) predate EMOS and multi-city correlation and should be
+  treated as historical upper bounds, not expectations.
+
+---
+
+## Source Layout
+
+```
+src/deep_isobar/
+  core/           # Types, logging
+  data/           # City universe, NOAA/ACIS ingest, GFS GRIB ingest,
+                  # ensemble_ingest (GEFS/EPS members + spread history)
+  models/         # Temperature ensemble, KDE, probability engine/surface
+  market/         # Kalshi client, Polymarket client, market/microstructure scanners
+  trading/        # Alpha engine, tail alpha, bracket spreader, risk, execution
+  calibration/    # emos, emos_training, bias_loader (legacy), onboarding, replay
+  research/       # paper_trade_session, settle, intraday_check,
+                  # daily_scorecard, forecast_evaluation, dashboards, backtests
+  monitoring/     # watchdog
+  notifications/  # Discord embeds (no-op without webhook)
+  supervisor.py   # long-running daily-job scheduler with catch-up
+
+deploy/macos/     # launchd plist template (rendered by make mac-install)
+docs/modules/     # per-module design specs
+tests/            # pytest suite
+config/           # settings.yaml (scheduler, risk), cities.yaml (stations)
+```
 
 ---
 
 ## Infrastructure
 
-| Server | Role | Status |
-|---|---|---|
-| Dell PowerEdge R750 | Primary scheduler, ensemble runner | On-premises, not yet networked |
-| Dell PowerEdge R520 #1 | Backtest farm, city onboarding | On-premises, not yet networked |
-| Dell PowerEdge R520 #2 | Market data collector, redundant execution | On-premises, not yet networked |
-
-Currently running on a Win11 PC. Servers will be networked via a Win10 NAT gateway (5 Ethernet ports) → Cisco Catalyst. Replay and batch onboarding should run on the R520s under Linux — the Windows cfgrib file-locking issues do not exist on Linux.
+Current runtime: **MacBook** (launchd agent, left on during the day). The
+Win11 PC and the Dell PowerEdge servers (R750 + 2×R520, not yet networked)
+are future capacity; replay and batch onboarding belong on Linux where the
+cfgrib file-locking issues don't exist.
 
 ---
 
-## Build Phases
+## Roadmap
 
-**Phase 1 — Calibration Engine (in progress)**
-1. Review `KMDW_monthly_profile.parquet` — confirm April `mean_bias_f` is negative
-2. Build `bias_loader.py` — runtime loader with fallback to `cities.yaml`
-3. Wire into `temperature_ensemble.py` replacing hardcoded April block
-4. Build `onboard_city.py` — one-command city pipeline
-5. Build `batch_onboard.py` — parallel onboarding for 40 cities
+**Done (June–July 2026):** EMOS min-CRPS calibration per station ·
+max-of-trace daily-max extraction · Central Park station fix · NBM as member
++ benchmark · GEFS/EPS member spread into the variance (accumulating toward
+the 60% gate) · daily scorecard + evaluation harness · macOS runtime.
 
-**Phase 2 — City Expansion**
-Dallas (KDFW), NYC (KJFK), and up to 40 cities. Each: `python onboard_city.py --city X --station Y --lat Z --lon W --history-years 5`
-
-**Phase 3 — Server Infrastructure**
-Network R750/R520s, move scheduling off Win11 PC, add message queue (Redis or RabbitMQ).
-
-**Phase 4 — Live Execution**
-Remove `RuntimeError` stub, add hard position limits ($50–100/trade), order status polling, gate behind `paper_trade=False`.
-
-**Phase 5 — Future**
-Post-settlement incremental profile updater, ECMWF feed (better than GFS at T+72–120h), Polymarket adapter, ML post-processing after 500+ settled trades.
-
----
-
-## Data Sources
-
-| Source | Use |
-|---|---|
-| NOAA GHCND | Historical observed temperatures for error modeling |
-| GFS (NOAA) | Operational forecast grids, ingested per model run |
-| ERA5 (ECMWF) | Climatology, long-range reanalysis |
-| Kalshi API | Live prices, resolved contract history |
-
-**Note:** `markets?status=settled` retains only ~582 recent contracts. As of April 2026, history cuts off around late December 2025. All 2023–2024 Kalshi data has aged out of the API; only the previously-pulled 2023 parquet survives.
-
----
-
-## Development Rules
-
-- One module at a time
-- Every module ships with tests and logging
-- Validate inputs at module boundaries
-- Never request the full application in one step
+**Next:**
+1. **Sizing** — fractional Kelly (~0.25) with correlation-aware exposure
+   across same-day cities; SELL-side spreading in `bracket_spreader.py`
+   (currently BUY-only; `kelly`/`equal` allocation are stubs).
+2. **Fees** — model Kalshi taker curve and Polymarket's 2026 weather taker
+   fee explicitly (replace the flat settlement haircut).
+3. **Intraday** — event-driven repricing (model cycles + 5-min ASOS lock-in)
+   with maker execution, once calibration has a forward track record.
+4. **Live execution** — remove the `submit_live_trade` stub, hard position
+   limits, order status polling, gated behind `paper_trade: false`.

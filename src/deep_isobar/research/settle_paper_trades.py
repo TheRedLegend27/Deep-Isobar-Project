@@ -12,17 +12,21 @@ Pipeline
 2. Find OPEN rows whose ``date`` matches the settle date (default: today).
 3. Group OPEN rows by city; for each city fetch the actual high_temp_f from
    NOAA/ACIS using the city's ``acis_station_id`` (from ``config/cities.yaml``).
-4. For each open trade determine WIN or LOSS:
+4. For each open trade determine the YES outcome by strike type
+   (``less``: actual < cap; ``greater``: actual > floor; ``between``:
+   floor <= actual < cap), then WIN/LOSS by direction: BUY wins when YES
+   settled 1, SELL (short YES) wins when YES settled 0.
 
-   - **BUY** (long YES):  WIN if ``actual_high >= threshold_f``
-   - **SELL** (short YES): WIN if ``actual_high < threshold_f``
+5. Compute realized P&L, charging Kalshi's actual taker fee
+   ``0.07 × entry × (1 − entry)`` per contract at entry — on every trade,
+   win or lose (paper fills cross the spread, so they are taker fills):
 
-5. Compute realized P&L, applying the 7% Kalshi fee to winning trades:
+   - BUY:  ``(outcome − entry) × qty − fee(entry) × qty``
+   - SELL: ``(entry − outcome) × qty − fee(entry) × qty``
 
-   - BUY WIN:  ``(1 - entry_price) × qty × 0.93``
-   - BUY LOSS: ``-entry_price × qty``
-   - SELL WIN: ``entry_price × qty × 0.93``
-   - SELL LOSS: ``-(1 - entry_price) × qty``
+   (Until 2026-07-02 this was a flat 7% haircut on winning trades only —
+   changed before any real trades settled, so the track record is
+   consistent under the new model.)
 
 6. Write ``status``, ``realized_pnl``, and ``settled_temp`` back to the CSV.
 7. Print a running P&L summary to stdout.
@@ -70,7 +74,11 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _PAPER_TRADES_CSV = _PROJECT_ROOT / "data" / "paper_trades" / "paper_trades.csv"
 
-KALSHI_FEE_RATE = 0.07   # 7% fee deducted from gross profit on winning trades
+# Kalshi taker-fee coefficient: fee = 0.07 × entry × (1 − entry) per
+# contract, charged at entry on every taker fill (win or lose).  Peaks at
+# 1.75 cents at entry=0.50.  Replaced the flat 7%-of-winnings model on
+# 2026-07-02, before any real trades settled.
+KALSHI_FEE_RATE = 0.07
 _DEFAULT_POSITION_SIZE = 10.0
 # Fallback city when the 'city' column is absent or empty (legacy rows written
 # before the multi-city refactor — all of which are Chicago trades).
@@ -130,20 +138,22 @@ def _compute_pnl(
     position_size: float,
     fee_rate: float = KALSHI_FEE_RATE,
 ) -> float:
-    """Compute net realized P&L for one paper trade after Kalshi fee.
+    """Compute net realized P&L for one paper trade after the Kalshi taker fee.
 
     Settlement convention (Kalshi YES binary):
     - ``realized_outcome = 1``  → YES settled (high >= threshold)
     - ``realized_outcome = 0``  → NO settled  (high <  threshold)
 
-    Kalshi fee applies only to winning trades (gross P&L > 0).
+    The taker fee ``fee_rate × entry × (1 − entry)`` per contract is
+    charged on every trade (paper fills cross the spread), matching the
+    published Kalshi schedule — not just on winners.
 
     Args:
         direction: ``"BUY"`` (long YES) or ``"SELL"`` (short YES).
         entry_price: Price paid / received per contract, in [0, 1].
         realized_outcome: 1 if YES settled, 0 if NO settled.
         position_size: Number of contracts.
-        fee_rate: Kalshi fee on winning trades (default 0.07).
+        fee_rate: Kalshi taker-fee coefficient (default 0.07).
 
     Returns:
         Net realized P&L in probability-point × contracts units.
@@ -155,10 +165,8 @@ def _compute_pnl(
     else:
         return 0.0
 
-    gross_pnl = pnl_per_unit * position_size
-    if gross_pnl > 0:
-        return gross_pnl * (1.0 - fee_rate)
-    return gross_pnl
+    fee_per_contract = fee_rate * entry_price * (1.0 - entry_price)
+    return (pnl_per_unit - fee_per_contract) * position_size
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +273,16 @@ def _settle_open_trades(
                     row.get("contract_ticker"), floor_strike,
                 )
             realized_outcome = 1 if settled_temp > floor_strike else 0
+        elif strike_type == "between":
+            # Matches probability_for_contract: YES iff floor <= actual < cap.
+            if floor_strike is None or cap_strike is None:
+                logger.warning(
+                    "settle: between contract %r missing floor/cap strike "
+                    "(%r/%r) — skipping.",
+                    row.get("contract_ticker"), floor_strike, cap_strike,
+                )
+                continue
+            realized_outcome = 1 if floor_strike <= settled_temp < cap_strike else 0
         else:
             logger.warning(
                 "settle: unexpected strike_type %r for %r — skipping.",
@@ -319,7 +337,7 @@ def _print_pnl_summary(df: pd.DataFrame) -> None:
     print(f"  Win rate       : {win_rate * 100:.1f}%")
     print(
         f"  Running P&L    : {running_pnl:+.4f}"
-        f"  (prob-pts × contracts, after {KALSHI_FEE_RATE:.0%} fee)"
+        f"  (prob-pts × contracts, after {KALSHI_FEE_RATE:.2f}·P·(1−P) taker fee)"
     )
 
     if "date" in settled.columns:
