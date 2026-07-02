@@ -10,3 +10,4 @@ loguru
 python-dateutil
 cryptography
 python-dotenv
+anthropic

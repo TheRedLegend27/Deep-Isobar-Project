@@ -182,13 +182,40 @@ config/
 
 ## Live Paper Trading
 
-**Schedule (Windows Task Scheduler, SYSTEM account):**
+**Daily schedule** (run by `deep_isobar.supervisor`, configured in
+`config/settings.yaml` → `scheduler.jobs`, local machine time):
 
-| Task | Time | Script |
+| Task | Time | Module |
 |---|---|---|
-| Morning session | 7:00 AM CDT | `paper_trade_session.py` |
-| Settlement | 6:00 PM CDT | `settle_paper_trades.py` |
-| Dashboard | 7:15 PM CDT | `generate_dashboard.py` |
+| EMOS refit + spread recording | 6:15 AM | `calibration.emos_training` |
+| Morning session | 7:00 AM | `research.paper_trade_session` |
+| Intraday lock-in check | 2:00 PM | `research.intraday_check` |
+| Settlement | 6:00 PM | `research.settle_paper_trades` |
+| **Daily scorecard** | 6:45 PM | `research.daily_scorecard` |
+| Dashboard | 7:15 PM | `research.generate_dashboard` |
+
+**Runtime registration:**
+
+- **Windows** — Task Scheduler at logon: `start_supervisor.bat`
+- **macOS** — launchd agent: `make mac-install` (status: `make mac-status`,
+  remove: `make mac-uninstall`). Runs at login, restarts on crash, catches
+  up jobs missed while the laptop was asleep.
+
+> **⚠️ iCloud warning (macOS):** if the project lives under `~/Desktop` or
+> `~/Documents` with iCloud "Desktop & Documents" sync on, iCloud can evict
+> file contents (`dataless`) and set the hidden flag on files — observed
+> 2026-07-02 breaking the venv's `.pth` (Python skips hidden `.pth` files)
+> and capable of evicting `data/` parquets/CSVs out from under the runtime.
+> Prefer a non-synced location (e.g. `~/deep-isobar`); after moving, rerun
+> `make mac-install` to re-render the agent's absolute paths. The agent sets
+> `PYTHONPATH=src` as a guard, but data files have no such fallback.
+
+**Day-to-day watch:** the scorecard writes `data/reports/scorecard_YYYY-MM-DD.md`
+and posts a Discord embed. It shows the day's settled trades, rolling 7d/30d
+P&L + win rate + Brier-edge-vs-market (are our probabilities beating the
+market's?), and per-station calibration (CRPS, MAE vs NBM, PIT histogram,
+ensemble-spread coverage toward the 60% variance gate). Run manually any
+time with `make scorecard`.
  
 **Data sources:**
 

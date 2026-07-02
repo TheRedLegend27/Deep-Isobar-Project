@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Deep Isobar supervisor — macOS launchd agent (Mac equivalent of the
+  Windows Task Scheduler registration in start_supervisor.bat).
+
+  Do not edit the installed copy by hand: `make mac-install` renders this
+  template with the project's absolute paths and (re)loads the agent.
+  The supervisor itself schedules the daily jobs from config/settings.yaml
+  and catches up on runs missed while the laptop was asleep.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.deepisobar.supervisor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>-m</string>
+        <string>deep_isobar.supervisor</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <!-- Belt-and-braces: iCloud sync can set the macOS hidden flag on the
+         venv's editable-install .pth (Python silently skips hidden .pth
+         files), which would break `-m deep_isobar.*` imports.  PYTHONPATH
+         keeps the runtime importable regardless. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__PROJECT_DIR__/src</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart the supervisor if it ever exits; it is designed to run
+         forever and persists job state across restarts. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/data/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/data/logs/launchd.err.log</string>
+
+    <!-- Don't hammer restarts if the venv is broken. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>
