@@ -115,6 +115,91 @@ def test_fit_beats_naive_ensemble_crps():
     assert params.train_crps < naive
 
 
+# ── ensemble spread source ───────────────────────────────────────────────────
+
+
+def test_fit_with_ensemble_spread_marks_source_and_climatology():
+    members, actuals = _synthetic_data()
+    ens_var = np.full(len(actuals), 4.0)
+    params = fit_emos(
+        members, actuals, MODELS, station_id="TEST", ensemble_spread_var=ens_var
+    )
+    assert params.spread_source == "ensemble"
+    assert params.climatological_spread_var == pytest.approx(4.0, abs=1e-3)
+
+
+def test_fit_without_ensemble_spread_is_members_source():
+    members, actuals = _synthetic_data()
+    params = fit_emos(members, actuals, MODELS, station_id="TEST")
+    assert params.spread_source == "members"
+    member_var = members.var(axis=1, ddof=1).mean()
+    assert params.climatological_spread_var == pytest.approx(member_var, abs=1e-2)
+
+
+def test_fit_ensemble_spread_nan_falls_back_to_member_variance():
+    members, actuals = _synthetic_data(n=60)
+    ens_var = np.full(len(actuals), 4.0)
+    ens_var[::2] = np.nan  # half the days missing — must not raise
+    params = fit_emos(
+        members, actuals, MODELS, station_id="TEST", ensemble_spread_var=ens_var
+    )
+    assert params.spread_source == "ensemble"
+
+
+def test_fit_ensemble_spread_shape_validation():
+    members, actuals = _synthetic_data(n=40)
+    with pytest.raises(ValueError, match="ensemble_spread_var"):
+        fit_emos(members, actuals, MODELS, ensemble_spread_var=np.zeros(39))
+
+
+def _ensemble_params() -> EMOSParams:
+    return EMOSParams(
+        station_id="TEST", model_names=MODELS,
+        a0=-2.0, a=[0.25, 0.25, 0.25, 0.25], c=1.0, d=0.5,
+        spread_source="ensemble", climatological_spread_var=3.0,
+    )
+
+
+def test_predict_uses_live_ensemble_spread():
+    p = _ensemble_params()
+    mu, sigma = emos_predict(p, {m: 80.0 for m in MODELS}, ensemble_spread_var=6.0)
+    assert sigma == pytest.approx(math.sqrt(1.0 + 0.5 * 6.0))
+
+
+def test_predict_falls_back_to_climatological_spread():
+    p = _ensemble_params()
+    # No live spread → climatological 3.0, NOT the (zero) member variance.
+    mu, sigma = emos_predict(p, {m: 80.0 for m in MODELS})
+    assert sigma == pytest.approx(math.sqrt(1.0 + 0.5 * 3.0))
+
+
+def test_predict_members_source_ignores_ensemble_spread():
+    p = _fixed_params()  # spread_source defaults to "members"
+    vals = {"GFS": 80.0, "ECMWF": 82.0, "ICON": 78.0, "GEM": 80.0}
+    mu, sigma = emos_predict(p, vals, ensemble_spread_var=100.0)
+    spread_var = np.var([80.0, 82.0, 78.0, 80.0], ddof=1)
+    assert sigma == pytest.approx(math.sqrt(1.0 + 0.5 * spread_var))
+
+
+def test_params_backward_compat_pre_ensemble_json(tmp_path):
+    """Params files written before the 2026-07 upgrade lack the new fields."""
+    import json as _json
+
+    old = {
+        "station_id": "KOLD", "model_names": MODELS,
+        "a0": -1.0, "a": [0.25, 0.25, 0.25, 0.25], "c": 1.0, "d": 0.5,
+        "sigma_floor_f": 1.3, "n_train": 60, "train_start": "", "train_end": "",
+        "train_crps": 1.1, "fitted_at_utc": "", "metric": "high_temp_f",
+    }
+    (tmp_path / "KOLD_emos.json").write_text(_json.dumps(old), encoding="utf-8")
+    loaded = load_params("KOLD", params_dir=tmp_path)
+    assert loaded is not None
+    assert loaded.spread_source == "members"
+    vals = {"GFS": 72.0, "ECMWF": 78.0, "ICON": 72.0, "GEM": 78.0}  # var = 12
+    mu, sigma = emos_predict(loaded, vals)
+    assert sigma == pytest.approx(math.sqrt(1.0 + 0.5 * 12.0))
+
+
 # ── emos_predict ─────────────────────────────────────────────────────────────
 
 

@@ -41,6 +41,12 @@ import pandas as pd
 from deep_isobar.calibration.emos import EMOSParams, fit_emos, save_params
 from deep_isobar.core.types import CityProfile
 from deep_isobar.data.city_universe import get_city_universe
+from deep_isobar.data.ensemble_ingest import (
+    fetch_member_daily_maxes,
+    load_t1_spread_history,
+    pooled_member_variance,
+    record_t1_spread,
+)
 from deep_isobar.data.historical_noaa_ingest import fetch_settlement_observations
 
 logger = logging.getLogger(__name__)
@@ -52,17 +58,25 @@ _PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 _HTTP_TIMEOUT_S = 60
 
 # Member set: must match the live session's Open-Meteo model codes so the
-# fitted coefficients apply to live forecasts of the same quantity.
+# fitted coefficients apply to live forecasts of the same quantity.  NBM is
+# NOAA's operationally calibrated blend (research report 2026-06, Q2) — it
+# enters the mean regression like any other member; its ensemble means are
+# deliberately NOT added as further predictors (collinear with GFS/ECMWF).
 EMOS_MODELS: dict[str, str] = {
     "GFS":   "gfs_seamless",
     "ECMWF": "ecmwf_ifs025",
     "ICON":  "icon_seamless",
     "GEM":   "gem_seamless",
+    "NBM":   "ncep_nbm_conus",
 }
 
 # Open-Meteo Previous Runs API serves at most ~92 days of history.
 MAX_PAST_DAYS = 92
 DEFAULT_WINDOW_DAYS = 90
+
+# Fraction of window days that must have recorded ensemble spread before the
+# variance model trains on it (spread history accumulates one day per run).
+MIN_SPREAD_COVERAGE = 0.6
 
 
 def fetch_t1_member_maxes(
@@ -118,6 +132,13 @@ def fetch_t1_member_maxes(
 
     daily = frame.groupby("local_day").max(numeric_only=True)
     daily.index.name = "date"
+    for model in EMOS_MODELS:
+        if model in daily.columns and daily[model].isna().all():
+            logger.warning(
+                "previous-runs: model %s returned no data — its column is "
+                "all-NaN and those training rows will be dropped at fit time",
+                model,
+            )
     # Drop today's partial day — the trace is incomplete until local midnight.
     return daily[daily.index < date.today()]
 
@@ -152,6 +173,21 @@ def build_training_data(
         city.city, len(forecasts), forecasts.index.min(), forecasts.index.max(),
     )
 
+    # Record tomorrow's live T+1 pooled GEFS/EPS member spread — historical
+    # member spread is not retrievable (see ensemble_ingest docstring), so
+    # the history accumulates one day per run.  Best-effort: a failed fetch
+    # never blocks the training build.
+    try:
+        members_by_model = fetch_member_daily_maxes(
+            city.nws_lat, city.nws_lon, city.timezone,
+            date.today() + timedelta(days=1),
+        )
+        live_var = pooled_member_variance(members_by_model)
+        if live_var is not None:
+            record_t1_spread(city.station_id, date.today() + timedelta(days=1), live_var)
+    except Exception:  # noqa: BLE001
+        logger.exception("[%s] live ensemble spread fetch failed — not recorded", city.city)
+
     obs = fetch_settlement_observations(
         city.city,
         start_date=forecasts.index.min(),
@@ -179,6 +215,20 @@ def build_training_data(
                 "[%s] could not read existing training parquet — rebuilding fresh",
                 city.city,
             )
+    # The spread-history parquet is the single source of truth for
+    # ens_spread_var — re-join it fully each run rather than merging stale
+    # column values through the dedup above.
+    spread_hist = load_t1_spread_history(city.station_id)
+    merged = merged.drop(columns=["ens_spread_var"], errors="ignore")
+    if not spread_hist.empty:
+        merged = merged.merge(spread_hist, on="date", how="left")
+    else:
+        merged["ens_spread_var"] = np.nan
+    logger.info(
+        "[%s] ensemble T+1 spread coverage: %d/%d training days",
+        city.city, int(merged["ens_spread_var"].notna().sum()), len(merged),
+    )
+
     merged = merged.sort_values("date").reset_index(drop=True)
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,9 +261,34 @@ def fit_station(
     cutoff = date.today() - timedelta(days=window_days)
     window = df[df["date"] >= cutoff].sort_values("date")
 
-    model_names = list(EMOS_MODELS.keys())
+    # Tolerate parquets built before a model was added (e.g. pre-NBM): fit
+    # on the columns that exist — params.model_names records what was used.
+    model_names = [m for m in EMOS_MODELS if m in window.columns]
+    missing = [m for m in EMOS_MODELS if m not in window.columns]
+    if missing:
+        logger.warning(
+            "[%s] training parquet lacks %s — fitting on %s only; re-run the "
+            "fetch to add the missing member(s)",
+            city.city, missing, model_names,
+        )
     members = window[model_names].to_numpy(dtype=float)
     actuals = window["actual_f"].to_numpy(dtype=float)
+
+    # Train the variance on ensemble spread only once coverage clears
+    # MIN_SPREAD_COVERAGE — a `d` fit mostly on the member-variance fallback
+    # would be scaled to the wrong predictor.  Below the gate the params
+    # stay "members"-source and live prediction matches automatically.
+    ens_spread_var = None
+    if "ens_spread_var" in window.columns and len(window):
+        coverage = float(window["ens_spread_var"].notna().mean())
+        if coverage >= MIN_SPREAD_COVERAGE:
+            ens_spread_var = window["ens_spread_var"].to_numpy(dtype=float)
+        else:
+            logger.info(
+                "[%s] ensemble spread coverage %.0f%% < %.0f%% — fitting on "
+                "member variance until history accumulates",
+                city.city, coverage * 100, MIN_SPREAD_COVERAGE * 100,
+            )
 
     params = fit_emos(
         members,
@@ -221,6 +296,7 @@ def fit_station(
         model_names,
         station_id=city.station_id,
         train_dates=(window["date"].min(), window["date"].max()),
+        ensemble_spread_var=ens_spread_var,
     )
     save_params(params, params_dir=params_dir)
     return params

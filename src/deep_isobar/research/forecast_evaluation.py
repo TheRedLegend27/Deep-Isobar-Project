@@ -31,7 +31,11 @@ from scipy.stats import norm
 
 from deep_isobar.calibration import bias_loader
 from deep_isobar.calibration.emos import crps_gaussian, fit_emos
-from deep_isobar.calibration.emos_training import EMOS_MODELS, _training_path
+from deep_isobar.calibration.emos_training import (
+    EMOS_MODELS,
+    MIN_SPREAD_COVERAGE,
+    _training_path,
+)
 from deep_isobar.core.types import CityProfile
 from deep_isobar.data.city_universe import get_city_universe
 
@@ -130,10 +134,16 @@ class HoldoutResult:
     legacy_pit: np.ndarray
 
 
+# The legacy pipeline only ever ran these four models — NBM joined with the
+# 2026-07 ensemble upgrade and must stay out of the legacy baseline.
+_LEGACY_MODELS = ["GFS", "ECMWF", "ICON", "GEM"]
+
+
 def _legacy_distribution(
     city: CityProfile,
     members: np.ndarray,
     dates: list[date],
+    model_names: list[str],
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reproduce the legacy live-session distribution from member forecasts.
 
@@ -149,7 +159,7 @@ def _legacy_distribution(
         "ICON": city.model_weight_icon,
         "GEM": city.model_weight_gem,
     }
-    w = np.array([static.get(m) or 1.0 for m in EMOS_MODELS], dtype=float)
+    w = np.array([static.get(m) or 1.0 for m in model_names], dtype=float)
     w = w / w.sum()
 
     mean = members @ w
@@ -175,10 +185,24 @@ def evaluate_station_holdout(
     path = _training_path(city.station_id, training_dir)
     df = pd.read_parquet(path)
     df["date"] = pd.to_datetime(df["date"]).dt.date
-    df = df.sort_values("date").dropna().reset_index(drop=True)
 
-    model_names = list(EMOS_MODELS.keys())
+    # Tolerate parquets built before a model column existed (e.g. pre-NBM);
+    # never dropna() on ens_spread_var — NaN there falls back per-row.
+    model_names = [m for m in EMOS_MODELS if m in df.columns]
+    df = (
+        df.sort_values("date")
+        .dropna(subset=model_names + ["actual_f"])
+        .reset_index(drop=True)
+    )
+
     train, test = df.iloc[:-holdout_days], df.iloc[-holdout_days:]
+
+    # Mirror fit_station's coverage gate: train the variance on ensemble
+    # spread only when enough of the window has recorded it.
+    train_spread = None
+    if "ens_spread_var" in df.columns and len(train):
+        if float(train["ens_spread_var"].notna().mean()) >= MIN_SPREAD_COVERAGE:
+            train_spread = train["ens_spread_var"].to_numpy(float)
 
     params = fit_emos(
         train[model_names].to_numpy(float),
@@ -186,6 +210,7 @@ def evaluate_station_holdout(
         model_names,
         station_id=city.station_id,
         train_dates=(train["date"].min(), train["date"].max()),
+        ensemble_spread_var=train_spread,
     )
 
     m_test = test[model_names].to_numpy(float)
@@ -194,10 +219,18 @@ def evaluate_station_holdout(
 
     a = np.asarray(params.a)
     emos_mu = params.a0 + m_test @ a
-    spread_var = m_test.var(axis=1, ddof=1)
+    member_var = m_test.var(axis=1, ddof=1)
+    if params.spread_source == "ensemble":
+        ens = test["ens_spread_var"].to_numpy(float)
+        spread_var = np.where(np.isnan(ens), member_var, ens)
+    else:
+        spread_var = member_var
     emos_sigma = np.sqrt(np.maximum(params.c + params.d * spread_var, params.sigma_floor_f**2))
 
-    leg_mu, leg_sigma = _legacy_distribution(city, m_test, test_dates)
+    legacy_names = [m for m in _LEGACY_MODELS if m in df.columns]
+    leg_mu, leg_sigma = _legacy_distribution(
+        city, test[legacy_names].to_numpy(float), test_dates, legacy_names
+    )
 
     return HoldoutResult(
         station_id=city.station_id,

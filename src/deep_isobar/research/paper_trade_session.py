@@ -61,6 +61,11 @@ load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY
 from deep_isobar.calibration.emos import emos_predict, load_params as load_emos_params
 from deep_isobar.core.types import CityProfile, ForecastPoint, TradeSignal
 from deep_isobar.data.city_universe import get_city_universe
+from deep_isobar.data.ensemble_ingest import (
+    fetch_member_daily_maxes,
+    pooled_member_variance,
+    record_t1_spread,
+)
 from deep_isobar.data.historical_forecast_ingest import (
     _AWS_BASE,
     _LEAD_FHOUR,
@@ -144,6 +149,10 @@ _CSV_COLUMNS = [
     "sizing_final_usd",
     "sizing_reasoning",
     "city",
+    # 2026-07 ensemble upgrade — appended last so _ensure_csv's prefix
+    # migration upgrades existing files in place.
+    "nbm_max_f",
+    "ens_spread_var",
 ]
 
 
@@ -159,8 +168,15 @@ _OPEN_METEO_MODELS: dict[str, str] = {
     "ECMWF": "ecmwf_ifs025",
     "ICON":  "icon_seamless",
     "GEM":   "gem_seamless",
+    "NBM":   "ncep_nbm_conus",
 }
 _EXTRA_MODELS = ("ECMWF", "ICON", "GEM")
+# EMOS-mode member set — must cover emos_training.EMOS_MODELS.  NBM stays
+# out of the legacy path: the old bias profiles were never calibrated on it.
+_EMOS_SESSION_MODELS = ("GFS",) + _EXTRA_MODELS + ("NBM",)
+# EMOS mu vs NBM MaxT divergence (deg F) that triggers a benchmark warning —
+# NBM is NOAA's calibrated blend, so a big gap usually means we are wrong.
+_NBM_DIVERGENCE_WARN_F = 4.0
 
 
 def _fetch_live_forecasts_t24(
@@ -196,7 +212,7 @@ def _fetch_live_forecasts_t24(
     if daily_max:
         points = _fetch_open_meteo_daily_max(
             city_profile, city_lat, city_lon_360, run_date, tomorrow,
-            ("GFS",) + _EXTRA_MODELS,
+            _EMOS_SESSION_MODELS,
         )
         if points:
             logger.info(
@@ -656,14 +672,49 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
         ensemble_run_time_utc=forecast_points[0].run_time_utc,
     )
 
+    nbm_max_f: float | None = None
+    ens_spread_var: float | None = None
+
     if emos_params is not None:
         # The legacy bias profiles were calibrated on 18z snapshots and do
         # NOT apply to daily-max inputs — never mix the two pipelines.  If
         # EMOS cannot produce a distribution, skip the city.
+
+        # Pooled GEFS/EPS member spread — today's flow-dependent uncertainty.
+        # A failed fetch degrades to the climatological spread inside
+        # emos_predict, never blocks the session.
+        if city.nws_lat and city.nws_lon:
+            try:
+                members_by_model = fetch_member_daily_maxes(
+                    city.nws_lat, city.nws_lon, city.timezone, tomorrow,
+                )
+                ens_spread_var = pooled_member_variance(members_by_model)
+                logger.info(
+                    "[%s] Ensemble members: %s → pooled spread var %s degF^2",
+                    city_label,
+                    {k: len(v) for k, v in members_by_model.items()},
+                    f"{ens_spread_var:.2f}" if ens_spread_var is not None else "n/a",
+                )
+                if ens_spread_var is not None:
+                    # Historical member spread is not retrievable, so every
+                    # session banks today's observation for EMOS training.
+                    try:
+                        record_t1_spread(city.station_id, tomorrow, ens_spread_var)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[%s] could not record T+1 spread history", city_label
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[%s] Ensemble member fetch failed (%s) — EMOS will use "
+                    "climatological spread", city_label, exc,
+                )
+
         try:
             effective_mean, effective_std = emos_predict(
                 emos_params,
                 {p.model_name: p.forecast_value_f for p in forecast_points},
+                ensemble_spread_var=ens_spread_var,
             )
         except ValueError as exc:
             msg = f"EMOS predict failed ({exc}) — skipping city rather than trading uncalibrated."
@@ -671,6 +722,21 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
             result["error"] = msg
             return result
         dist_source = "EMOS"
+
+        # NBM benchmark: NOAA's operationally calibrated blend.  Divergence
+        # beyond _NBM_DIVERGENCE_WARN_F usually means our mean is the wrong
+        # one (research report 2026-06, Q2).
+        nbm_max_f = next(
+            (p.forecast_value_f for p in forecast_points if p.model_name == "NBM"),
+            None,
+        )
+        if nbm_max_f is not None and abs(effective_mean - nbm_max_f) > _NBM_DIVERGENCE_WARN_F:
+            logger.warning(
+                "[%s] EMOS mu %.1f°F diverges from NBM MaxT %.1f°F by %.1f°F "
+                "(> %.1f) — treat today's edge with suspicion",
+                city_label, effective_mean, nbm_max_f,
+                abs(effective_mean - nbm_max_f), _NBM_DIVERGENCE_WARN_F,
+            )
     else:
         effective_mean = ensemble.bias_corrected_mean_f
         effective_std = max(ensemble.adjusted_std_f, _MIN_ENSEMBLE_STD_F)
@@ -886,6 +952,8 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                 "sizing_final_usd": "",
                 "sizing_reasoning": "",
                 "city": city.city,
+                "nbm_max_f": round(nbm_max_f, 2) if nbm_max_f is not None else "",
+                "ens_spread_var": round(ens_spread_var, 4) if ens_spread_var is not None else "",
             }
 
             all_rows.append(row)

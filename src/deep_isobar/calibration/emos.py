@@ -14,6 +14,19 @@ Parameters ``(a0, a, c, d)`` are fit by minimising the mean closed-form
 Gaussian CRPS over a rolling training window.  ``c`` and ``d`` are kept
 non-negative by optimising their square roots.
 
+The variance predictor S^2 comes from one of two sources, recorded in
+``EMOSParams.spread_source``:
+
+    "members"  — variance of the K deterministic member forecasts (legacy)
+    "ensemble" — pooled GEFS/ECMWF-EPS member variance supplied externally
+                 (research report 2026-06, Q2: true member spread is the
+                 flow-dependent uncertainty signal; 4-model spread is not)
+
+The ``d`` coefficient is scaled to whichever source it was fit on, so live
+prediction must feed the same source; ``climatological_spread_var`` (the
+training-window mean S^2) is stored as the fallback when the live ensemble
+fetch fails.
+
 The predictive sigma is floored at ``SIGMA_FLOOR_F`` (default 1.3 deg F),
 the irreducible observation + integer-settlement error — NOT the legacy
 5.5 deg F floor, which forced chronic over-dispersion (see research report
@@ -71,6 +84,12 @@ class EMOSParams:
     train_crps: float = float("nan")
     fitted_at_utc: str = ""
     metric: str = "high_temp_f"
+    # "members" = variance of the K member forecasts (legacy, pre-2026-07
+    # params files lack this field and default here); "ensemble" = pooled
+    # GEFS/EPS member variance supplied by the caller.
+    spread_source: str = "members"
+    # Mean training-window S^2 — live fallback when the ensemble fetch fails.
+    climatological_spread_var: float = 0.0
 
 
 def crps_gaussian(
@@ -120,6 +139,7 @@ def fit_emos(
     station_id: str = "",
     sigma_floor_f: float = SIGMA_FLOOR_F,
     train_dates: tuple[date, date] | None = None,
+    ensemble_spread_var: np.ndarray | None = None,
 ) -> EMOSParams:
     """Fit EMOS parameters by minimum-CRPS over a training window.
 
@@ -131,6 +151,11 @@ def fit_emos(
         station_id: Station the fit belongs to (metadata only).
         sigma_floor_f: Hard floor for predictive sigma.
         train_dates: Optional ``(start, end)`` of the window for metadata.
+        ensemble_spread_var: Optional ``(n_days,)`` pooled GEFS/EPS member
+            variance (deg F^2) as the variance predictor S^2.  NaN entries
+            fall back to that row's member variance.  When provided, the
+            params are marked ``spread_source="ensemble"`` and live
+            prediction must supply the same quantity.
 
     Returns:
         Fitted :class:`EMOSParams`.
@@ -147,6 +172,12 @@ def fit_emos(
         )
     if members.shape[0] != actuals.shape[0]:
         raise ValueError("members and actuals must have the same number of rows")
+    if ensemble_spread_var is not None:
+        ensemble_spread_var = np.asarray(ensemble_spread_var, dtype=float)
+        if ensemble_spread_var.shape != actuals.shape:
+            raise ValueError(
+                "ensemble_spread_var must have the same number of rows as actuals"
+            )
 
     ok = ~(np.isnan(members).any(axis=1) | np.isnan(actuals))
     members, actuals = members[ok], actuals[ok]
@@ -157,7 +188,20 @@ def fit_emos(
         )
 
     k = members.shape[1]
-    spread_var = members.var(axis=1, ddof=1) if k > 1 else np.zeros(n)
+    member_var = members.var(axis=1, ddof=1) if k > 1 else np.zeros(n)
+    if ensemble_spread_var is not None:
+        ext = ensemble_spread_var[ok]
+        n_missing = int(np.isnan(ext).sum())
+        if n_missing:
+            logger.info(
+                "EMOS fit %s: %d/%d days missing ensemble spread — "
+                "filling with member variance", station_id, n_missing, n,
+            )
+        spread_var = np.where(np.isnan(ext), member_var, ext)
+        spread_source = "ensemble"
+    else:
+        spread_var = member_var
+        spread_source = "members"
 
     # ── Initial guess: OLS for the mean, residual variance for c ─────────
     X = np.column_stack([np.ones(n), members])
@@ -202,10 +246,14 @@ def fit_emos(
         train_end=end,
         train_crps=round(train_crps, 4),
         fitted_at_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        spread_source=spread_source,
+        climatological_spread_var=round(float(np.mean(spread_var)), 4),
     )
     logger.info(
-        "EMOS fit %s: n=%d  a0=%.2f  a=%s  c=%.3f  d=%.3f  train CRPS=%.3f degF",
-        station_id, n, a0, [round(v, 3) for v in a], c, d, train_crps,
+        "EMOS fit %s: n=%d  a0=%.2f  a=%s  c=%.3f  d=%.3f  spread=%s  "
+        "train CRPS=%.3f degF",
+        station_id, n, a0, [round(v, 3) for v in a], c, d, spread_source,
+        train_crps,
     )
     return params
 
@@ -213,6 +261,7 @@ def fit_emos(
 def emos_predict(
     params: EMOSParams,
     member_values: dict[str, float],
+    ensemble_spread_var: float | None = None,
 ) -> tuple[float, float]:
     """Compute the calibrated ``(mu, sigma)`` for one forecast day.
 
@@ -224,6 +273,13 @@ def emos_predict(
         params: Fitted EMOS parameters.
         member_values: ``{model_name: daily_max_forecast_f}``; keys matching
             ``params.model_names``.
+        ensemble_spread_var: Pooled GEFS/EPS member variance (deg F^2) for
+            the forecast day.  Required in spirit when
+            ``params.spread_source == "ensemble"``: if absent, the
+            climatological training-window spread is used instead (the ``d``
+            coefficient is scaled to ensemble spread, so member variance
+            would be the wrong quantity).  Ignored for legacy
+            ``"members"``-source params.
 
     Returns:
         ``(mu_f, sigma_f)`` of the calibrated Gaussian predictive
@@ -256,7 +312,25 @@ def emos_predict(
 
     members = np.asarray(values)
     mu = params.a0 + float(np.dot(members, params.a))
-    spread_var = float(members.var(ddof=1)) if len(members) > 1 else 0.0
+
+    if params.spread_source == "ensemble":
+        if ensemble_spread_var is not None and math.isfinite(ensemble_spread_var):
+            spread_var = float(ensemble_spread_var)
+        else:
+            spread_var = float(params.climatological_spread_var)
+            logger.warning(
+                "EMOS predict %s: no live ensemble spread — using "
+                "climatological S^2=%.2f degF^2 (sigma loses today's "
+                "flow-dependence)", params.station_id, spread_var,
+            )
+    else:
+        if ensemble_spread_var is not None:
+            logger.debug(
+                "EMOS predict %s: ensemble spread supplied but params were "
+                "fit on member spread — ignoring", params.station_id,
+            )
+        spread_var = float(members.var(ddof=1)) if len(members) > 1 else 0.0
+
     sigma = math.sqrt(max(params.c + params.d * spread_var, params.sigma_floor_f**2))
     return mu, sigma
 
