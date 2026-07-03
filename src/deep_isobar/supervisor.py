@@ -99,6 +99,33 @@ def _parse_at(at: str) -> tuple[int, int]:
     return int(hh), int(mm)
 
 
+def _interval_job_due(job: dict, state: dict, now: datetime) -> bool:
+    """Whether an ``every_minutes`` job should run at *now*.
+
+    Interval jobs declare ``every_minutes: N`` and an optional local-time
+    ``window: "HH:MM-HH:MM"`` outside which they stay idle (no catch-up —
+    a missed book snapshot is stale, not late).  ``last_run`` holds an ISO
+    timestamp for these jobs rather than a date.
+    """
+    window = job.get("window")
+    if window:
+        start_s, end_s = window.split("-")
+        sh, sm = _parse_at(start_s)
+        eh, em = _parse_at(end_s)
+        t = now.hour * 60 + now.minute
+        if not (sh * 60 + sm <= t <= eh * 60 + em):
+            return False
+
+    last = state["last_run"].get(job["name"])
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except ValueError:
+        return True  # previously a daily-format date — treat as never-run
+    return (now - last_dt).total_seconds() >= float(job["every_minutes"]) * 60.0
+
+
 def _run_job(job: dict) -> bool:
     """Run one job as ``python -m <module>`` and return success.
 
@@ -161,7 +188,9 @@ def _post_heartbeat(jobs: list[dict], state: dict) -> None:
     fields = []
     for job in jobs:
         last = state["last_run"].get(job["name"], "never")
-        if last == today:
+        if "every_minutes" in job:
+            value = f"🔁 every {job['every_minutes']}m (last: {last})"
+        elif last == today:
             value = f"✅ ran (last: {last})"
         else:
             value = f"⏳ scheduled {job['at']} (last: {last})"
@@ -204,6 +233,14 @@ def run_loop() -> None:
 
         # ── Due jobs (includes catch-up for missed times) ─────────────────
         for job in jobs:
+            if "every_minutes" in job:
+                if _interval_job_due(job, state, now):
+                    _run_job(job)
+                    # Timestamp (not date) — interval jobs re-run all day.
+                    state["last_run"][job["name"]] = now.isoformat(timespec="seconds")
+                    _save_state(state)
+                continue
+
             hh, mm = _parse_at(job["at"])
             sched = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if now < sched:
@@ -232,7 +269,10 @@ def print_status() -> None:
     print(f"Supervisor schedule ({len(jobs)} jobs, local machine time):")
     for job in jobs:
         last = state["last_run"].get(job["name"], "never")
-        print(f"  {job['at']}  {job['name']:<22} module={job['module']}  last_run={last}")
+        when = job.get("at") or f"~{job['every_minutes']}m" + (
+            f" ({job['window']})" if job.get("window") else ""
+        )
+        print(f"  {when:<16} {job['name']:<22} module={job['module']}  last_run={last}")
     print(f"State file     : {_STATE_PATH}")
     print(f"Job logs       : {_JOB_LOG_DIR}")
     print(f"Last heartbeat : {state.get('last_heartbeat') or 'never'}")

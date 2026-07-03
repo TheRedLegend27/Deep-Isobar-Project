@@ -231,6 +231,17 @@ def _use_stub_mode() -> bool:
     return bool(get_setting("markets.kalshi.stub_mode", False))
 
 
+def is_live_mode() -> bool:
+    """True when this client would hit the real Kalshi API (not the stub).
+
+    Public check for callers that must never act on stub data — the
+    pre-trade circuit breakers and the orderbook collector.  Mirrors the
+    decision the fetch functions make internally: stub is used when forced
+    via config or when no usable credentials load.
+    """
+    return not _use_stub_mode() and _load_credentials() is not None
+
+
 # ---------------------------------------------------------------------------
 # HTTP client
 # ---------------------------------------------------------------------------

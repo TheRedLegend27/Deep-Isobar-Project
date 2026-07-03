@@ -42,6 +42,19 @@ scheduler:
     - name: generate_dashboard
       module: deep_isobar.research.generate_dashboard
       at: "19:15"
+    # Orderbook history recorder — market depth cannot be fetched
+    # retroactively, so this runs all trading day.  Live mode only (refuses
+    # to record stub books).  ~60 contracts per cycle.
+    - name: orderbook_collector
+      module: deep_isobar.data.orderbook_collector
+      every_minutes: 10
+      window: "06:00-21:00"
+    # Nightly archive of the unreplaceable data/ assets (trades, params,
+    # spread history) — see scripts/backup_data.py.  Retargets to TrueNAS
+    # in Phase 1.
+    - name: nightly_backup
+      module: deep_isobar.ops.backup
+      at: "21:30"
 
 runtime:
   paper_trade: true
@@ -59,7 +72,25 @@ anomaly:
   # NONE multiplier (1.0) instead of penalizing every trade as LOW (0.5).
   enabled: false
 
+backup:
+  # Nightly archive of the unreplaceable data/ assets (21:30 job).
+  dest_dir: ~/DeepIsobarBackups   # keep OUTSIDE the repo and any iCloud path
+  keep: 14                        # rotated archives to retain
+  # rclone_remote: "remote:deep-isobar-backups"   # optional offsite copy
+
 risk:
+  # Pre-trade circuit breakers (trading/preflight.py) — any failure refuses
+  # the city for the day.  Motivated by the 2026-07-02 stub-trade incident.
+  preflight:
+    enabled: true
+    allow_stub_market: false      # true only for offline development
+    bounds_margin_f: 15.0         # mean must be within history min/max ± this
+    max_nbm_divergence_f: 6.0     # hard stop; session warns at 4.0 already
+    max_params_age_days: 3
+    min_sigma_f: 0.5
+    max_sigma_f: 15.0
+    min_contracts: 3
+
   # Lowered 0.38 -> 0.10 with the EMOS calibration upgrade (2026-06-12).
   # The 0.38 threshold was a symptom of the mis-specified distribution
   # (5.5F std floor); with calibrated probabilities legitimate edges are

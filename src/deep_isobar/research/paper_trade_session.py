@@ -85,6 +85,8 @@ from deep_isobar.market.microstructure_scanner import compute_microstructure_sco
 from deep_isobar.models.probability_engine import probability_for_contract
 from deep_isobar.models.temperature_ensemble import build_temperature_ensemble
 from deep_isobar.trading.distribution_tail_alpha import is_tail_threshold
+from deep_isobar.trading.preflight import run_preflight, training_history_bounds
+from deep_isobar.market.kalshi_client import is_live_mode as kalshi_is_live_mode
 from deep_isobar.config import get_setting
 from deep_isobar.notifications.discord_notifier import (
     COLOR_AMBER,
@@ -853,6 +855,34 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
             tomorrow,
             sorted(c.threshold_f for c in tomorrow_contracts),
         )
+
+        # ── Pre-trade circuit breakers ─────────────────────────────────────
+        # Any failure refuses the whole city for the day — a wrong refusal
+        # costs one day's edge; a wrong trade against broken inputs or stub
+        # markets costs real money (see preflight module docstring).
+        hist_lo, hist_hi = training_history_bounds(city.station_id)
+        preflight = run_preflight(
+            city_name=city_label,
+            effective_mean=effective_mean,
+            effective_std=effective_std,
+            dist_source=dist_source,
+            nbm_max_f=nbm_max_f,
+            emos_params=emos_params,
+            n_contracts=len(tomorrow_contracts),
+            market_is_live=kalshi_is_live_mode(),
+            hist_min_f=hist_lo,
+            hist_max_f=hist_hi,
+        )
+        if not preflight.ok:
+            msg = f"Preflight blocked trading: {preflight.summary()}"
+            result["error"] = msg
+            if not dry_run:
+                post_embed(
+                    title=f"🛑 [{city_label}] PREFLIGHT BLOCKED",
+                    description=preflight.summary(),
+                    color=COLOR_RED,
+                )
+            return result
 
         # ── Probability surface ────────────────────────────────────────────
         probability_surface: dict[int, float] = {}
