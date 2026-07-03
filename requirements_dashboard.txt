@@ -2,3 +2,8 @@ fastapi
 uvicorn[standard]
 pandas
 pyarrow
+python-jose[cryptography]
+bcrypt
+python-dotenv
+PyYAML
+openpyxl

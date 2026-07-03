@@ -23,11 +23,14 @@ import bcrypt as _bcrypt_lib
 import pandas as pd
 import yaml
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
+
+from deep_isobar.dashboard.audit import fetch_audit, init_audit_table, record_audit
+from deep_isobar.dashboard.exports import xlsx_response
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -80,6 +83,7 @@ def _init_db() -> None:
     """Create users table and seed admin if none exists."""
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = _get_db()
+    init_audit_table(conn)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id                  TEXT PRIMARY KEY,
@@ -408,17 +412,20 @@ class ChangePasswordBody(BaseModel):
 
 
 @app.post("/api/auth/login")
-def login(body: LoginBody) -> dict:
+def login(body: LoginBody, request: Request) -> dict:
+    client_ip = request.client.host if request.client else ""
     conn = _get_db()
     row = conn.execute(
         "SELECT * FROM users WHERE username = ?", (body.username,)
     ).fetchone()
 
     if row is None or not _verify_password(body.password, row["hashed_password"]):
+        record_audit(conn, body.username, "login.failure", ip=client_ip)
         conn.close()
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     if not row["is_active"]:
+        record_audit(conn, body.username, "login.deactivated", ip=client_ip)
         conn.close()
         raise HTTPException(status_code=403, detail="Account deactivated")
 
@@ -428,6 +435,7 @@ def login(body: LoginBody) -> dict:
         (datetime.now(timezone.utc).isoformat(), body.username),
     )
     conn.commit()
+    record_audit(conn, body.username, "login.success", ip=client_ip)
     conn.close()
 
     must_change = bool(row["must_change_password"])
@@ -530,6 +538,8 @@ def create_user(body: CreateUserBody, admin: dict = Depends(require_admin)) -> d
             ),
         )
         conn.commit()
+        record_audit(conn, admin["username"], "users.create",
+                     detail=f"created {body.username!r} (investor)")
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Username already exists")
@@ -576,6 +586,10 @@ def patch_user(
             f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params
         )
         conn.commit()
+        record_audit(
+            conn, admin["username"], "users.patch",
+            detail=f"{row['username']!r}: {', '.join(u.split(' = ')[0] for u in updates)}",
+        )
 
     row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     conn.close()
@@ -594,6 +608,8 @@ def delete_user(user_id: str, admin: dict = Depends(require_admin)) -> dict:
         raise HTTPException(status_code=403, detail="Cannot delete admin account")
     conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()
+    record_audit(conn, admin["username"], "users.delete",
+                 detail=f"deleted {row['username']!r}")
     conn.close()
     return {"deleted": True}
 
@@ -800,18 +816,34 @@ def get_settings(admin: dict = Depends(require_admin)) -> dict:
 def patch_settings(
     body: PatchSettingsBody, admin: dict = Depends(require_admin)
 ) -> dict:
+    changes: list[str] = []
     if body.alpha_threshold is not None or body.lead_decay_halflife_hours is not None:
         cfg = _load_yaml()
         if "risk" not in cfg:
             cfg["risk"] = {}
         if body.alpha_threshold is not None:
+            changes.append(
+                f"risk.alpha_threshold {cfg['risk'].get('alpha_threshold')} "
+                f"-> {body.alpha_threshold}"
+            )
             cfg["risk"]["alpha_threshold"] = body.alpha_threshold
         if body.lead_decay_halflife_hours is not None:
+            changes.append(
+                f"risk.lead_decay_halflife_hours "
+                f"{cfg['risk'].get('lead_decay_halflife_hours')} "
+                f"-> {body.lead_decay_halflife_hours}"
+            )
             cfg["risk"]["lead_decay_halflife_hours"] = body.lead_decay_halflife_hours
         _save_yaml(cfg)
 
     if body.discord_webhook_url is not None:
+        changes.append("DISCORD_WEBHOOK_URL updated")
         _write_env_key("DISCORD_WEBHOOK_URL", body.discord_webhook_url)
+
+    if changes:
+        conn = _get_db()
+        record_audit(conn, admin["username"], "settings.patch", detail="; ".join(changes))
+        conn.close()
 
     return _build_settings_response()
 
@@ -866,8 +898,9 @@ def trades(
     status: str = Query(default="ALL", description="OPEN|WIN|LOSS|VOID|ALL"),
     limit:  int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
+    format: str = Query(default="json", description="json|xlsx"),
     admin: dict = Depends(require_admin),
-) -> dict[str, Any]:
+):
     valid_statuses = {"OPEN", "WIN", "LOSS", "VOID", "ALL"}
     if status not in valid_statuses:
         raise HTTPException(
@@ -877,7 +910,12 @@ def trades(
     df = _load_trades()
     if status != "ALL":
         df = df[df["status"] == status]
-    df    = df.sort_values("date", ascending=False, kind="stable")
+    df = df.sort_values("date", ascending=False, kind="stable")
+
+    if format == "xlsx":
+        # Full filtered set — a download is a report, not a page.
+        return xlsx_response(df, f"trades_{status.lower()}", sheet_name="trades")
+
     total = len(df)
     page  = df.iloc[offset : offset + limit]
     return {
@@ -891,8 +929,9 @@ def trades(
 @app.get("/api/daily_log")
 def daily_log(
     date_param: str | None = Query(default=None, alias="date"),
+    format: str = Query(default="json", description="json|xlsx"),
     admin: dict = Depends(require_admin),
-) -> dict[str, Any]:
+):
     if date_param is not None:
         try:
             date.fromisoformat(date_param)
@@ -904,11 +943,32 @@ def daily_log(
 
     df   = _load_daily_log()
     rows = df[df["date"].astype(str) == target]
+
+    if format == "xlsx":
+        return xlsx_response(rows, f"daily_log_{target}", sheet_name="daily_log")
+
     return {
         "date":  target,
         "count": len(rows),
         "rows":  [_row_to_dict(row) for _, row in rows.iterrows()],
     }
+
+
+@app.get("/api/audit")
+def audit(
+    limit:  int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+    username: str | None = Query(default=None),
+    format: str = Query(default="json", description="json|xlsx"),
+    admin: dict = Depends(require_admin),
+):
+    """Append-only audit trail (logins, config changes, user/trade edits)."""
+    conn = _get_db()
+    rows = fetch_audit(conn, limit=limit, offset=offset, username=username)
+    conn.close()
+    if format == "xlsx":
+        return xlsx_response(pd.DataFrame(rows), "audit_log", sheet_name="audit")
+    return {"count": len(rows), "rows": rows}
 
 
 @app.get("/api/pnl_curve")
@@ -1049,4 +1109,11 @@ def override_trade(
         df.loc[idx, "realized_pnl"] = 0.0
 
     df.to_csv(_PAPER_TRADES_CSV, index=False)
+    conn = _get_db()
+    record_audit(
+        conn, admin["username"], "trades.patch",
+        detail=f"{contract_ticker}: status -> {body.status}"
+        + (f", settled_temp -> {body.settled_temp}" if body.settled_temp is not None else ""),
+    )
+    conn.close()
     return _row_to_dict(df.loc[idx])
