@@ -33,7 +33,8 @@
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests -q --deselect tests/test_alpha_engine.py::test_build_trade_signal_optional_flags_set 2>$null)",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests -q --deselect tests/test_alpha_engine.py::test_build_trade_signal_optional_flags_set 2>$null | Select-String \"FAILED\" | ForEach-Object { $_.Line } | Select-Object -First 40)",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests -q 2>$null)",
-      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m deep_isobar.research.paper_trade_session --dry-run 2>&1)"
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m deep_isobar.research.paper_trade_session --dry-run 2>&1)",
+      "Workflow(deep-research)"
     ]
   }
 }
