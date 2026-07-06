@@ -158,3 +158,13 @@ def test_interval_handles_legacy_date_format():
     # A daily-format date in state (pre-upgrade) must not crash — treat as due.
     now = datetime(2026, 7, 3, 12, 0)
     assert _interval_job_due(_job(), {"last_run": {"collector": "2026-07-02"}}, now)
+
+
+def test_job_when_handles_both_job_types():
+    """Regression: run_loop's startup log crashed on interval jobs (KeyError
+    'at'), crash-looping the supervisor overnight 2026-07-02."""
+    from deep_isobar.supervisor import _job_when
+
+    assert _job_when({"name": "x", "at": "07:00"}) == "07:00"
+    assert _job_when(_job()) == "every 10m"
+    assert _job_when(_job(window="06:00-21:00")) == "every 10m (06:00-21:00)"

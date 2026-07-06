@@ -34,6 +34,11 @@ scheduler:
     - name: settle_paper_trades
       module: deep_isobar.research.settle_paper_trades
       at: "18:00"
+    # Cross-verify our WIN/LOSS grading against Kalshi's official results —
+    # a mismatch means our contract semantics disagree with the exchange.
+    - name: verify_settlements
+      module: deep_isobar.research.verify_settlements
+      at: "18:30"
     # Calibration + trading scorecard after settlement (markdown report in
     # data/reports/ + Discord embed).
     - name: daily_scorecard

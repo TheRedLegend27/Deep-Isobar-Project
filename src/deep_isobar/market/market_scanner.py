@@ -152,14 +152,20 @@ def evaluate_contract_opportunity(
         timestamp_utc = datetime.now(timezone.utc)
 
     threshold = contract.threshold_f
-    if threshold not in probability_surface:
+    # Prefer contract_id keys: multiple contracts can share a threshold_f
+    # (a "T98" tail listed next to a 98–99 bracket), and a threshold-keyed
+    # surface silently collides — cause of the wrong-sided 2026-07-04 NY
+    # trade.  threshold_f keys remain accepted for older callers.
+    if contract.contract_id in probability_surface:
+        model_probability = probability_surface[contract.contract_id]
+    elif threshold in probability_surface:
+        model_probability = probability_surface[threshold]
+    else:
         raise KeyError(
-            f"threshold_f={threshold} not found in probability_surface for "
-            f"contract={contract.contract_id}. "
-            f"Available thresholds: {sorted(probability_surface)}"
+            f"neither contract_id={contract.contract_id!r} nor "
+            f"threshold_f={threshold} found in probability_surface. "
+            f"Available keys: {sorted(probability_surface, key=str)}"
         )
-
-    model_probability = probability_surface[threshold]
     market_probability = compute_market_probability(orderbook)
 
     logger.debug(

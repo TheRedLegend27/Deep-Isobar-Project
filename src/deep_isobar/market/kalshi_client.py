@@ -857,6 +857,28 @@ def fetch_live_contracts(
         return _stub_fetch_live_contracts(series_ticker)
 
 
+def fetch_market_result(ticker: str) -> str | None:
+    """Return Kalshi's official result for *ticker*: ``"yes"``, ``"no"``,
+    or ``None`` when unsettled / unavailable / stub mode.
+
+    Ground truth for settlement cross-verification — our own grading
+    (strike conventions, settlement windows) must MATCH the exchange, and
+    2026-07-03..05 showed those conventions cannot be assumed.
+    """
+    if _use_stub_mode():
+        return None
+    credentials = _load_credentials()
+    if credentials is None:
+        return None
+    try:
+        data = _kalshi_get(f"/markets/{ticker}", None, credentials)
+        result = str((data.get("market") or {}).get("result") or "").lower()
+        return result if result in ("yes", "no") else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_market_result(%s) failed: %s", ticker, exc)
+        return None
+
+
 def fetch_orderbook_for_contract(
     market_source: str,
     contract_id: str,

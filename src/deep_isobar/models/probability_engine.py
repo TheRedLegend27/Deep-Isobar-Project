@@ -88,8 +88,9 @@ def probability_for_contract(
       → ``P(X < cap) = norm.cdf(cap − 0.5, mean, std)``
     - ``"greater"`` : YES if ``actual > floor_strike``
       → ``P(X > floor) = 1 − norm.cdf(floor + 0.5, mean, std)``
-    - ``"between"`` : YES if ``floor_strike ≤ actual < cap_strike``
-      → ``P(floor ≤ X < cap) = norm.cdf(cap − 0.5) − norm.cdf(floor − 0.5)``
+    - ``"between"`` : YES if ``floor_strike ≤ actual ≤ cap_strike`` (cap
+      INCLUSIVE — Kalshi's B82.5 = "82-83°" pays on 82 and 83)
+      → ``P(floor ≤ X ≤ cap) = norm.cdf(cap + 0.5) − norm.cdf(floor − 0.5)``
 
     Args:
         strike_type: Kalshi settlement type — ``"less"``, ``"greater"``, or
@@ -118,9 +119,9 @@ def probability_for_contract(
         p = probability_for_contract("greater", 67, None, mean_f=65.0, std_f=5.5)
         # → 1 - norm.cdf(67.5, 65.0, 5.5) ≈ 0.325
 
-        # B65 bracket (between, floor=65, cap=70): P(65 ≤ actual < 70)
-        p = probability_for_contract("between", 65, 70, mean_f=67.0, std_f=5.5)
-        # → norm.cdf(69.5, 67.0, 5.5) - norm.cdf(64.5, 67.0, 5.5) ≈ 0.346
+        # B65.5-style bracket (between, floor=65, cap=66): P(65 ≤ actual ≤ 66)
+        p = probability_for_contract("between", 65, 66, mean_f=67.0, std_f=5.5)
+        # → norm.cdf(66.5, 67.0, 5.5) - norm.cdf(64.5, 67.0, 5.5) ≈ 0.14
     """
     if std_f <= 0:
         raise ValueError(f"std_f must be positive, got {std_f}")
@@ -141,9 +142,13 @@ def probability_for_contract(
             raise ValueError("floor_strike is required for strike_type='between'")
         if cap_strike is None:
             raise ValueError("cap_strike is required for strike_type='between'")
-        # P(floor ≤ actual < cap): integer settlement → cdf(cap − 0.5) − cdf(floor − 0.5)
+        # P(floor ≤ actual ≤ cap) — CAP IS INCLUSIVE.  Verified against the
+        # live API 2026-07-05: B82.5 = "82-83°" with floor=82, cap=83, YES
+        # pays on 82 AND 83.  The previous exclusive-cap formula counted
+        # only half of every 2-degree bracket, making all brackets look
+        # overpriced and skewing the whole book toward bracket SELLs.
         prob = float(
-            norm.cdf(cap_strike - 0.5, loc=mean_f, scale=std_f)
+            norm.cdf(cap_strike + 0.5, loc=mean_f, scale=std_f)
             - norm.cdf(floor_strike - 0.5, loc=mean_f, scale=std_f)
         )
     else:

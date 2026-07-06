@@ -885,9 +885,13 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
             return result
 
         # ── Probability surface ────────────────────────────────────────────
-        probability_surface: dict[int, float] = {}
+        # Keyed by contract_id, NOT threshold_f: a "T98" tail and a 98–99
+        # bracket share threshold 98, and threshold keys silently collide
+        # (the wrong-sided 2026-07-04 NY trade: bracket prob overwrote the
+        # tail prob and flipped the signal's side).
+        probability_surface: dict[str, float] = {}
         for _c in tomorrow_contracts:
-            probability_surface[_c.threshold_f] = probability_for_contract(
+            probability_surface[_c.contract_id] = probability_for_contract(
                 strike_type=_c.strike_type,
                 floor_strike=_c.floor_strike,
                 cap_strike=_c.cap_strike,
@@ -907,7 +911,7 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
         logger.info(
             "[%s] Probability surface: %s",
             city_label,
-            {_surface_label(_c): f"{probability_surface[_c.threshold_f]:.3f}"
+            {_surface_label(_c): f"{probability_surface[_c.contract_id]:.3f}"
              for _c in sorted(tomorrow_contracts, key=lambda x: x.threshold_f)},
         )
 
@@ -995,7 +999,15 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
         for row in all_rows:
             if row["status"] != "OPEN":
                 continue
-            key = (row["threshold_f"], row["direction"])
+            # Key on the full strike definition, not threshold alone: a T98
+            # tail and a 98-99 bracket share threshold_f but are DIFFERENT
+            # outcomes — a threshold-only key silently dropped one of them
+            # as a "duplicate" (same family as the probability-surface
+            # collision fixed 2026-07-04).
+            key = (
+                row["strike_type"], row["floor_strike"], row["cap_strike"],
+                row["direction"],
+            )
             existing = best_by_key.get(key)
             if existing is None or abs(row["alpha"]) > abs(existing["alpha"]):
                 if existing is not None:

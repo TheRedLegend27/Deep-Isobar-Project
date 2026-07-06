@@ -211,7 +211,6 @@ def _settle_open_trades(
         (df["date"].astype(str) == str(settle_date))
         & (df["status"] == "OPEN")
         & city_mask
-        & ~df["contract_ticker"].str.contains(r"-B", na=False)
     )
 
     def _parse_optional_int(val) -> int | None:
@@ -237,22 +236,17 @@ def _settle_open_trades(
 
         strike_type = str(row.get("strike_type", "") or "").lower().strip()
         if not strike_type:
-            ticker = str(row.get("contract_ticker", ""))
-            import re as _re
-            m = _re.search(r"-([BT])[\d.]+$", ticker, _re.IGNORECASE)
-            if m and m.group(1).upper() == "T":
-                strike_type = "less"
-                logger.warning(
-                    "settle: missing strike_type for %r — inferred 'less'; "
-                    "verify settlement is correct.",
-                    ticker,
-                )
-            else:
-                logger.warning(
-                    "settle: cannot determine strike_type for %r — skipping.",
-                    row.get("contract_ticker"),
-                )
-                continue
+            # NEVER guess from the ticker: T-tickers are "less" OR "greater"
+            # (live API 2026-07-05: KXHIGHCHI T76 = less, T83 = greater).
+            # The old fallback inferred every T as "less", which would grade
+            # a greater-type contract exactly backwards.  Leave the row OPEN
+            # for manual review instead.
+            logger.error(
+                "settle: missing strike_type for %r — left OPEN for manual "
+                "review (ticker letters do NOT determine direction).",
+                row.get("contract_ticker"),
+            )
+            continue
 
         floor_strike = _parse_optional_int(row.get("floor_strike"))
         cap_strike   = _parse_optional_int(row.get("cap_strike"))
@@ -274,7 +268,9 @@ def _settle_open_trades(
                 )
             realized_outcome = 1 if settled_temp > floor_strike else 0
         elif strike_type == "between":
-            # Matches probability_for_contract: YES iff floor <= actual < cap.
+            # CAP INCLUSIVE — Kalshi's B82.5 = "82-83°" pays on 82 AND 83
+            # (verified against live API titles 2026-07-05).  Matches the
+            # corrected probability_for_contract convention.
             if floor_strike is None or cap_strike is None:
                 logger.warning(
                     "settle: between contract %r missing floor/cap strike "
@@ -282,7 +278,7 @@ def _settle_open_trades(
                     row.get("contract_ticker"), floor_strike, cap_strike,
                 )
                 continue
-            realized_outcome = 1 if floor_strike <= settled_temp < cap_strike else 0
+            realized_outcome = 1 if floor_strike <= settled_temp <= cap_strike else 0
         else:
             logger.warning(
                 "settle: unexpected strike_type %r for %r — skipping.",
@@ -480,21 +476,12 @@ def settle(settle_date: date) -> None:
         dtype={"threshold_f": float, "position_size": float},
     )
 
-    # Warn about B-type contracts (bracket; not yet settleable).
-    b_contracts = df[df["contract_ticker"].str.contains(r"-B", na=False)]
-    if not b_contracts.empty:
-        for _, b_row in b_contracts.iterrows():
-            logger.warning(
-                "settle: skipping bracket contract %r (status=%s) — "
-                "B-type settlement logic is not implemented; mark manually.",
-                b_row["contract_ticker"], b_row["status"],
-            )
-
-    # Determine which cities have OPEN trades on this date.
+    # Determine which cities have OPEN trades on this date.  Bracket
+    # (between) contracts settle like any other row — the old "B-type not
+    # implemented" skip left the entire bracket book permanently OPEN.
     open_today_mask = (
         (df["date"].astype(str) == str(settle_date))
         & (df["status"] == "OPEN")
-        & ~df["contract_ticker"].str.contains(r"-B", na=False)
     )
     open_today = df[open_today_mask]
 
@@ -623,6 +610,37 @@ def settle(settle_date: date) -> None:
     _refresh_emos_calibration()
 
 
+def settle_all_pending(up_to: date | None = None) -> None:
+    """Settle every date that still has OPEN rows, oldest first.
+
+    ACIS publishes a day's official high the NEXT morning, so a row dated D
+    is normally settleable from the morning of D+1 — the old single-date
+    logic asked for *today's* high at 18:00 (never available) and dropped
+    prior dates out of scope forever.  Dates whose observation is still
+    missing are left OPEN and retried on the next run.
+    """
+    if not _PAPER_TRADES_CSV.exists():
+        logger.error("paper_trades.csv not found at %s", _PAPER_TRADES_CSV)
+        sys.exit(1)
+
+    up_to = up_to or date.today()
+    df = pd.read_csv(_PAPER_TRADES_CSV)
+    pending = sorted(
+        {
+            d for d in pd.to_datetime(df.loc[df["status"] == "OPEN", "date"]).dt.date
+            if d <= up_to
+        }
+    )
+    if not pending:
+        logger.info("No OPEN rows dated on/before %s — nothing to settle.", up_to)
+        _refresh_emos_calibration()
+        return
+
+    logger.info("Pending settlement dates: %s", [str(d) for d in pending])
+    for d in pending:
+        settle(d)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -650,6 +668,22 @@ if __name__ == "__main__":
         metavar="YYYY-MM-DD",
         help="Date to settle (default: today).",
     )
+    parser.add_argument(
+        "--pending",
+        action="store_true",
+        default=True,
+        help=(
+            "Settle every date that still has OPEN rows (default).  ACIS "
+            "posts a day's official high the NEXT morning, so the 18:00 run "
+            "mainly clears yesterday; unsettleable dates are retried on the "
+            "next run automatically."
+        ),
+    )
+    parser.add_argument(
+        "--only-date",
+        action="store_true",
+        help="Settle strictly the --date given (legacy single-date behaviour).",
+    )
     args = parser.parse_args()
 
     try:
@@ -661,4 +695,7 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    settle(settle_date)
+    if args.only_date:
+        settle(settle_date)
+    else:
+        settle_all_pending(up_to=settle_date)

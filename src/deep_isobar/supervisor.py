@@ -99,6 +99,19 @@ def _parse_at(at: str) -> tuple[int, int]:
     return int(hh), int(mm)
 
 
+def _job_when(job: dict) -> str:
+    """Human-readable schedule for a job — works for both job types.
+
+    Every display path (startup log, --status, heartbeat) must use this:
+    interval jobs have no ``at`` key, and a bare ``job["at"]`` here is what
+    crash-looped the supervisor overnight on 2026-07-02.
+    """
+    if "every_minutes" in job:
+        window = f" ({job['window']})" if job.get("window") else ""
+        return f"every {job['every_minutes']}m{window}"
+    return str(job.get("at", "?"))
+
+
 def _interval_job_due(job: dict, state: dict, now: datetime) -> bool:
     """Whether an ``every_minutes`` job should run at *now*.
 
@@ -189,11 +202,11 @@ def _post_heartbeat(jobs: list[dict], state: dict) -> None:
     for job in jobs:
         last = state["last_run"].get(job["name"], "never")
         if "every_minutes" in job:
-            value = f"🔁 every {job['every_minutes']}m (last: {last})"
+            value = f"🔁 {_job_when(job)} (last: {last})"
         elif last == today:
             value = f"✅ ran (last: {last})"
         else:
-            value = f"⏳ scheduled {job['at']} (last: {last})"
+            value = f"⏳ scheduled {_job_when(job)} (last: {last})"
         fields.append({"name": job["name"], "value": value})
     post_embed(
         title=f"Deep Isobar supervisor — alive ({today})",
@@ -215,7 +228,7 @@ def run_loop() -> None:
     logger.info(
         "Supervisor started — %d job(s): %s",
         len(jobs),
-        {j["name"]: j["at"] for j in jobs},
+        {j["name"]: _job_when(j) for j in jobs},
     )
 
     while True:
@@ -269,10 +282,7 @@ def print_status() -> None:
     print(f"Supervisor schedule ({len(jobs)} jobs, local machine time):")
     for job in jobs:
         last = state["last_run"].get(job["name"], "never")
-        when = job.get("at") or f"~{job['every_minutes']}m" + (
-            f" ({job['window']})" if job.get("window") else ""
-        )
-        print(f"  {when:<16} {job['name']:<22} module={job['module']}  last_run={last}")
+        print(f"  {_job_when(job):<22} {job['name']:<22} module={job['module']}  last_run={last}")
     print(f"State file     : {_STATE_PATH}")
     print(f"Job logs       : {_JOB_LOG_DIR}")
     print(f"Last heartbeat : {state.get('last_heartbeat') or 'never'}")

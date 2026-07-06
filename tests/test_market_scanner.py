@@ -583,3 +583,42 @@ def test_evaluate_all_enhancement_flags_combined():
     assert signal.rank_score == pytest.approx(0.615, abs=1e-6)
     # Raw alpha unchanged
     assert signal.alpha == pytest.approx(0.29, abs=1e-6)
+
+
+# ── probability-surface keying (2026-07-04 collision bug) ────────────────────
+
+
+def test_same_threshold_contracts_get_distinct_probabilities():
+    """A 'T98' tail and a 98-99 bracket share threshold_f=98.  With
+    contract_id keys each signal must use its own probability — threshold
+    keys silently collided and flipped the NY 2026-07-04 trade's side."""
+    from datetime import datetime, timezone
+
+    from deep_isobar.core.types import MarketContract, OrderBookSnapshot
+    from deep_isobar.market.market_scanner import evaluate_contract_opportunity
+
+    now = datetime(2026, 7, 4, 12, 0, tzinfo=timezone.utc)
+
+    def contract(cid, **kw):
+        return MarketContract(
+            contract_id=cid, market_source="Kalshi", city="New York",
+            target_date=now.date(), metric="high_temp_f", threshold_f=98,
+            comparison_operator="ge", settlement_source="NWS", **kw,
+        )
+
+    tail = contract("KXHIGHNY-26JUL04-T98", strike_type="less", cap_strike=98)
+    bracket = contract("KXHIGHNY-26JUL04-B98.5", strike_type="between",
+                       floor_strike=98, cap_strike=99)
+    surface = {tail.contract_id: 0.915, bracket.contract_id: 0.054}
+    book = OrderBookSnapshot(
+        timestamp_utc=now, contract_id="x", market_source="Kalshi",
+        best_bid=0.63, best_ask=0.65,
+    )
+
+    s_tail = evaluate_contract_opportunity(tail, surface, book, 0.10, now)
+    s_bracket = evaluate_contract_opportunity(bracket, surface, book, 0.10, now)
+
+    assert s_tail.model_probability == 0.915
+    assert s_bracket.model_probability == 0.054
+    # Model 0.915 vs market 0.64 → BUY side, never SELL.
+    assert s_tail.signal_side == "BUY"

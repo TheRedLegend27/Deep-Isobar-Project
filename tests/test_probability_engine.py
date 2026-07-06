@@ -10,6 +10,7 @@ Covers:
 import pytest
 
 from deep_isobar.models.probability_engine import (
+    probability_for_contract,
     probability_ge_normal,
     probability_le_normal,
 )
@@ -146,3 +147,28 @@ def test_ge_symmetry():
     ge = probability_ge_normal(mean_f, std_f, mean_f + d)
     le = probability_le_normal(mean_f, std_f, mean_f - d)
     assert ge == pytest.approx(le, abs=1e-9)
+
+
+# ── between (bracket) contracts — cap INCLUSIVE ──────────────────────────────
+# Kalshi's B82.5 = "82-83°" pays on 82 AND 83 (live API titles, 2026-07-05).
+# The old exclusive-cap formula counted only half of every 2-degree bracket.
+
+
+def test_between_cap_is_inclusive():
+    from scipy.stats import norm
+
+    p = probability_for_contract("between", 82, 83, mean_f=82.5, std_f=2.0)
+    expected = norm.cdf(83.5, 82.5, 2.0) - norm.cdf(81.5, 82.5, 2.0)
+    assert p == pytest.approx(expected)
+    # A centred 2-degree bracket must cover BOTH integers: for mean at the
+    # bracket centre this is ~38%, not the ~19% the half-bracket bug gave.
+    assert p > 0.35
+
+
+def test_between_two_brackets_tile_the_line():
+    """Adjacent brackets (82-83, 84-85) plus tails must sum to ~1."""
+    lo = probability_for_contract("less", None, 82, mean_f=83.5, std_f=1.5)
+    b1 = probability_for_contract("between", 82, 83, mean_f=83.5, std_f=1.5)
+    b2 = probability_for_contract("between", 84, 85, mean_f=83.5, std_f=1.5)
+    hi = probability_for_contract("greater", 85, None, mean_f=83.5, std_f=1.5)
+    assert lo + b1 + b2 + hi == pytest.approx(1.0, abs=1e-9)

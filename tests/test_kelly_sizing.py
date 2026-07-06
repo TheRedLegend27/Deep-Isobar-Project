@@ -220,14 +220,14 @@ def test_settle_between_outcome_convention():
     df, n = _settle_open_trades(df, date(2026, 7, 3), settled_temp=96.0,
                                 city_name="Testville")
     assert n == 2
-    # 96 is inside [95, 97) → YES settled: BUY wins, SELL loses.
+    # 96 is inside 95-97 (cap INCLUSIVE per Kalshi) → YES: BUY wins, SELL loses.
     assert df.loc[df.contract_ticker == "B95.5-in", "status"].iloc[0] == "WIN"
     assert df.loc[df.contract_ticker == "B95.5-sell", "status"].iloc[0] == "LOSS"
 
     df2 = pd.DataFrame([_row("B95.5-out", "SELL")])
-    df2, _ = _settle_open_trades(df2, date(2026, 7, 3), settled_temp=97.0,
+    df2, _ = _settle_open_trades(df2, date(2026, 7, 3), settled_temp=98.0,
                                  city_name="Testville")
-    # 97 is outside [95, 97) → NO settled: the short wins.
+    # 98 is outside 95-97 (cap inclusive) → NO settled: the short wins.
     assert df2["status"].iloc[0] == "WIN"
 
 
