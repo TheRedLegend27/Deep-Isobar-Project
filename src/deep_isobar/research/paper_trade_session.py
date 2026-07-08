@@ -1262,10 +1262,15 @@ def main(dry_run: bool = False) -> None:
     tomorrow = today + timedelta(days=1)
 
     all_profiles = get_city_universe()
-    active_cities = [p for p in all_profiles if p.active]
+    active_cities = [p for p in all_profiles if p.active and p.trade]
+    data_only = [p.city for p in all_profiles if p.active and not p.trade]
+    if data_only:
+        logger.info(
+            "Data-only cities (calibrating, not trading): %s", data_only
+        )
 
     if not active_cities:
-        logger.warning("No active cities found in config/cities.yaml — nothing to do.")
+        logger.warning("No tradable cities found in config/cities.yaml — nothing to do.")
         return
 
     city_names = [c.city for c in active_cities]

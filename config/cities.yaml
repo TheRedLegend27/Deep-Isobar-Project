@@ -144,3 +144,83 @@ cities:
     model_weight_gem: 0.10
     heat_bias_adjustment_f: 0.0
     cold_bias_adjustment_f: 0.0
+
+  # ── Data-only onboarding wave 1 (2026-07-07) ──────────────────────────────
+  # Four climate zones chosen for decorrelation from the NE-heavy book
+  # (desert SW, high plains, subtropical, marine NW).  trade: false →
+  # calibrating + collecting books, NOT trading.  Flip trade: true when
+  # (a) their calibration has matured and (b) the live book has earned
+  # expansion (see docs/ROADMAP.md Phase 4).  Series tickers verified
+  # against the live Kalshi API 2026-07-07.
+
+  - city: Phoenix
+    city_code: PHX
+    state: AZ
+    country: US
+    timezone: America/Phoenix
+    station_id: KPHX
+    settlement_source: NWS
+    active: true
+    trade: false
+    kalshi_series: KXHIGHTPHX
+    acis_station_id: KPHX
+    nws_lat: 33.4278
+    nws_lon: -112.0038
+    variance_multiplier: 1.0
+    mean_bias_correction_f: 0.0
+    kde_bandwidth: 5.5
+    tail_multiplier: 1.0
+
+  - city: Denver
+    city_code: DEN
+    state: CO
+    country: US
+    timezone: America/Denver
+    station_id: KDEN
+    settlement_source: NWS
+    active: true
+    trade: false
+    kalshi_series: KXHIGHDEN
+    acis_station_id: KDEN
+    nws_lat: 39.8467
+    nws_lon: -104.6561
+    variance_multiplier: 1.0
+    mean_bias_correction_f: 0.0
+    kde_bandwidth: 5.5
+    tail_multiplier: 1.0
+
+  - city: Miami
+    city_code: MIA
+    state: FL
+    country: US
+    timezone: America/New_York
+    station_id: KMIA
+    settlement_source: NWS
+    active: true
+    trade: false
+    kalshi_series: KXHIGHMIA
+    acis_station_id: KMIA
+    nws_lat: 25.7906
+    nws_lon: -80.3164
+    variance_multiplier: 1.0
+    mean_bias_correction_f: 0.0
+    kde_bandwidth: 5.5
+    tail_multiplier: 1.0
+
+  - city: Seattle
+    city_code: SEA
+    state: WA
+    country: US
+    timezone: America/Los_Angeles
+    station_id: KSEA
+    settlement_source: NWS
+    active: true
+    trade: false
+    kalshi_series: KXHIGHTSEA
+    acis_station_id: KSEA
+    nws_lat: 47.4444
+    nws_lon: -122.3139
+    variance_multiplier: 1.0
+    mean_bias_correction_f: 0.0
+    kde_bandwidth: 5.5
+    tail_multiplier: 1.0

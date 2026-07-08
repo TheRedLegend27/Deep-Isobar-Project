@@ -74,6 +74,11 @@ class CityProfile:
     lead_decay_halflife_hours: float = 48.0
     # Multi-city fields — populated from cities.yaml; default to safe no-ops.
     active: bool = True
+    # Data-only onboarding: active cities with trade=false get forecasts,
+    # EMOS calibration, orderbook collection, and scorecard rows — but the
+    # trading session never opens positions.  Flip to true once calibration
+    # has matured AND the book's track record justifies expansion.
+    trade: bool = True
     kalshi_series: str = ""
     # ACIS settlement station; may differ from METAR station_id (e.g. Dallas:
     # METAR=KDFW, ACIS/Kalshi settlement=CLIDFW).  Falls back to station_id

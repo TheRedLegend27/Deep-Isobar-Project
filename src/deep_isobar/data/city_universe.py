@@ -173,6 +173,7 @@ def _build_profile(entry: dict[str, Any]) -> CityProfile:
         sep_anomaly_trigger_f=entry.get("sep_anomaly_trigger_f"),
         lead_decay_halflife_hours=float(entry.get("lead_decay_halflife_hours", 48.0)),
         active=bool(entry.get("active", True)),
+        trade=bool(entry.get("trade", True)),
         kalshi_series=str(entry.get("kalshi_series", "")),
         acis_station_id=str(entry.get("acis_station_id", "")),
         nws_lat=float(entry.get("nws_lat", 0.0)),
