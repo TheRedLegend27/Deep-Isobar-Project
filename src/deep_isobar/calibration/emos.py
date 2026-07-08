@@ -90,6 +90,9 @@ class EMOSParams:
     spread_source: str = "members"
     # Mean training-window S^2 — live fallback when the ensemble fetch fails.
     climatological_spread_var: float = 0.0
+    # Variance trend term: sigma^2 += e_trend * (run-to-run forecast change)^2.
+    # 0.0 = disabled (pre-2026-07-08 params files lack this field).
+    e_trend: float = 0.0
 
 
 def crps_gaussian(
@@ -116,19 +119,29 @@ def _emos_mu_sigma(
     members: np.ndarray,
     spread_var: np.ndarray,
     sigma_floor: float,
+    trend_sq: np.ndarray | None = None,
+    nonneg: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute (mu, sigma) vectors from packed parameters.
 
-    ``theta`` = [a0, a1..aK, sqrt_c, sqrt_d]; c and d enter squared so the
-    optimiser is unconstrained while sigma^2 stays non-negative.
+    ``theta`` = [a0, a1..aK, sqrt_c, sqrt_d(, sqrt_e)]; variance terms enter
+    squared so the optimiser is unconstrained while sigma^2 stays
+    non-negative.  With *nonneg*, member weights also enter squared
+    (Gneiting's original EMOS constraint — collinear members otherwise pick
+    up nonsense negative weights on short windows).  With *trend_sq*
+    (squared run-to-run forecast change, deg F^2), sigma^2 gains e·Δμ² —
+    regime-change days widen the distribution (the 2026-07-05 bust mode).
     """
     k = members.shape[1]
     a0 = theta[0]
-    a = theta[1 : 1 + k]
+    a = theta[1 : 1 + k] ** 2 if nonneg else theta[1 : 1 + k]
     c = theta[1 + k] ** 2
     d = theta[2 + k] ** 2
     mu = a0 + members @ a
-    sigma = np.sqrt(np.maximum(c + d * spread_var, sigma_floor**2))
+    var = c + d * spread_var
+    if trend_sq is not None:
+        var = var + (theta[3 + k] ** 2) * trend_sq
+    sigma = np.sqrt(np.maximum(var, sigma_floor**2))
     return mu, sigma
 
 
@@ -140,6 +153,9 @@ def fit_emos(
     sigma_floor_f: float = SIGMA_FLOOR_F,
     train_dates: tuple[date, date] | None = None,
     ensemble_spread_var: np.ndarray | None = None,
+    trend: np.ndarray | None = None,
+    nonneg_weights: bool = False,
+    ridge_lambda: float = 0.0,
 ) -> EMOSParams:
     """Fit EMOS parameters by minimum-CRPS over a training window.
 
@@ -203,19 +219,42 @@ def fit_emos(
         spread_var = member_var
         spread_source = "members"
 
+    trend_sq: np.ndarray | None = None
+    if trend is not None:
+        trend = np.asarray(trend, dtype=float)
+        if trend.shape[0] != ok.shape[0]:
+            raise ValueError("trend must have the same number of rows as actuals")
+        t = trend[ok]
+        trend_sq = np.where(np.isnan(t), 0.0, t) ** 2
+
     # ── Initial guess: OLS for the mean, residual variance for c ─────────
     X = np.column_stack([np.ones(n), members])
     coef, *_ = np.linalg.lstsq(X, actuals, rcond=None)
     resid = actuals - X @ coef
     resid_var = float(resid.var(ddof=1))
+    if nonneg_weights:
+        # Weights enter squared — seed with sqrt of clipped OLS weights.
+        coef = np.concatenate([[coef[0]], np.sqrt(np.clip(coef[1:], 1e-4, None))])
     theta0 = np.concatenate([
         coef,
         [math.sqrt(max(resid_var * 0.8, sigma_floor_f**2)), math.sqrt(0.5)],
+        [0.3] if trend_sq is not None else [],
     ])
 
+    equal_w = 1.0 / k
+
     def objective(theta: np.ndarray) -> float:
-        mu, sigma = _emos_mu_sigma(theta, members, spread_var, sigma_floor_f)
-        return float(np.mean(crps_gaussian(mu, sigma, actuals)))
+        mu, sigma = _emos_mu_sigma(
+            theta, members, spread_var, sigma_floor_f,
+            trend_sq=trend_sq, nonneg=nonneg_weights,
+        )
+        crps = float(np.mean(crps_gaussian(mu, sigma, actuals)))
+        if ridge_lambda > 0.0:
+            w = theta[1 : 1 + k] ** 2 if nonneg_weights else theta[1 : 1 + k]
+            # Shrink toward equal weights (not zero) — the prior is "all
+            # members equally informative", which fights collinearity noise.
+            crps += ridge_lambda * float(np.sum((w - equal_w) ** 2))
+        return crps
 
     result = minimize(objective, theta0, method="Nelder-Mead",
                       options={"maxiter": 20000, "xatol": 1e-5, "fatol": 1e-7})
@@ -228,9 +267,11 @@ def fit_emos(
     theta = result.x
     train_crps = objective(theta)
     a0 = float(theta[0])
-    a = [float(v) for v in theta[1 : 1 + k]]
+    raw_a = theta[1 : 1 + k] ** 2 if nonneg_weights else theta[1 : 1 + k]
+    a = [float(v) for v in raw_a]
     c = float(theta[1 + k] ** 2)
     d = float(theta[2 + k] ** 2)
+    e_trend = float(theta[3 + k] ** 2) if trend_sq is not None else 0.0
 
     start, end = ("", "")
     if train_dates is not None:
@@ -248,6 +289,7 @@ def fit_emos(
         fitted_at_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         spread_source=spread_source,
         climatological_spread_var=round(float(np.mean(spread_var)), 4),
+        e_trend=round(e_trend, 6),
     )
     logger.info(
         "EMOS fit %s: n=%d  a0=%.2f  a=%s  c=%.3f  d=%.3f  spread=%s  "
@@ -262,6 +304,7 @@ def emos_predict(
     params: EMOSParams,
     member_values: dict[str, float],
     ensemble_spread_var: float | None = None,
+    trend_f: float | None = None,
 ) -> tuple[float, float]:
     """Compute the calibrated ``(mu, sigma)`` for one forecast day.
 
@@ -331,7 +374,10 @@ def emos_predict(
             )
         spread_var = float(members.var(ddof=1)) if len(members) > 1 else 0.0
 
-    sigma = math.sqrt(max(params.c + params.d * spread_var, params.sigma_floor_f**2))
+    var = params.c + params.d * spread_var
+    if params.e_trend > 0.0 and trend_f is not None and math.isfinite(trend_f):
+        var += params.e_trend * trend_f**2
+    sigma = math.sqrt(max(var, params.sigma_floor_f**2))
     return mu, sigma
 
 

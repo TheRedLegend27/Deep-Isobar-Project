@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly Deep Isobar backfill worker run
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

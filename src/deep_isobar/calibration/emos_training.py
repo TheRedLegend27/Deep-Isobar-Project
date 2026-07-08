@@ -105,7 +105,7 @@ def fetch_t1_member_maxes(
     om_ids = ",".join(EMOS_MODELS.values())
     url = (
         f"{_PREVIOUS_RUNS_URL}?latitude={lat}&longitude={lon}"
-        "&hourly=temperature_2m_previous_day1"
+        "&hourly=temperature_2m_previous_day1,temperature_2m_previous_day2"
         f"&models={om_ids}"
         "&temperature_unit=fahrenheit"
         f"&timezone={timezone_name.replace('/', '%2F')}"
@@ -124,15 +124,28 @@ def fetch_t1_member_maxes(
         raise ValueError("Open-Meteo previous-runs response had no hourly times")
 
     frame = pd.DataFrame({"local_day": times.date})
+    frame2 = pd.DataFrame({"local_day": times.date})  # previous_day2 view
     for model, om_id in EMOS_MODELS.items():
-        key = f"temperature_2m_previous_day1_{om_id}"
-        vals = hourly.get(key)
+        vals = hourly.get(f"temperature_2m_previous_day1_{om_id}")
         if vals is None and len(EMOS_MODELS) == 1:
             vals = hourly.get("temperature_2m_previous_day1")
         frame[model] = pd.to_numeric(pd.Series(vals if vals is not None else [np.nan] * len(times)), errors="coerce")
+        vals2 = hourly.get(f"temperature_2m_previous_day2_{om_id}")
+        if vals2 is None and len(EMOS_MODELS) == 1:
+            vals2 = hourly.get("temperature_2m_previous_day2")
+        frame2[model] = pd.to_numeric(pd.Series(vals2 if vals2 is not None else [np.nan] * len(times)), errors="coerce")
 
-    daily = (frame.groupby("local_day").min(numeric_only=True) if agg == "min"
-             else frame.groupby("local_day").max(numeric_only=True))
+    def _daily(fr):
+        return (fr.groupby("local_day").min(numeric_only=True) if agg == "min"
+                else fr.groupby("local_day").max(numeric_only=True))
+
+    daily = _daily(frame)
+    daily2 = _daily(frame2)
+    # Run-to-run forecast trend: how much the multi-model mean view of each
+    # target day moved between the D-2 and D-1 runs.  Regime-change days
+    # (fronts) show big values — the variance model's e_trend widens sigma
+    # there (2026-07-05 bust mode: NY forecast fell ~14F day-over-day).
+    daily["trend_f"] = daily[list(EMOS_MODELS)].mean(axis=1) - daily2[list(EMOS_MODELS)].mean(axis=1)
     daily.index.name = "date"
     for model in EMOS_MODELS:
         if model in daily.columns and daily[model].isna().all():
@@ -305,6 +318,8 @@ def fit_station(
                 city.city, coverage * 100, MIN_SPREAD_COVERAGE * 100,
             )
 
+    from deep_isobar.config import get_setting
+    use_trend = bool(get_setting("emos.trend_variance", default=False))
     params = fit_emos(
         members,
         actuals,
@@ -312,6 +327,10 @@ def fit_station(
         station_id=key,
         train_dates=(window["date"].min(), window["date"].max()),
         ensemble_spread_var=ens_spread_var,
+        trend=(window["trend_f"].to_numpy(dtype=float)
+               if use_trend and "trend_f" in window.columns else None),
+        nonneg_weights=bool(get_setting("emos.nonneg_weights", default=False)),
+        ridge_lambda=float(get_setting("emos.ridge_lambda", default=0.0)),
     )
     params.metric = "low_temp_f" if metric == "low" else "high_temp_f"
     save_params(params, params_dir=params_dir)

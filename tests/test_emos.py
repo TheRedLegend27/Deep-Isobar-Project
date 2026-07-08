@@ -256,3 +256,15 @@ def test_load_missing_returns_none(tmp_path):
 def test_load_corrupt_returns_none(tmp_path):
     (tmp_path / "KBAD_emos.json").write_text("{not json", encoding="utf-8")
     assert load_params("KBAD", params_dir=tmp_path) is None
+
+
+def test_nonneg_weights_are_nonnegative():
+    """Validated 2026-07-08 (holdout CRPS 1.021->1.004): constrained fits
+    must never emit the nonsense negative member weights collinearity
+    produced on short windows."""
+    members, actuals = _synthetic_data()
+    params = fit_emos(members, actuals, MODELS, station_id="TEST",
+                      nonneg_weights=True)
+    assert all(w >= 0 for w in params.a)
+    mu, _ = emos_predict(params, {m: 80.0 for m in MODELS})
+    assert mu == pytest.approx(76.0, abs=1.5)

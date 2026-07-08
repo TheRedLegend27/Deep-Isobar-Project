@@ -145,6 +145,16 @@ risk:
         moderate: 5.0     # 3.0–5.0°F → multiplier 0.80
         wide: 999.0       # > 5.0°F → multiplier 0.60
 
+emos:
+  # Member weights constrained >= 0 (Gneiting's original EMOS).  Validated
+  # 2026-07-08: holdout CRPS 1.021 -> 1.004 mean across the 5 trading
+  # stations (NY 1.273 -> 1.187).  ridge and trend-variance variants did
+  # NOT beat base on holdout and are not enabled (see
+  # research/validate_emos_variants.py).
+  nonneg_weights: true
+  ridge_lambda: 0.0
+  trend_variance: false
+
 models:
   default_metric: high_temp_f
   comparison_operator: ge

@@ -1,0 +1,19 @@
+[Unit]
+Description=Deep Isobar GEFS member backfill worker
+After=network-online.target mnt-lake.mount
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=isobar
+WorkingDirectory=/opt/deep-isobar
+Environment=PYTHONPATH=/opt/deep-isobar/src
+ExecStart=/opt/deep-isobar/.venv/bin/python -m deep_isobar.lab.gefs_backfill \
+    --work --queue /mnt/lake/backfill/queue --out /mnt/lake/backfill/out
+# A worker run exits 0 when the queue is empty; the timer re-fires hourly to
+# pick up reseeded or failed-and-requeued tasks.
+TimeoutStartSec=12h
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
