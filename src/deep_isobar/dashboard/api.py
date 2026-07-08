@@ -175,15 +175,57 @@ def get_current_user(
     return user
 
 
+# ---------------------------------------------------------------------------
+# Roles & scopes (Phase 3 RBAC)
+# ---------------------------------------------------------------------------
+# A role is a named bundle of scopes; endpoints require a SCOPE, never a
+# role, so adding a role is one line here and zero endpoint changes.
+#
+#   trading      — positions, trades, P&L detail, signals
+#   calibration  — scorecard, CRPS/PIT tables, params, bias profiles
+#   research     — Lab outputs (sweeps, maker sims, backfill status)
+#   reports      — polished summaries (investor page, CFO exports)
+#   ops          — job health, logs, data freshness (IT / Grafana embed)
+#   admin        — users, settings, audit log, manual trade edits
+
+SCOPES = {"trading", "calibration", "research", "reports", "ops", "admin"}
+
+ROLE_SCOPES: dict[str, set[str]] = {
+    "admin":      set(SCOPES),                       # legacy full access
+    "ceo":        set(SCOPES),
+    "cfo":        {"reports", "trading"},
+    "cio":        {"calibration", "research", "trading", "reports"},
+    "programmer": {"trading", "calibration", "research", "ops"},
+    "it":         {"ops"},
+    "investor":   {"reports"},
+}
+
+
+def require_scope(scope: str):
+    """Dependency factory: 403 unless the caller's role grants *scope*."""
+    if scope not in SCOPES:  # fail at import time, not request time
+        raise ValueError(f"unknown scope {scope!r}")
+
+    def _check(user: dict = Depends(get_current_user)) -> dict:
+        granted = ROLE_SCOPES.get(str(user.get("role", "")), set())
+        if scope not in granted:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Requires {scope!r} access (role {user.get('role')!r})",
+            )
+        return user
+
+    return _check
+
+
 def require_admin(user: dict = Depends(get_current_user)) -> dict:
-    if user.get("role") != "admin":
+    if "admin" not in ROLE_SCOPES.get(str(user.get("role", "")), set()):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
 
-def require_investor_or_admin(user: dict = Depends(get_current_user)) -> dict:
-    if user.get("role") not in ("admin", "investor"):
-        raise HTTPException(status_code=403, detail="Investor or admin access required")
+def require_investor_or_admin(user: dict = Depends(require_scope("reports"))) -> dict:
+    """Legacy name — now means the ``reports`` scope."""
     return user
 
 # ---------------------------------------------------------------------------
@@ -852,7 +894,7 @@ def patch_settings(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/summary")
-def summary(admin: dict = Depends(require_admin)) -> dict[str, Any]:
+def summary(user: dict = Depends(require_scope("trading"))) -> dict[str, Any]:
     df = _load_trades()
 
     settled   = df[df["status"].isin(["WIN", "LOSS"])].copy()
@@ -899,7 +941,7 @@ def trades(
     limit:  int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     format: str = Query(default="json", description="json|xlsx"),
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_scope("trading")),
 ):
     valid_statuses = {"OPEN", "WIN", "LOSS", "VOID", "ALL"}
     if status not in valid_statuses:
@@ -930,7 +972,7 @@ def trades(
 def daily_log(
     date_param: str | None = Query(default=None, alias="date"),
     format: str = Query(default="json", description="json|xlsx"),
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(require_scope("trading")),
 ):
     if date_param is not None:
         try:
@@ -972,7 +1014,7 @@ def audit(
 
 
 @app.get("/api/pnl_curve")
-def pnl_curve(admin: dict = Depends(require_admin)) -> list[dict[str, Any]]:
+def pnl_curve(user: dict = Depends(require_scope("trading"))) -> list[dict[str, Any]]:
     df      = _load_trades()
     settled = df[df["status"].isin(["WIN", "LOSS"])].copy()
     if settled.empty:
@@ -998,7 +1040,7 @@ def pnl_curve(admin: dict = Depends(require_admin)) -> list[dict[str, Any]]:
 
 
 @app.get("/api/alpha_distribution")
-def alpha_distribution(admin: dict = Depends(require_admin)) -> list[dict[str, Any]]:
+def alpha_distribution(user: dict = Depends(require_scope("trading"))) -> list[dict[str, Any]]:
     df     = _load_trades()
     alphas = pd.to_numeric(df["alpha"], errors="coerce").dropna()
     if alphas.empty:
@@ -1026,7 +1068,7 @@ _MONTH_NAMES = [
 
 
 @app.get("/api/bias_profile")
-def bias_profile(admin: dict = Depends(require_admin)) -> dict[str, Any]:
+def bias_profile(user: dict = Depends(require_scope("calibration"))) -> dict[str, Any]:
     if not _BIAS_PROFILE_PQ.exists():
         return {"source": "not_available", "rows": []}
     try:
@@ -1053,7 +1095,7 @@ def bias_profile(admin: dict = Depends(require_admin)) -> dict[str, Any]:
 
 
 @app.get("/api/account")
-def get_account(admin: dict = Depends(require_admin)) -> dict:
+def get_account(user: dict = Depends(require_scope("trading"))) -> dict:
     try:
         from deep_isobar.market.kalshi_client import get_balance
         result = get_balance()
