@@ -7,9 +7,17 @@ calibrated probabilistic forecast for each settlement station and comparing it
 against market-implied probabilities, executing (paper) trades when the edge
 clears risk thresholds.
 
-**Current status:** paper trading five cities on Kalshi (Chicago, New York,
-Dallas, Philadelphia, Boston) with per-station EMOS-calibrated distributions,
-running unattended on a daily schedule.
+**Current status (July 2026):** paper trading five cities on Kalshi
+(Chicago, New York, Dallas, Philadelphia, Boston) with per-station
+EMOS-calibrated distributions — while **calibrating and collecting order
+books for Kalshi's entire weather universe** (20 cities, daily highs *and*
+lows) in data-only mode, ready to flip on when the track record earns it.
+Runs unattended on a nine-job daily schedule with pre-trade circuit
+breakers and settlement results cross-verified against the exchange.
+
+**Docs:** [Operations manual](docs/OPERATIONS.md) ·
+[Roadmap](docs/ROADMAP.md) · [Server runbook](docs/RUNBOOK_SERVERS.md) ·
+[As-of data store](docs/DATA_STORE.md)
 
 ```
 alpha = model_probability − market_probability
@@ -156,12 +164,15 @@ edges are ~3–10 points, and 0.10 stays above Kalshi's taker-fee peak (~1.75%).
 
 | Task | Time | Module |
 |---|---|---|
-| EMOS refit + spread recording | 6:15 AM | `calibration.emos_training` |
-| Morning session | 7:00 AM | `research.paper_trade_session` |
+| EMOS refit + spread recording (all 20 cities, highs+lows) | 6:15 AM | `calibration.emos_training` |
+| Morning session (circuit breakers → Kelly-sized trades) | 7:00 AM | `research.paper_trade_session` |
 | Intraday lock-in check | 2:00 PM | `research.intraday_check` |
-| Settlement | 6:00 PM | `research.settle_paper_trades` |
+| Settlement (all pending dates) | 6:00 PM | `research.settle_paper_trades` |
+| **Exchange cross-verification** of every graded trade | 6:30 PM | `research.verify_settlements` |
 | Daily scorecard | 6:45 PM | `research.daily_scorecard` |
 | Dashboard | 7:15 PM | `research.generate_dashboard` |
+| Orderbook collector (~305 books, all series) | every 10 min, 6–21 | `data.orderbook_collector` |
+| Backup with rotation | 9:30 PM | `ops.backup` |
 
 **Runtime registration:**
 
@@ -218,21 +229,31 @@ Performance claims are tracked, not assumed:
 src/deep_isobar/
   core/           # Types, logging
   data/           # City universe, NOAA/ACIS ingest, GFS GRIB ingest,
-                  # ensemble_ingest (GEFS/EPS members + spread history)
+                  # ensemble_ingest (GEFS/EPS members + spread history),
+                  # orderbook_collector (market-history recorder)
   models/         # Temperature ensemble, KDE, probability engine/surface
-  market/         # Kalshi client, Polymarket client, market/microstructure scanners
-  trading/        # Alpha engine, tail alpha, bracket spreader, risk, execution
-  calibration/    # emos, emos_training, bias_loader (legacy), onboarding, replay
-  research/       # paper_trade_session, settle, intraday_check,
-                  # daily_scorecard, forecast_evaluation, dashboards, backtests
+  market/         # Kalshi client (incl. official-result fetch), scanners
+  trading/        # Alpha engine, Kelly sizing, bracket spreader,
+                  # preflight circuit breakers, risk, execution
+  calibration/    # emos (nonneg/ridge/trend options), emos_training
+                  # (highs + lows), bias_loader (legacy), onboarding
+  research/       # paper_trade_session, settle, verify_settlements,
+                  # intraday_check, daily_scorecard, forecast_evaluation,
+                  # validate_emos_variants (the holdout race)
+  lab/            # Forecast Lab: asof_store (lookahead-proof reads),
+                  # gefs_backfill (server fleet worker), maker_fills
+  ops/            # backup
+  dashboard/      # FastAPI API + auth + audit log + xlsx exports
   monitoring/     # watchdog
   notifications/  # Discord embeds (no-op without webhook)
-  supervisor.py   # long-running daily-job scheduler with catch-up
+  supervisor.py   # daily + interval job scheduler with catch-up
 
-deploy/macos/     # launchd plist template (rendered by make mac-install)
-docs/modules/     # per-module design specs
+deploy/macos/     # launchd plist template (make mac-install)
+deploy/server/    # drop-and-use Linux fleet: bootstrap.sh + systemd units
+docs/             # OPERATIONS.md, ROADMAP.md, RUNBOOK_SERVERS.md,
+                  # DATA_STORE.md, research/ (overnight-agent reports)
 tests/            # pytest suite
-config/           # settings.yaml (scheduler, risk), cities.yaml (stations)
+config/           # settings.yaml (scheduler, risk, emos), cities.yaml
 ```
 
 ---
@@ -246,20 +267,41 @@ cfgrib file-locking issues don't exist.
 
 ---
 
+## Feature summary
+
+- **Calibrated forecasting** — per-station EMOS (min-CRPS, non-negative
+  weights, 1.3°F floor), five models incl. NBM, max/min-of-trace extraction,
+  ensemble-member spread accumulating toward flow-dependent variance.
+- **Full-universe coverage** — 20 Kalshi cities × highs and lows calibrated
+  and tracked; per-city `trade` flag separates learning from trading.
+- **Risk & integrity** — fee-adjusted fractional Kelly with same-day
+  correlation haircut; pre-trade circuit breakers (stub/bounds/NBM/params/
+  sigma/liquidity); settlement cross-verified against the exchange nightly.
+- **Evidence loop** — daily scorecard (P&L, Brier-edge-vs-market, CRPS/PIT
+  per station); holdout race required before any model change ships.
+- **Data assets** — orderbook history recorder (~305 books/10 min), live
+  member-spread history, lookahead-proof as-of store, GEFS archive backfill
+  worker for the server fleet.
+- **Ops** — 9-job supervisor with sleep catch-up, launchd/systemd deploys,
+  nightly rotated backups, append-only audit log, xlsx export on API
+  endpoints, Discord notifications (optional).
+
 ## Roadmap
 
-**Done (June–July 2026):** EMOS min-CRPS calibration per station ·
-max-of-trace daily-max extraction · Central Park station fix · NBM as member
-+ benchmark · GEFS/EPS member spread into the variance (accumulating toward
-the 60% gate) · daily scorecard + evaluation harness · macOS runtime.
+**Done (June–July 2026):** EMOS calibration + max-of-trace + station fixes ·
+NBM + GEFS/EPS members · Kelly sizing + SELL spreading + fee model · circuit
+breakers · settlement cross-verification · full-universe onboarding (highs +
+lows, data-only) · scorecard/evaluation harness · orderbook collector ·
+maker-fill simulator (verdict: hybrid, not maker-only) · non-negative EMOS
+weights (won its holdout race) · server fleet package (see
+[docs/ROADMAP.md](docs/ROADMAP.md) for the full phased plan).
 
 **Next:**
-1. **Sizing** — fractional Kelly (~0.25) with correlation-aware exposure
-   across same-day cities; SELL-side spreading in `bracket_spreader.py`
-   (currently BUY-only; `kelly`/`equal` allocation are stubs).
-2. **Fees** — model Kalshi taker curve and Polymarket's 2026 weather taker
-   fee explicitly (replace the flat settlement haircut).
-3. **Intraday** — event-driven repricing (model cycles + 5-min ASOS lock-in)
-   with maker execution, once calibration has a forward track record.
-4. **Live execution** — remove the `submit_live_trade` stub, hard position
-   limits, order status polling, gated behind `paper_trade: false`.
+1. **Server day** (docs/RUNBOOK_SERVERS.md) — Tailscale + Proxmox/TrueNAS,
+   then the GEFS member backfill → flow-dependent variance gate crosses.
+2. **Forecast Lab (Phase 2)** — walk-forward sweeps on backfilled vintages;
+   first customers: trend-variance rematch, Boston sea-breeze regime flag.
+3. **City/low flips** — gated on 2–3 weeks positive Brier edge + collector
+   liquidity evidence (+ midnight-minimum settlement spec for lows).
+4. **Intraday repricing** then **live execution** — in that order, each
+   gated on the evidence before it (docs/ROADMAP.md).
