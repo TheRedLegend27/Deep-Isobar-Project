@@ -175,6 +175,7 @@ def _build_profile(entry: dict[str, Any]) -> CityProfile:
         active=bool(entry.get("active", True)),
         trade=bool(entry.get("trade", True)),
         kalshi_series=str(entry.get("kalshi_series", "")),
+        kalshi_low_series=str(entry.get("kalshi_low_series", "")),
         acis_station_id=str(entry.get("acis_station_id", "")),
         nws_lat=float(entry.get("nws_lat", 0.0)),
         nws_lon=float(entry.get("nws_lon", 0.0)),

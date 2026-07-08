@@ -8,6 +8,7 @@ cities:
     settlement_source: NWS
     active: true
     kalshi_series: KXHIGHCHI
+    kalshi_low_series: KXLOWTCHI
     # ACIS sid (ICAO form). The previous CLIMDW-style ids were NWS CLI product
     # codes, which ACIS rejects ("no data available") — that silently broke
     # fetch_settlement_observations for every city (found 2026-06-12).
@@ -55,6 +56,7 @@ cities:
     settlement_source: NWS
     active: true
     kalshi_series: KXHIGHNY
+    kalshi_low_series: KXLOWTNYC
     acis_station_id: KNYC
     nws_lat: 40.7789
     nws_lon: -73.9692
@@ -83,6 +85,7 @@ cities:
     settlement_source: NWS
     active: true
     kalshi_series: KXHIGHTDAL
+    kalshi_low_series: KXLOWTDAL
     acis_station_id: KDFW
     nws_lat: 32.897
     nws_lon: -97.037
@@ -107,6 +110,7 @@ cities:
     station_id: KPHL
     settlement_source: NWS
     kalshi_series: KXHIGHPHIL
+    kalshi_low_series: KXLOWTPHIL
     acis_station_id: KPHL
     nws_lat: 39.8719
     nws_lon: -75.2411
@@ -129,6 +133,7 @@ cities:
     station_id: KBOS
     settlement_source: NWS
     kalshi_series: KXHIGHTBOS
+    kalshi_low_series: KXLOWTBOS
     acis_station_id: KBOS
     nws_lat: 42.3631
     nws_lon: -71.0064
@@ -163,6 +168,7 @@ cities:
     active: true
     trade: false
     kalshi_series: KXHIGHTPHX
+    kalshi_low_series: KXLOWTPHX
     acis_station_id: KPHX
     nws_lat: 33.4278
     nws_lon: -112.0038
@@ -181,6 +187,7 @@ cities:
     active: true
     trade: false
     kalshi_series: KXHIGHDEN
+    kalshi_low_series: KXLOWTDEN
     acis_station_id: KDEN
     nws_lat: 39.8467
     nws_lon: -104.6561
@@ -199,6 +206,7 @@ cities:
     active: true
     trade: false
     kalshi_series: KXHIGHMIA
+    kalshi_low_series: KXLOWTMIA
     acis_station_id: KMIA
     nws_lat: 25.7906
     nws_lon: -80.3164
@@ -217,6 +225,7 @@ cities:
     active: true
     trade: false
     kalshi_series: KXHIGHTSEA
+    kalshi_low_series: KXLOWTSEA
     acis_station_id: KSEA
     nws_lat: 47.4444
     nws_lon: -122.3139
@@ -224,3 +233,74 @@ cities:
     mean_bias_correction_f: 0.0
     kde_bandwidth: 5.5
     tail_multiplier: 1.0
+
+  # ── Data-only onboarding wave 2 (2026-07-07): full Kalshi universe ────────
+  # Stations verified via each series' settlement_sources CLI product
+  # (issuedby code); Austin confirmed BERGSTROM (KAUS) from the live CLI
+  # text; Houston is Hobby (KHOU).  All trade: false.
+
+  - {city: Austin, city_code: AUS, state: TX, country: US, timezone: America/Chicago,
+     station_id: KAUS, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHAUS, kalshi_low_series: KXLOWTAUS, acis_station_id: KAUS,
+     nws_lat: 30.1945, nws_lon: -97.6699,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: Houston, city_code: HOU, state: TX, country: US, timezone: America/Chicago,
+     station_id: KHOU, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHTHOU, kalshi_low_series: KXLOWTHOU, acis_station_id: KHOU,
+     nws_lat: 29.6454, nws_lon: -95.2789,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: Los Angeles, city_code: LAX, state: CA, country: US, timezone: America/Los_Angeles,
+     station_id: KLAX, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHLAX, kalshi_low_series: KXLOWTLAX, acis_station_id: KLAX,
+     nws_lat: 33.9382, nws_lon: -118.3866,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: Atlanta, city_code: ATL, state: GA, country: US, timezone: America/New_York,
+     station_id: KATL, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHTATL, kalshi_low_series: KXLOWTATL, acis_station_id: KATL,
+     nws_lat: 33.6301, nws_lon: -84.4418,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: Washington DC, city_code: DC, state: DC, country: US, timezone: America/New_York,
+     station_id: KDCA, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHTDC, kalshi_low_series: KXLOWTDC, acis_station_id: KDCA,
+     nws_lat: 38.8483, nws_lon: -77.0342,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: Las Vegas, city_code: LV, state: NV, country: US, timezone: America/Los_Angeles,
+     station_id: KLAS, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHTLV, kalshi_low_series: KXLOWTLV, acis_station_id: KLAS,
+     nws_lat: 36.0719, nws_lon: -115.1634,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: Minneapolis, city_code: MIN, state: MN, country: US, timezone: America/Chicago,
+     station_id: KMSP, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHTMIN, kalshi_low_series: KXLOWTMIN, acis_station_id: KMSP,
+     nws_lat: 44.8831, nws_lon: -93.2289,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: New Orleans, city_code: NOLA, state: LA, country: US, timezone: America/Chicago,
+     station_id: KMSY, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHTNOLA, kalshi_low_series: KXLOWTNOLA, acis_station_id: KMSY,
+     nws_lat: 29.9928, nws_lon: -90.2510,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: Oklahoma City, city_code: OKC, state: OK, country: US, timezone: America/Chicago,
+     station_id: KOKC, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHTOKC, kalshi_low_series: KXLOWTOKC, acis_station_id: KOKC,
+     nws_lat: 35.3889, nws_lon: -97.6006,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: San Antonio, city_code: SATX, state: TX, country: US, timezone: America/Chicago,
+     station_id: KSAT, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHTSATX, kalshi_low_series: KXLOWTSATX, acis_station_id: KSAT,
+     nws_lat: 29.5443, nws_lon: -98.4839,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
+
+  - {city: San Francisco, city_code: SFO, state: CA, country: US, timezone: America/Los_Angeles,
+     station_id: KSFO, settlement_source: NWS, active: true, trade: false,
+     kalshi_series: KXHIGHTSFO, kalshi_low_series: KXLOWTSFO, acis_station_id: KSFO,
+     nws_lat: 37.6197, nws_lon: -122.3647,
+     variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}

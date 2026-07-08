@@ -74,6 +74,7 @@ def fetch_member_daily_maxes(
     timezone_name: str,
     target_date: date,
     models: dict[str, str] | None = None,
+    daily_var: str = "temperature_2m_max",
 ) -> dict[str, list[float]]:
     """Fetch per-member daily-max forecasts for *target_date* (live path).
 
@@ -93,7 +94,7 @@ def fetch_member_daily_maxes(
     om_ids = ",".join(models.values())
     url = (
         f"{_ENSEMBLE_URL}?latitude={lat}&longitude={lon}"
-        "&daily=temperature_2m_max"
+        f"&daily={daily_var}"
         f"&models={om_ids}"
         "&temperature_unit=fahrenheit"
         f"&timezone={timezone_name.replace('/', '%2F')}"
@@ -113,9 +114,9 @@ def fetch_member_daily_maxes(
 
     out: dict[str, list[float]] = {}
     for name, om_id in models.items():
-        # Keys: temperature_2m_max_{om_id} (control) and
-        # temperature_2m_max_memberNN_{om_id} (perturbed members).
-        pattern = re.compile(rf"^temperature_2m_max(_member\d+)?_{re.escape(om_id)}$")
+        # Keys: {daily_var}_{om_id} (control) and
+        # {daily_var}_memberNN_{om_id} (perturbed members).
+        pattern = re.compile(rf"^{re.escape(daily_var)}(_member\d+)?_{re.escape(om_id)}$")
         values: list[float] = []
         for key, series in daily.items():
             if not pattern.match(key):

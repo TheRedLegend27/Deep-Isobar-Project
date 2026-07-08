@@ -165,6 +165,7 @@ def station_calibration(
     params_dir: Path | None = None,
     spread_dir: Path | None = None,
     asof: date | None = None,
+    metric: str = "high",
 ) -> dict | None:
     """Recompute calibration metrics for one station from stored artifacts.
 
@@ -173,8 +174,9 @@ def station_calibration(
     forecasts, how calibrated were they".  Returns ``None`` when the station
     has no params or no usable training rows.
     """
-    params = load_params(city.station_id, params_dir=params_dir)
-    path = _training_path(city.station_id, training_dir)
+    key = city.station_id if metric == "high" else f"{city.station_id}_low"
+    params = load_params(key, params_dir=params_dir)
+    path = _training_path(key, training_dir)
     if params is None or not path.exists():
         return None
 
@@ -205,8 +207,8 @@ def station_calibration(
     sigma = np.sqrt(np.maximum(params.c + params.d * spread_var, params.sigma_floor_f**2))
 
     out = {
-        "city": city.city,
-        "station_id": city.station_id,
+        "city": city.city if metric == "high" else f"{city.city} LOW",
+        "station_id": key,
         "n_days": len(df),
         "crps": float(np.mean(crps_gaussian(mu, sigma, y))),
         "mae": float(np.mean(np.abs(mu - y))),
@@ -234,7 +236,7 @@ def station_calibration(
     except ValueError:
         out["params_age_days"] = -1
 
-    spread_hist = load_t1_spread_history(city.station_id, spread_dir=spread_dir)
+    spread_hist = load_t1_spread_history(key, spread_dir=spread_dir)
     today = asof or date.today()
     recent = spread_hist[spread_hist["date"] >= today - timedelta(days=window_days)]
     out["spread_days"] = len(recent)
@@ -446,13 +448,17 @@ def main(argv: list[str] | None = None) -> int:
 
     calibrations = []
     for city in (c for c in get_city_universe() if c.active):
-        try:
-            cal = station_calibration(city, window_days=args.days, asof=asof)
-        except Exception:  # noqa: BLE001
-            logger.exception("[%s] calibration section failed", city.city)
-            cal = None
-        if cal is not None:
-            calibrations.append(cal)
+        metrics = ["high"] + (["low"] if city.kalshi_low_series else [])
+        for metric in metrics:
+            try:
+                cal = station_calibration(
+                    city, window_days=args.days, asof=asof, metric=metric
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("[%s/%s] calibration section failed", city.city, metric)
+                cal = None
+            if cal is not None:
+                calibrations.append(cal)
 
     report = render_markdown(asof, latest, latest_day, stats7, stats30, calibrations)
     print(report)

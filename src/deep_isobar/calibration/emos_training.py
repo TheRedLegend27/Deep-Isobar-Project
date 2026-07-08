@@ -84,6 +84,7 @@ def fetch_t1_member_maxes(
     lon: float,
     timezone_name: str,
     past_days: int = MAX_PAST_DAYS,
+    agg: str = "max",
 ) -> pd.DataFrame:
     """Fetch T+1-lead daily-max forecasts per member from Open-Meteo.
 
@@ -130,7 +131,8 @@ def fetch_t1_member_maxes(
             vals = hourly.get("temperature_2m_previous_day1")
         frame[model] = pd.to_numeric(pd.Series(vals if vals is not None else [np.nan] * len(times)), errors="coerce")
 
-    daily = frame.groupby("local_day").max(numeric_only=True)
+    daily = (frame.groupby("local_day").min(numeric_only=True) if agg == "min"
+             else frame.groupby("local_day").max(numeric_only=True))
     daily.index.name = "date"
     for model in EMOS_MODELS:
         if model in daily.columns and daily[model].isna().all():
@@ -148,10 +150,17 @@ def _training_path(station_id: str, training_dir: Path | None = None) -> Path:
     return d / f"{station_id}_t1_training.parquet"
 
 
+def _station_key(city: CityProfile, metric: str) -> str:
+    """Filesystem key for params/training/spread: highs keep the bare
+    station id (backward compatible); lows append ``_low``."""
+    return city.station_id if metric == "high" else f"{city.station_id}_low"
+
+
 def build_training_data(
     city: CityProfile,
     past_days: int = MAX_PAST_DAYS,
     training_dir: Path | None = None,
+    metric: str = "high",
 ) -> pd.DataFrame:
     """Build/refresh the paired training parquet for one city.
 
@@ -165,8 +174,11 @@ def build_training_data(
     if not (city.nws_lat and city.nws_lon):
         raise ValueError(f"{city.city}: nws_lat/nws_lon required for EMOS training")
 
+    key = _station_key(city, metric)
+    agg = "min" if metric == "low" else "max"
+    obs_col = "low_temp_f" if metric == "low" else "high_temp_f"
     forecasts = fetch_t1_member_maxes(
-        city.nws_lat, city.nws_lon, city.timezone, past_days
+        city.nws_lat, city.nws_lon, city.timezone, past_days, agg=agg
     )
     logger.info(
         "[%s] previous-runs forecasts: %d days (%s .. %s)",
@@ -181,10 +193,11 @@ def build_training_data(
         members_by_model = fetch_member_daily_maxes(
             city.nws_lat, city.nws_lon, city.timezone,
             date.today() + timedelta(days=1),
+            daily_var="temperature_2m_min" if metric == "low" else "temperature_2m_max",
         )
         live_var = pooled_member_variance(members_by_model)
         if live_var is not None:
-            record_t1_spread(city.station_id, date.today() + timedelta(days=1), live_var)
+            record_t1_spread(key, date.today() + timedelta(days=1), live_var)
     except Exception:  # noqa: BLE001
         logger.exception("[%s] live ensemble spread fetch failed — not recorded", city.city)
 
@@ -194,8 +207,8 @@ def build_training_data(
         end_date=forecasts.index.max(),
     )
     actuals = (
-        obs[["target_date", "high_temp_f"]]
-        .rename(columns={"target_date": "date", "high_temp_f": "actual_f"})
+        obs[["target_date", obs_col]]
+        .rename(columns={"target_date": "date", obs_col: "actual_f"})
         .set_index("date")
     )
 
@@ -203,7 +216,7 @@ def build_training_data(
     merged["date"] = pd.to_datetime(merged["date"]).dt.date
     merged = merged.dropna(subset=["actual_f"])
 
-    path = _training_path(city.station_id, training_dir)
+    path = _training_path(key, training_dir)
     if path.exists():
         try:
             existing = pd.read_parquet(path)
@@ -218,7 +231,7 @@ def build_training_data(
     # The spread-history parquet is the single source of truth for
     # ens_spread_var — re-join it fully each run rather than merging stale
     # column values through the dedup above.
-    spread_hist = load_t1_spread_history(city.station_id)
+    spread_hist = load_t1_spread_history(key)
     merged = merged.drop(columns=["ens_spread_var"], errors="ignore")
     if not spread_hist.empty:
         merged = merged.merge(spread_hist, on="date", how="left")
@@ -244,6 +257,7 @@ def fit_station(
     window_days: int = DEFAULT_WINDOW_DAYS,
     training_dir: Path | None = None,
     params_dir: Path | None = None,
+    metric: str = "high",
 ) -> EMOSParams:
     """Fit EMOS for one station from its training parquet and save params.
 
@@ -251,10 +265,11 @@ def fit_station(
     research report's recommended alternative to per-month fits while the
     history is still short).
     """
-    path = _training_path(city.station_id, training_dir)
+    key = _station_key(city, metric)
+    path = _training_path(key, training_dir)
     if not path.exists():
         raise FileNotFoundError(
-            f"No training parquet for {city.station_id} — run build_training_data first"
+            f"No training parquet for {key} — run build_training_data first"
         )
     df = pd.read_parquet(path)
     df["date"] = pd.to_datetime(df["date"]).dt.date
@@ -294,10 +309,11 @@ def fit_station(
         members,
         actuals,
         model_names,
-        station_id=city.station_id,
+        station_id=key,
         train_dates=(window["date"].min(), window["date"].max()),
         ensemble_spread_var=ens_spread_var,
     )
+    params.metric = "low_temp_f" if metric == "low" else "high_temp_f"
     save_params(params, params_dir=params_dir)
     return params
 
@@ -320,20 +336,24 @@ def main(argv: list[str] | None = None) -> int:
 
     failures = 0
     for city in cities:
-        try:
-            if not args.skip_fetch:
-                build_training_data(city)
-            params = fit_station(city, window_days=args.window_days)
-            print(
-                f"{city.city:>14} ({city.station_id}): n={params.n_train}  "
-                f"a0={params.a0:+.2f}  a={[round(v, 3) for v in params.a]}  "
-                f"c={params.c:.3f}  d={params.d:.3f}  "
-                f"train CRPS={params.train_crps:.3f}degF"
-            )
-        except Exception as exc:  # noqa: BLE001
-            failures += 1
-            logger.exception("[%s] EMOS build/fit failed", city.city)
-            print(f"{city.city:>14}: FAILED — {exc}", file=sys.stderr)
+        metrics = ["high"] + (["low"] if city.kalshi_low_series else [])
+        for metric in metrics:
+            try:
+                if not args.skip_fetch:
+                    build_training_data(city, metric=metric)
+                params = fit_station(
+                    city, window_days=args.window_days, metric=metric
+                )
+                print(
+                    f"{city.city:>14} ({params.station_id}): n={params.n_train}  "
+                    f"a0={params.a0:+.2f}  a={[round(v, 3) for v in params.a]}  "
+                    f"c={params.c:.3f}  d={params.d:.3f}  "
+                    f"train CRPS={params.train_crps:.3f}degF"
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                logger.exception("[%s/%s] EMOS build/fit failed", city.city, metric)
+                print(f"{city.city:>14} ({metric}): FAILED — {exc}", file=sys.stderr)
 
     return 1 if failures else 0
 

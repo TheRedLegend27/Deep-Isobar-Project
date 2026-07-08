@@ -80,6 +80,10 @@ class CityProfile:
     # has matured AND the book's track record justifies expansion.
     trade: bool = True
     kalshi_series: str = ""
+    # Daily LOW-temperature series for this station ("" = none).  Lows are
+    # calibration/collection-only for now — the trading session only trades
+    # METRIC=high_temp_f regardless of this field.
+    kalshi_low_series: str = ""
     # ACIS settlement station; may differ from METAR station_id (e.g. Dallas:
     # METAR=KDFW, ACIS/Kalshi settlement=CLIDFW).  Falls back to station_id
     # at runtime when empty.

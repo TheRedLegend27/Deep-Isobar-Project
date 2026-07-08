@@ -67,12 +67,14 @@ def collect_snapshot(history_dir: Path | None = None) -> Path | None:
     rows: list[dict] = []
 
     for city in (c for c in get_city_universe() if c.active):
-        if not city.kalshi_series:
+      for metric, series in (("high", city.kalshi_series),
+                             ("low", city.kalshi_low_series)):
+        if not series:
             continue
         try:
-            contracts = fetch_live_contracts("Kalshi", series_ticker=city.kalshi_series)
+            contracts = fetch_live_contracts("Kalshi", series_ticker=series)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] contract fetch failed: %s", city.city, exc)
+            logger.warning("[%s/%s] contract fetch failed: %s", city.city, metric, exc)
             continue
 
         for contract in contracts:
@@ -87,7 +89,8 @@ def collect_snapshot(history_dir: Path | None = None) -> Path | None:
             rows.append({
                 "snapshot_utc": snapshot_utc,
                 "city": city.city,
-                "series": city.kalshi_series,
+                "series": series,
+                "metric": metric,
                 "contract_id": contract.contract_id,
                 "strike_type": contract.strike_type,
                 "threshold_f": contract.threshold_f,
