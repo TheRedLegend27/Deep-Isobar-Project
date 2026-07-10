@@ -62,7 +62,7 @@ _SUPERVISOR_LOG = _PROJECT_ROOT / "data" / "logs" / "supervisor.log"
 _JOB_TIMEOUT_SECONDS = 3600
 
 _DEFAULT_JOBS = [
-    {"name": "paper_trade_session", "module": "deep_isobar.research.paper_trade_session", "at": "07:00"},
+    {"name": "paper_trade_session", "module": "deep_isobar.research.paper_trade_session", "at": "10:30"},
     {"name": "intraday_check",      "module": "deep_isobar.research.intraday_check",      "at": "14:00"},
     {"name": "settle_paper_trades", "module": "deep_isobar.research.settle_paper_trades", "at": "18:00"},
     {"name": "generate_dashboard",  "module": "deep_isobar.research.generate_dashboard",  "at": "19:15"},

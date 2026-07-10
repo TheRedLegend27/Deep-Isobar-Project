@@ -25,9 +25,12 @@ scheduler:
     - name: emos_training
       module: deep_isobar.calibration.emos_training
       at: "06:15"
+    # Kalshi lists next-day high-temp markets mid-morning (observed between
+    # ~07:30 and ~10:17 ET) — 07:00 always found zero contracts. Jul 8-10
+    # 2026 sessions silently placed no trades because of this.
     - name: paper_trade_session
       module: deep_isobar.research.paper_trade_session
-      at: "07:00"
+      at: "10:30"
     - name: intraday_check
       module: deep_isobar.research.intraday_check
       at: "14:00"
