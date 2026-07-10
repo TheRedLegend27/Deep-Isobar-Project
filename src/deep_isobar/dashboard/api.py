@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 import bcrypt as _bcrypt_lib
 import pandas as pd
+import pyotp
 import yaml
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
@@ -55,8 +56,18 @@ load_dotenv(_ENV_PATH)
 
 _JWT_SECRET    = os.getenv("JWT_SECRET", "dev-secret-do-not-use-in-production")
 _JWT_ALGORITHM = "HS256"
-_JWT_EXPIRE_H  = 24
+_ACCESS_EXPIRE_MIN = int(os.getenv("JWT_ACCESS_MINUTES", "60"))
+_REFRESH_EXPIRE_D  = int(os.getenv("JWT_REFRESH_DAYS", "7"))
 _security      = HTTPBearer(auto_error=False)
+
+_TOTP_ISSUER         = "Deep Isobar"
+_TOTP_REQUIRED_ROLES = {"admin", "ceo"}
+
+# Login rate limits, counted from the audit log (survives restarts).
+_LOGIN_WINDOW_MIN     = 15
+_LOGIN_MAX_FAILS_USER = 5
+_LOGIN_MAX_FAILS_IP   = 20
+_LOGIN_FAILURE_ACTIONS = ("login.failure", "login.totp_failure")
 
 
 def _hash_password(password: str) -> str:
@@ -95,9 +106,22 @@ def _init_db() -> None:
             is_active           INTEGER DEFAULT 1,
             must_change_password INTEGER DEFAULT 0,
             created_at          TEXT NOT NULL,
-            last_login          TEXT DEFAULT NULL
+            last_login          TEXT DEFAULT NULL,
+            totp_secret         TEXT NOT NULL DEFAULT '',
+            totp_enabled        INTEGER NOT NULL DEFAULT 0,
+            token_version       INTEGER NOT NULL DEFAULT 0
         )
     """)
+    # Migrate pre-hardening databases in place.
+    for col, ddl in [
+        ("totp_secret",   "TEXT NOT NULL DEFAULT ''"),
+        ("totp_enabled",  "INTEGER NOT NULL DEFAULT 0"),
+        ("token_version", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
 
     existing_admin = conn.execute(
@@ -129,24 +153,54 @@ def _init_db() -> None:
 def _user_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     d.pop("hashed_password", None)
+    d.pop("totp_secret", None)
+    d.pop("token_version", None)
     d["is_active"] = bool(d.get("is_active", 1))
     d["must_change_password"] = bool(d.get("must_change_password", 0))
+    d["totp_enabled"] = bool(d.get("totp_enabled", 0))
     return d
 
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
 
-def _create_token(username: str, role: str, must_change_password: bool, display_name: str = "") -> str:
-    expire = datetime.now(timezone.utc) + timedelta(hours=_JWT_EXPIRE_H)
-    payload = {
-        "sub":                  username,
-        "role":                 role,
-        "display_name":         display_name or username,
-        "must_change_password": must_change_password,
-        "exp":                  expire,
+def _make_token(username: str, token_type: str, version: int, minutes: float,
+                extra: dict | None = None) -> str:
+    payload: dict[str, Any] = {
+        "sub":  username,
+        "type": token_type,
+        "ver":  version,
+        "exp":  datetime.now(timezone.utc) + timedelta(minutes=minutes),
     }
+    if extra:
+        payload.update(extra)
     return jwt.encode(payload, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
+
+
+def _issue_tokens(row: sqlite3.Row | dict) -> dict[str, Any]:
+    """Access + refresh token pair for a user row.
+
+    Both carry the user's ``token_version``; bumping that column (password
+    change/reset) revokes every previously issued token at once.
+    """
+    version = int(row["token_version"] or 0)
+    access = _make_token(
+        row["username"], "access", version, _ACCESS_EXPIRE_MIN,
+        extra={
+            "role":                 row["role"],
+            "display_name":         row["display_name"] or row["username"],
+            "must_change_password": bool(row["must_change_password"]),
+        },
+    )
+    refresh = _make_token(
+        row["username"], "refresh", version, _REFRESH_EXPIRE_D * 24 * 60
+    )
+    return {
+        "access_token":  access,
+        "refresh_token": refresh,
+        "token_type":    "bearer",
+        "expires_in":    _ACCESS_EXPIRE_MIN * 60,
+    }
 
 
 def get_current_user(
@@ -161,6 +215,9 @@ def get_current_user(
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Not an access token")
+
     conn = _get_db()
     row = conn.execute(
         "SELECT * FROM users WHERE username = ?", (username,)
@@ -169,6 +226,9 @@ def get_current_user(
 
     if row is None or not row["is_active"]:
         raise HTTPException(status_code=401, detail="User not found or deactivated")
+
+    if payload.get("ver") != int(row["token_version"] or 0):
+        raise HTTPException(status_code=401, detail="Token revoked")
 
     user = dict(row)
     user["must_change_password"] = bool(user.get("must_change_password", 0))
@@ -235,6 +295,9 @@ def require_investor_or_admin(user: dict = Depends(require_scope("reports"))) ->
 @asynccontextmanager
 async def _lifespan(app: FastAPI):  # noqa: ARG001
     _init_db()
+    if _JWT_SECRET == "dev-secret-do-not-use-in-production":
+        print("[deep-isobar-api] WARNING: JWT_SECRET is the dev default — "
+              "set a real JWT_SECRET in .env before any internet exposure")
     found, missing = [], []
     for p in [_PAPER_TRADES_CSV, _DAILY_LOG_CSV, _BIAS_PROFILE_PQ]:
         (found if p.exists() else missing).append(p.name)
@@ -446,6 +509,11 @@ def health() -> dict[str, str]:
 class LoginBody(BaseModel):
     username: str
     password: str
+    totp_code: Optional[str] = None
+
+
+class RefreshBody(BaseModel):
+    refresh_token: str
 
 
 class ChangePasswordBody(BaseModel):
@@ -453,10 +521,58 @@ class ChangePasswordBody(BaseModel):
     new_password: str
 
 
+def _login_retry_after(conn: sqlite3.Connection, username: str, ip: str) -> Optional[int]:
+    """Seconds the caller must wait, or None if under the failure limits.
+
+    Failures are counted straight from the audit log, so lockouts survive
+    API restarts and need no extra state store.
+    """
+    since = (
+        datetime.now(timezone.utc) - timedelta(minutes=_LOGIN_WINDOW_MIN)
+    ).isoformat(timespec="seconds")
+    placeholders = ",".join("?" * len(_LOGIN_FAILURE_ACTIONS))
+
+    user_fails = conn.execute(
+        f"SELECT COUNT(*) FROM audit_log "
+        f"WHERE action IN ({placeholders}) AND ts_utc >= ? AND username = ?",
+        (*_LOGIN_FAILURE_ACTIONS, since, username),
+    ).fetchone()[0]
+    if user_fails >= _LOGIN_MAX_FAILS_USER:
+        return _LOGIN_WINDOW_MIN * 60
+
+    if ip:
+        ip_fails = conn.execute(
+            f"SELECT COUNT(*) FROM audit_log "
+            f"WHERE action IN ({placeholders}) AND ts_utc >= ? AND ip = ?",
+            (*_LOGIN_FAILURE_ACTIONS, since, ip),
+        ).fetchone()[0]
+        if ip_fails >= _LOGIN_MAX_FAILS_IP:
+            return _LOGIN_WINDOW_MIN * 60
+    return None
+
+
+def _verify_totp(secret: str, code: str) -> bool:
+    try:
+        return pyotp.TOTP(secret).verify(code, valid_window=1)
+    except Exception:
+        return False
+
+
 @app.post("/api/auth/login")
 def login(body: LoginBody, request: Request) -> dict:
     client_ip = request.client.host if request.client else ""
     conn = _get_db()
+
+    retry_after = _login_retry_after(conn, body.username, client_ip)
+    if retry_after is not None:
+        record_audit(conn, body.username, "login.rate_limited", ip=client_ip)
+        conn.close()
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts — try again later",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     row = conn.execute(
         "SELECT * FROM users WHERE username = ?", (body.username,)
     ).fetchone()
@@ -471,6 +587,19 @@ def login(body: LoginBody, request: Request) -> dict:
         conn.close()
         raise HTTPException(status_code=403, detail="Account deactivated")
 
+    if row["totp_enabled"]:
+        if not body.totp_code:
+            record_audit(conn, body.username, "login.totp_missing", ip=client_ip)
+            conn.close()
+            raise HTTPException(
+                status_code=401,
+                detail={"totp_required": True, "message": "TOTP code required"},
+            )
+        if not _verify_totp(row["totp_secret"], body.totp_code):
+            record_audit(conn, body.username, "login.totp_failure", ip=client_ip)
+            conn.close()
+            raise HTTPException(status_code=401, detail="Invalid TOTP code")
+
     # Update last_login
     conn.execute(
         "UPDATE users SET last_login = ? WHERE username = ?",
@@ -480,15 +609,48 @@ def login(body: LoginBody, request: Request) -> dict:
     record_audit(conn, body.username, "login.success", ip=client_ip)
     conn.close()
 
-    must_change = bool(row["must_change_password"])
-    token = _create_token(body.username, row["role"], must_change, row["display_name"])
     return {
-        "access_token":          token,
-        "token_type":            "bearer",
+        **_issue_tokens(row),
         "role":                  row["role"],
         "username":              row["username"],
         "display_name":          row["display_name"],
-        "must_change_password":  must_change,
+        "must_change_password":  bool(row["must_change_password"]),
+        "totp_enabled":          bool(row["totp_enabled"]),
+        # 2FA is mandatory for these roles — the frontend must force
+        # enrollment (like must_change_password) before anything else.
+        "totp_enrollment_required": (
+            row["role"] in _TOTP_REQUIRED_ROLES and not row["totp_enabled"]
+        ),
+    }
+
+
+@app.post("/api/auth/refresh")
+def refresh_token(body: RefreshBody) -> dict:
+    """Exchange a refresh token for a fresh access+refresh pair."""
+    try:
+        payload = jwt.decode(body.refresh_token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Not a refresh token")
+
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM users WHERE username = ?", (payload.get("sub", ""),)
+    ).fetchone()
+    conn.close()
+
+    if row is None or not row["is_active"]:
+        raise HTTPException(status_code=401, detail="User not found or deactivated")
+    if payload.get("ver") != int(row["token_version"] or 0):
+        raise HTTPException(status_code=401, detail="Token revoked")
+
+    return {
+        **_issue_tokens(row),
+        "role":                 row["role"],
+        "username":             row["username"],
+        "display_name":         row["display_name"],
+        "must_change_password": bool(row["must_change_password"]),
     }
 
 
@@ -503,6 +665,11 @@ def me(user: dict = Depends(get_current_user)) -> dict:
         "scopes":               sorted(ROLE_SCOPES.get(str(user.get("role", "")), set())),
         "email":                user.get("email", ""),
         "must_change_password": bool(user.get("must_change_password", 0)),
+        "totp_enabled":         bool(user.get("totp_enabled", 0)),
+        "totp_enrollment_required": (
+            str(user.get("role", "")) in _TOTP_REQUIRED_ROLES
+            and not user.get("totp_enabled", 0)
+        ),
         "last_login":           user.get("last_login"),
     }
 
@@ -525,13 +692,92 @@ def change_password(
         raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
 
     conn = _get_db()
+    # Bumping token_version revokes every token issued before this change —
+    # so return a fresh pair for the session doing the changing.
     conn.execute(
-        "UPDATE users SET hashed_password = ?, must_change_password = 0 WHERE id = ?",
+        "UPDATE users SET hashed_password = ?, must_change_password = 0, "
+        "token_version = token_version + 1 WHERE id = ?",
         (_hash_password(body.new_password), user["id"]),
     )
     conn.commit()
+    record_audit(conn, user["username"], "auth.change_password")
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     conn.close()
-    return {"success": True}
+    return {"success": True, **_issue_tokens(row)}
+
+
+# ---------------------------------------------------------------------------
+# TOTP (2FA) — mandatory for admin/ceo, optional for everyone else
+# ---------------------------------------------------------------------------
+
+class TotpEnableBody(BaseModel):
+    code: str
+
+
+class TotpDisableBody(BaseModel):
+    code: str
+    password: str
+
+
+@app.post("/api/auth/totp/setup")
+def totp_setup(user: dict = Depends(get_current_user)) -> dict:
+    """Generate a pending TOTP secret; 2FA activates only after /enable."""
+    if user.get("totp_enabled"):
+        raise HTTPException(status_code=409, detail="TOTP already enabled — disable it first")
+
+    secret = pyotp.random_base32()
+    conn = _get_db()
+    conn.execute(
+        "UPDATE users SET totp_secret = ?, totp_enabled = 0 WHERE id = ?",
+        (secret, user["id"]),
+    )
+    conn.commit()
+    record_audit(conn, user["username"], "totp.setup")
+    conn.close()
+
+    uri = pyotp.totp.TOTP(secret).provisioning_uri(
+        name=user["username"], issuer_name=_TOTP_ISSUER
+    )
+    return {"secret": secret, "otpauth_uri": uri}
+
+
+@app.post("/api/auth/totp/enable")
+def totp_enable(body: TotpEnableBody, user: dict = Depends(get_current_user)) -> dict:
+    if user.get("totp_enabled"):
+        raise HTTPException(status_code=409, detail="TOTP already enabled")
+    if not user.get("totp_secret"):
+        raise HTTPException(status_code=400, detail="Call /api/auth/totp/setup first")
+    if not _verify_totp(user["totp_secret"], body.code):
+        raise HTTPException(status_code=400, detail="Invalid TOTP code")
+
+    conn = _get_db()
+    conn.execute("UPDATE users SET totp_enabled = 1 WHERE id = ?", (user["id"],))
+    conn.commit()
+    record_audit(conn, user["username"], "totp.enable")
+    conn.close()
+    return {"totp_enabled": True}
+
+
+@app.post("/api/auth/totp/disable")
+def totp_disable(body: TotpDisableBody, user: dict = Depends(get_current_user)) -> dict:
+    """Requires both the current password and a valid code — a stolen
+    session alone must not be able to strip 2FA off an account."""
+    if not user.get("totp_enabled"):
+        raise HTTPException(status_code=400, detail="TOTP is not enabled")
+    if not _verify_password(body.password, user["hashed_password"]):
+        raise HTTPException(status_code=400, detail="Password is incorrect")
+    if not _verify_totp(user["totp_secret"], body.code):
+        raise HTTPException(status_code=400, detail="Invalid TOTP code")
+
+    conn = _get_db()
+    conn.execute(
+        "UPDATE users SET totp_enabled = 0, totp_secret = '' WHERE id = ?",
+        (user["id"],),
+    )
+    conn.commit()
+    record_audit(conn, user["username"], "totp.disable")
+    conn.close()
+    return {"totp_enabled": False}
 
 # ---------------------------------------------------------------------------
 # USER MANAGEMENT (admin only)
@@ -640,6 +886,8 @@ def patch_user(
         updates.append("hashed_password = ?")
         params.append(_hash_password(body.temp_password))
         updates.append("must_change_password = 1")
+        # Revoke the user's existing sessions along with the old password.
+        updates.append("token_version = token_version + 1")
 
     if updates:
         params.append(user_id)

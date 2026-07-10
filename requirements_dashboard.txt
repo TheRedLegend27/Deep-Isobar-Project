@@ -4,6 +4,7 @@ pandas
 pyarrow
 python-jose[cryptography]
 bcrypt
+pyotp
 python-dotenv
 PyYAML
 openpyxl
