@@ -498,10 +498,20 @@ def me(user: dict = Depends(get_current_user)) -> dict:
         "username":             user["username"],
         "display_name":         user["display_name"],
         "role":                 user["role"],
+        # The frontend renders navigation from these — the server remains
+        # the source of truth (every endpoint re-checks its own scope).
+        "scopes":               sorted(ROLE_SCOPES.get(str(user.get("role", "")), set())),
         "email":                user.get("email", ""),
         "must_change_password": bool(user.get("must_change_password", 0)),
         "last_login":           user.get("last_login"),
     }
+
+
+@app.get("/api/roles")
+def list_roles(admin: dict = Depends(require_admin)) -> dict:
+    """Role→scope matrix, for the admin user-management screen."""
+    return {"scopes": sorted(SCOPES),
+            "roles": {r: sorted(sc) for r, sc in ROLE_SCOPES.items()}}
 
 
 @app.post("/api/auth/change-password")
@@ -532,6 +542,7 @@ class CreateUserBody(BaseModel):
     display_name: str
     email: str = ""
     temp_password: str
+    role: str = "investor"
 
 
 class PatchUserBody(BaseModel):
@@ -560,6 +571,13 @@ def create_user(body: CreateUserBody, admin: dict = Depends(require_admin)) -> d
         )
     if len(body.temp_password) < 6:
         raise HTTPException(status_code=422, detail="Temp password must be at least 6 characters")
+    # Admin can only be seeded from .env, never minted through the API — a
+    # created admin would be a privilege-escalation path.
+    if body.role not in ROLE_SCOPES or body.role == "admin":
+        raise HTTPException(
+            status_code=422,
+            detail=f"role must be one of {sorted(set(ROLE_SCOPES) - {'admin'})}",
+        )
 
     user_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -569,19 +587,20 @@ def create_user(body: CreateUserBody, admin: dict = Depends(require_admin)) -> d
             """INSERT INTO users
                (id, username, display_name, email, hashed_password, role,
                 is_active, must_change_password, created_at)
-               VALUES (?, ?, ?, ?, ?, 'investor', 1, 1, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?)""",
             (
                 user_id,
                 body.username,
                 body.display_name,
                 body.email,
                 _hash_password(body.temp_password),
+                body.role,
                 now,
             ),
         )
         conn.commit()
         record_audit(conn, admin["username"], "users.create",
-                     detail=f"created {body.username!r} (investor)")
+                     detail=f"created {body.username!r} ({body.role})")
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Username already exists")
@@ -1159,3 +1178,76 @@ def override_trade(
     )
     conn.close()
     return _row_to_dict(df.loc[idx])
+
+
+# ---------------------------------------------------------------------------
+# Dashboard data endpoints (Phase 3) — reuse the scorecard module's own
+# computations so the API and the nightly markdown report never diverge.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/scorecard")
+def scorecard(
+    days: int = Query(default=30, ge=5, le=120),
+    user: dict = Depends(require_scope("calibration")),
+) -> dict[str, Any]:
+    """Structured scorecard: latest settlements, 7d/30d trend, calibration."""
+    from datetime import date as _date
+
+    from deep_isobar.data.city_universe import get_city_universe
+    from deep_isobar.research.daily_scorecard import (
+        load_settled_trades,
+        station_calibration,
+        window_stats,
+    )
+
+    asof = _date.today()
+    trades = load_settled_trades()
+    if trades.empty:
+        latest, latest_day = trades, None
+    else:
+        latest_day = trades["date"].max()
+        latest = trades[trades["date"] == latest_day]
+
+    def _clean(d: dict) -> dict:
+        return {k: (None if isinstance(v, float) and math.isnan(v) else v)
+                for k, v in d.items()}
+
+    calibrations = []
+    for city in (c for c in get_city_universe() if c.active):
+        for metric in ["high"] + (["low"] if city.kalshi_low_series else []):
+            try:
+                cal = station_calibration(city, window_days=days, asof=asof, metric=metric)
+            except Exception:  # noqa: BLE001
+                cal = None
+            if cal is not None:
+                cal.pop("pit_hist", None)  # ndarray — not JSON; sparkline is cosmetic
+                calibrations.append(_clean(cal))
+
+    return {
+        "as_of": str(asof),
+        "latest_settlement_day": str(latest_day) if latest_day is not None else None,
+        "latest_trades": [
+            _clean(r._asdict() if hasattr(r, "_asdict") else dict(r))
+            for _, r in latest.iterrows()
+        ],
+        "stats_7d": _clean(window_stats(trades, 7, asof)),
+        "stats_30d": _clean(window_stats(trades, 30, asof)),
+        "calibration": calibrations,
+    }
+
+
+@app.get("/api/positions")
+def positions(
+    status: str = Query(default="OPEN"),
+    format: str = Query(default="json"),
+    user: dict = Depends(require_scope("trading")),
+):
+    """Current positions by status (default OPEN) — the trading desk view."""
+    df = _load_trades()
+    if status != "ALL":
+        df = df[df["status"] == status]
+    df = df.sort_values("date", ascending=False, kind="stable")
+    if format == "xlsx":
+        return xlsx_response(df, f"positions_{status.lower()}", sheet_name="positions")
+    return {"count": len(df), "positions": [_row_to_dict(r) for _, r in df.iterrows()]}
