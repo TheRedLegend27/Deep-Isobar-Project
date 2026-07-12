@@ -40,9 +40,12 @@ import re
 import urllib.request
 from datetime import date
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
+
+from deep_isobar.core.lst import lst_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +83,8 @@ def fetch_member_daily_maxes(
 
     One Ensemble API request covering all *models*; the daily
     ``temperature_2m_max`` is aggregated by Open-Meteo over the station's
-    local calendar day.
+    fixed-LST settlement day (midnight-midnight Local Standard Time — the
+    NWS CLI window Kalshi settles on; see deep_isobar.core.lst).
 
     Returns:
         ``{ensemble_name: [member maxes in deg F]}`` — control member
@@ -97,7 +101,7 @@ def fetch_member_daily_maxes(
         f"&daily={daily_var}"
         f"&models={om_ids}"
         "&temperature_unit=fahrenheit"
-        f"&timezone={timezone_name.replace('/', '%2F')}"
+        f"&timezone={quote(lst_timezone(timezone_name), safe='')}"
         "&forecast_days=3"
     )
     data = _http_get_json(url)

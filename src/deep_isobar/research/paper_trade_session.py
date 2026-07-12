@@ -50,6 +50,7 @@ import threading
 import time
 import traceback
 import urllib.request
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -60,6 +61,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, etc.
 
 from deep_isobar.calibration.emos import emos_predict, load_params as load_emos_params
+from deep_isobar.core.lst import lst_timezone
 from deep_isobar.core.types import CityProfile, ForecastPoint, TradeSignal
 from deep_isobar.data.city_universe import get_city_universe
 from deep_isobar.data.ensemble_ingest import (
@@ -429,11 +431,13 @@ def _fetch_open_meteo_daily_max(
 ) -> list[ForecastPoint]:
     """Fetch native daily-max temperature for several models in one call.
 
-    Requests Open-Meteo's ``temperature_2m_max`` daily variable aggregated in
-    the city's **local timezone** — i.e. the max over the hourly trace of the
-    settlement day, matching how NWS computes the climate-report high and how
-    the EMOS training data was built.  This replaces the 18z snapshot, which
-    sampled hours before the afternoon peak (the Dallas cold-bias bug).
+    Requests Open-Meteo's ``temperature_2m_max`` daily variable aggregated
+    over the station's **fixed-LST settlement day** (midnight-midnight Local
+    Standard Time — the NWS CLI window Kalshi settles on; during DST that is
+    1 AM-1 AM on the local clock, so the DST-aware local zone is the wrong
+    window ~7 months a year; see deep_isobar.core.lst). This replaces the
+    18z snapshot, which sampled hours before the afternoon peak (the Dallas
+    cold-bias bug).
     """
     station_id = city_profile.station_id
     city_lon = city_lon_360 - 360.0 if city_lon_360 > 180.0 else city_lon_360
@@ -446,7 +450,7 @@ def _fetch_open_meteo_daily_max(
         f"&models={om_ids}"
         "&temperature_unit=fahrenheit"
         "&forecast_days=3"
-        f"&timezone={city_profile.timezone.replace('/', '%2F')}"
+        f"&timezone={quote(lst_timezone(city_profile.timezone), safe='')}"
     )
 
     try:

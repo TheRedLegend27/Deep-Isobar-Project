@@ -34,11 +34,13 @@ import sys
 import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
 
 from deep_isobar.calibration.emos import EMOSParams, fit_emos, save_params
+from deep_isobar.core.lst import lst_timezone
 from deep_isobar.core.types import CityProfile
 from deep_isobar.data.city_universe import get_city_universe
 from deep_isobar.data.ensemble_ingest import (
@@ -103,12 +105,15 @@ def fetch_t1_member_maxes(
         model had no data for that day).
     """
     om_ids = ",".join(EMOS_MODELS.values())
+    # Fixed standard-time zone, NOT the DST-aware local zone: the CLI
+    # settlement day is midnight-midnight LST year-round, so the grouping
+    # below must see LST timestamps (see deep_isobar.core.lst).
     url = (
         f"{_PREVIOUS_RUNS_URL}?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m_previous_day1,temperature_2m_previous_day2"
         f"&models={om_ids}"
         "&temperature_unit=fahrenheit"
-        f"&timezone={timezone_name.replace('/', '%2F')}"
+        f"&timezone={quote(lst_timezone(timezone_name), safe='')}"
         f"&past_days={min(past_days, MAX_PAST_DAYS)}"
         "&forecast_days=1"
     )
