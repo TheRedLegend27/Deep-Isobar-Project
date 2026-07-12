@@ -14,7 +14,8 @@ Pipeline
    NOAA/ACIS using the city's ``acis_station_id`` (from ``config/cities.yaml``).
 4. For each open trade determine the YES outcome by strike type
    (``less``: actual < cap; ``greater``: actual > floor; ``between``:
-   floor <= actual < cap), then WIN/LOSS by direction: BUY wins when YES
+   floor <= actual <= cap, cap INCLUSIVE — Kalshi B82.5 "82-83" pays on
+   82 AND 83), then WIN/LOSS by direction: BUY wins when YES
    settled 1, SELL (short YES) wins when YES settled 0.
 
 5. Compute realized P&L, charging Kalshi's actual taker fee

@@ -109,11 +109,14 @@ def _classify_yes(strike_type: str, floor_strike: float | None,
             return "LOCKED", f"running high {high_f:.0f}F already > floor {floor_strike:.0f}F"
         return "PENDING", f"needs high above {floor_strike:.0f}F"
     if strike_type == "between":
-        if cap_strike is not None and high_f >= cap_strike:
-            return "DEAD", f"running high {high_f:.0f}F already >= cap {cap_strike:.0f}F"
+        # Cap is INCLUSIVE at settlement (B82.5 = "82-83" pays 82 AND 83,
+        # graded floor <= actual <= cap in settle_paper_trades) — only a
+        # high strictly above the cap kills YES.
+        if cap_strike is not None and high_f > cap_strike:
+            return "DEAD", f"running high {high_f:.1f}F already > cap {cap_strike:.0f}F"
         if floor_strike is not None and high_f >= floor_strike:
             return "IN_RANGE", "in range now; overshoot risk until diurnal peak"
-        return "PENDING", f"needs high to reach {floor_strike:.0f}F without hitting {cap_strike:.0f}F"
+        return "PENDING", f"needs high to reach {floor_strike:.0f}F without exceeding {cap_strike:.0f}F"
     return "PENDING", f"unknown strike_type {strike_type!r}"
 
 
