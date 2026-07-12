@@ -72,7 +72,10 @@ def collect_snapshot(history_dir: Path | None = None) -> Path | None:
         if not series:
             continue
         try:
-            contracts = fetch_live_contracts("Kalshi", series_ticker=series)
+            # Never record stub fabrications: raise instead of falling back.
+            contracts = fetch_live_contracts(
+                "Kalshi", series_ticker=series, allow_stub_fallback=False,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s/%s] contract fetch failed: %s", city.city, metric, exc)
             continue
@@ -101,8 +104,10 @@ def collect_snapshot(history_dir: Path | None = None) -> Path | None:
                 "last_trade_price": book.last_trade_price,
                 "bid_size": book.bid_size,
                 "ask_size": book.ask_size,
-                "volume_24h": book.volume_24h,
-                "open_interest": book.open_interest,
+                # The orderbook endpoint doesn't return liquidity fields —
+                # they come from the /markets payload on the contract.
+                "volume_24h": book.volume_24h if book.volume_24h is not None else contract.volume_24h,
+                "open_interest": book.open_interest if book.open_interest is not None else contract.open_interest,
             })
 
     if not rows:

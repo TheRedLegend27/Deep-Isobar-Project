@@ -532,3 +532,58 @@ def test_stub_mode_config_forces_stub_despite_credentials(mock_setting, _):
     result = kc.fetch_live_contracts("Kalshi")
     assert len(result) == 7   # one per stub threshold in the current season
     assert all(c.city == "Chicago" for c in result)
+
+
+# ---------------------------------------------------------------------------
+# Series metadata coverage — every configured city series must resolve
+# ---------------------------------------------------------------------------
+
+
+def test_series_metadata_covers_every_configured_series():
+    """Every kalshi_series / kalshi_low_series in cities.yaml must resolve.
+
+    Regression for 2026-07-12: the hardcoded metadata dict only knew the
+    original 7 series, so every data-only city parsed to 0 contracts and
+    fetch_live_contracts silently fell back to stub — the orderbook
+    collector archived 5 days of fake 48/52 books before anyone noticed.
+    """
+    from deep_isobar.data.city_universe import get_city_universe
+
+    meta = kc._series_metadata()
+    missing = []
+    for profile in get_city_universe():
+        for series in (profile.kalshi_series, profile.kalshi_low_series):
+            if series and series not in meta:
+                missing.append(f"{profile.city}: {series}")
+    assert not missing, f"series with no metadata (would stub-fallback): {missing}"
+
+
+def test_series_metadata_metric_by_series_kind():
+    from deep_isobar.data.city_universe import get_city_universe
+
+    meta = kc._series_metadata()
+    for profile in get_city_universe():
+        if profile.kalshi_series:
+            assert meta[profile.kalshi_series]["metric"] == "high_temp_f"
+        if profile.kalshi_low_series:
+            assert meta[profile.kalshi_low_series]["metric"] == "low_temp_f"
+
+
+def test_fetch_live_contracts_no_stub_fallback_raises_without_creds(monkeypatch):
+    """allow_stub_fallback=False must raise rather than return fabrications."""
+    monkeypatch.setattr(kc, "_load_credentials", lambda: None)
+    monkeypatch.setattr(kc, "_use_stub_mode", lambda: False)
+    with pytest.raises(RuntimeError, match="forbids stub"):
+        kc.fetch_live_contracts("Kalshi", series_ticker="KXHIGHCHI",
+                                allow_stub_fallback=False)
+
+
+def test_fetch_live_contracts_no_stub_fallback_raises_on_zero_parsed(monkeypatch):
+    monkeypatch.setattr(kc, "_use_stub_mode", lambda: False)
+    monkeypatch.setattr(kc, "_load_credentials", lambda: ("key", object()))
+    monkeypatch.setattr(
+        kc, "_fetch_live_contracts_from_api", lambda creds, series_ticker=None: []
+    )
+    with pytest.raises(RuntimeError, match="0 parseable"):
+        kc.fetch_live_contracts("Kalshi", series_ticker="KXNOPE",
+                                allow_stub_fallback=False)

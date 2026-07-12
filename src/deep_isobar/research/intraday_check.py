@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -63,17 +64,28 @@ _LOG_COLUMNS = [
 
 def _fetch_running_high_f(station_id: str, tz_name: str) -> tuple[float | None, int]:
     """Return (max temp °F observed today local time, observation count)."""
-    try:
-        resp = requests.get(
-            _METAR_URL,
-            params={"ids": station_id, "format": "json", "hours": 20},
-            timeout=_TIMEOUT_SECONDS,
-            headers={"User-Agent": "deep-isobar/1.0"},
-        )
-        resp.raise_for_status()
-        obs = resp.json()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[%s] METAR history fetch failed: %s", station_id, exc)
+    # aviationweather.gov read-timeouts intermittently (KNYC 2026-07-11
+    # skipped a whole city's check on one 20s timeout) — retry once.
+    obs = None
+    for attempt in (1, 2):
+        try:
+            resp = requests.get(
+                _METAR_URL,
+                params={"ids": station_id, "format": "json", "hours": 20},
+                timeout=_TIMEOUT_SECONDS,
+                headers={"User-Agent": "deep-isobar/1.0"},
+            )
+            resp.raise_for_status()
+            obs = resp.json()
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] METAR history fetch failed (attempt %d/2): %s",
+                station_id, attempt, exc,
+            )
+            if attempt == 1:
+                time.sleep(5)
+    if obs is None:
         return None, 0
 
     tz = ZoneInfo(tz_name)

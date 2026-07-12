@@ -77,7 +77,7 @@ from deep_isobar.market.kalshi_client import (
     _load_credentials,
     _make_auth_headers,
     _parse_ticker,
-    _SERIES_METADATA,
+    _series_metadata,
     _KALSHI_BASE_URL,
 )
 from deep_isobar.config import get_setting
@@ -273,7 +273,7 @@ def _fetch_settled_contracts(
             parsed = _parse_ticker(ticker)
             if parsed is None:
                 continue
-            if parsed["series"] not in _SERIES_METADATA:
+            if parsed["series"] not in _series_metadata():
                 continue
             td: date = parsed["target_date"]
             if start_date <= td <= end_date:
@@ -461,7 +461,7 @@ def _build_live_market_contract(market: dict[str, Any]) -> dict[str, Any] | None
     if parsed is None:
         return None
 
-    meta = _SERIES_METADATA.get(parsed["series"])
+    meta = _series_metadata().get(parsed["series"])
     if meta is None:
         return None
 

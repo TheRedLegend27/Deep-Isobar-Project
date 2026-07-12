@@ -103,6 +103,42 @@ _SERIES_METADATA: dict[str, dict[str, str]] = {
     "HIGHPHIL":   {"city": "Philadelphia","metric": "high_temp_f", "comparison_operator": "ge", "settlement_source": "NWS"},
 }
 
+_series_metadata_cache: dict[str, dict[str, str]] | None = None
+
+
+def _series_metadata() -> dict[str, dict[str, str]]:
+    """Return series metadata for every configured city, merged over the
+    hardcoded legacy entries.
+
+    Built from ``config/cities.yaml`` (kalshi_series / kalshi_low_series) so
+    onboarding a city automatically teaches this client its series. The
+    hardcoded dict alone silently sent every 2026-07 data-only city into the
+    stub fallback — the collector archived fake 48/52 books for 5 days
+    before anyone noticed.
+    """
+    global _series_metadata_cache
+    if _series_metadata_cache is None:
+        merged = dict(_SERIES_METADATA)
+        # Imported lazily: city_universe has no dependency back on this
+        # module, but keeping module import light avoids config reads at
+        # import time.
+        from deep_isobar.data.city_universe import get_city_universe
+
+        for profile in get_city_universe():
+            source = profile.settlement_source or "NWS"
+            if profile.kalshi_series:
+                merged[profile.kalshi_series] = {
+                    "city": profile.city, "metric": "high_temp_f",
+                    "comparison_operator": "ge", "settlement_source": source,
+                }
+            if profile.kalshi_low_series:
+                merged[profile.kalshi_low_series] = {
+                    "city": profile.city, "metric": "low_temp_f",
+                    "comparison_operator": "le", "settlement_source": source,
+                }
+        _series_metadata_cache = merged
+    return _series_metadata_cache
+
 # Month abbreviation → month number (Kalshi uses 3-letter uppercase abbrevs)
 _MONTH_MAP: dict[str, int] = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
@@ -471,7 +507,7 @@ def _parse_contract(market: dict[str, Any], now_utc: datetime) -> MarketContract
     floor_strike: int | None = int(floor_strike_raw) if floor_strike_raw is not None else None
     cap_strike:   int | None = int(cap_strike_raw)   if cap_strike_raw   is not None else None
 
-    meta = _SERIES_METADATA.get(parsed["series"])
+    meta = _series_metadata().get(parsed["series"])
     if meta is None:
         logger.debug(
             "_parse_contract: unknown series %r — skipping %r", parsed["series"], ticker
@@ -520,7 +556,25 @@ def _parse_contract(market: dict[str, Any], now_utc: datetime) -> MarketContract
         listed_at_utc=listed_at_utc,
         expires_at_utc=expires_at_utc,
         active=active,
+        volume_24h=_parse_fp(market, "volume_24h"),
+        open_interest=_parse_fp(market, "open_interest"),
     )
+
+
+def _parse_fp(market: dict, field: str) -> float | None:
+    """Read a numeric market field across Kalshi API vintages.
+
+    Current payloads use fixed-point strings under ``<field>_fp``
+    (e.g. ``"volume_24h_fp": "1384.18"``); older ones used a plain
+    numeric ``<field>``.
+    """
+    raw = market.get(f"{field}_fp", market.get(field))
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +788,7 @@ def _stub_fetch_live_contracts(series_ticker: str | None = None) -> list[MarketC
     target_date = date.today() + timedelta(days=1)
     thresholds = _stub_thresholds_for_date(target_date)
 
-    meta = _SERIES_METADATA.get(series_ticker.upper() if series_ticker else "") or {}
+    meta = _series_metadata().get(series_ticker.upper() if series_ticker else "") or {}
     city = meta.get("city", "Chicago")
     city_tag = (series_ticker or "CHI").upper()
 
@@ -792,12 +846,17 @@ def _stub_fetch_orderbook(contract_id: str) -> OrderBookSnapshot:
 def fetch_live_contracts(
     market_source: str,
     series_ticker: str | None = None,
+    allow_stub_fallback: bool = True,
 ) -> list[MarketContract]:
     """Return live temperature contracts for the given market source and series.
 
     In **live mode** (credentials present and valid), calls
     ``GET /markets`` filtered to *series_ticker*.
-    Falls back to stub data automatically on any API error.
+    Falls back to stub data automatically on any API error — unless
+    *allow_stub_fallback* is False, in which case failures raise
+    RuntimeError instead. Data-recording callers (orderbook collector)
+    must pass False: a silent stub fallback here archived 5 days of fake
+    48/52 books for every unrecognized series in July 2026.
 
     In **stub mode**, returns 7 deterministic ``high_temp_f >= T`` contracts
     for tomorrow derived from *series_ticker* without any network call.
@@ -828,11 +887,21 @@ def fetch_live_contracts(
         )
 
     if _use_stub_mode():
+        if not allow_stub_fallback:
+            raise RuntimeError(
+                "fetch_live_contracts: stub_mode=true in config but caller "
+                "forbids stub data"
+            )
         logger.info("fetch_live_contracts: stub_mode=true in config — using stub")
         return _stub_fetch_live_contracts(series_ticker)
 
     credentials = _load_credentials()
     if credentials is None:
+        if not allow_stub_fallback:
+            raise RuntimeError(
+                "fetch_live_contracts: no usable credentials and caller "
+                "forbids stub data"
+            )
         logger.info(
             "fetch_live_contracts: no usable credentials found — using stub mode"
         )
@@ -841,20 +910,28 @@ def fetch_live_contracts(
     logger.info("fetch_live_contracts: live mode — calling Kalshi API")
     try:
         contracts = _fetch_live_contracts_from_api(credentials, series_ticker=series_ticker)
-        if not contracts:
-            logger.warning(
-                "fetch_live_contracts: API returned 0 parseable contracts — "
-                "falling back to stub"
-            )
-            return _stub_fetch_live_contracts(series_ticker)
-        return contracts
     except Exception as exc:
+        if not allow_stub_fallback:
+            raise
         logger.warning(
             "fetch_live_contracts: live API call failed (%s: %s) — "
             "falling back to stub",
             type(exc).__name__, exc,
         )
         return _stub_fetch_live_contracts(series_ticker)
+
+    if not contracts:
+        if not allow_stub_fallback:
+            raise RuntimeError(
+                f"fetch_live_contracts: API returned 0 parseable contracts "
+                f"for series {series_ticker!r} and caller forbids stub data"
+            )
+        logger.warning(
+            "fetch_live_contracts: API returned 0 parseable contracts — "
+            "falling back to stub"
+        )
+        return _stub_fetch_live_contracts(series_ticker)
+    return contracts
 
 
 def fetch_market_result(ticker: str) -> str | None:

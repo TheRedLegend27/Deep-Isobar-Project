@@ -47,6 +47,7 @@ import json
 import logging
 import sys
 import threading
+import time
 import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -113,6 +114,14 @@ SIGNAL_THRESHOLD: float = get_setting("risk.alpha_threshold", default=0.25)
 logger.info(f"Signal threshold loaded from config: {SIGNAL_THRESHOLD}")
 POSITION_SIZE = 10.0        # contracts per trade (paper)
 METRIC = "high_temp_f"
+
+# Kalshi lists next-day markets mid-morning at no fixed time (observed
+# ~07:30-10:17 ET; Jul 8-10 2026 the 07:00 sessions found nothing and
+# silently placed no trades). If the target date isn't listed yet, retry
+# before giving up. Total wait must stay inside the supervisor's 1-hour
+# job timeout; cities retry in parallel threads so wall time ≈ one city's.
+_LISTING_RETRIES = 3
+_LISTING_RETRY_WAIT_S = 900  # 15 min between attempts → up to 45 min
 # LEGACY-ONLY floor, applied when a station has no fitted EMOS params and
 # the session falls back to the snapshot + bias-profile pipeline.  Stations
 # with EMOS params use the calibrated sigma (floored at ~1.3 F inside
@@ -822,13 +831,25 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
     try:
         # Use city.kalshi_series to fetch only this city's contracts.
         series = city.kalshi_series or None
-        all_contracts = fetch_live_contracts("Kalshi", series_ticker=series)
-        tomorrow_contracts = [
-            c for c in all_contracts
-            if c.target_date == tomorrow
-            and c.metric == METRIC
-            and c.strike_type in ("less", "greater", "between")
-        ]
+        # Retry while the target date isn't listed yet (skip waits in
+        # dry-run — it's interactive).
+        retries = 0 if dry_run else _LISTING_RETRIES
+        for attempt in range(retries + 1):
+            all_contracts = fetch_live_contracts("Kalshi", series_ticker=series)
+            tomorrow_contracts = [
+                c for c in all_contracts
+                if c.target_date == tomorrow
+                and c.metric == METRIC
+                and c.strike_type in ("less", "greater", "between")
+            ]
+            if tomorrow_contracts or attempt == retries:
+                break
+            logger.info(
+                "[%s] %s not listed yet (attempt %d/%d) — retrying in %d min",
+                city_label, tomorrow, attempt + 1, retries + 1,
+                _LISTING_RETRY_WAIT_S // 60,
+            )
+            time.sleep(_LISTING_RETRY_WAIT_S)
 
         if not tomorrow_contracts:
             logger.warning(

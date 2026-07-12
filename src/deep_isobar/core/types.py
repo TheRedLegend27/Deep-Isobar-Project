@@ -201,6 +201,10 @@ class MarketContract:
     listed_at_utc: Optional[datetime] = None
     expires_at_utc: Optional[datetime] = None
     active: bool = True
+    # Liquidity fields from the /markets payload (the orderbook endpoint
+    # does not return them); None for stub contracts and older callers.
+    volume_24h: Optional[float] = None
+    open_interest: Optional[float] = None
 
 
 # ── Trading & Execution ──────────────────────────────────────────────────
