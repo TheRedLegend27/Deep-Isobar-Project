@@ -258,7 +258,12 @@ def test_build_trade_signal_optional_flags_default():
 
 
 def test_build_trade_signal_optional_flags_set():
-    """Optional flags are forwarded correctly when provided."""
+    """Optional flags are forwarded correctly when provided.
+
+    stale_market_flag is exercised separately — it is a hard filter that
+    forces HOLD and zeroes rank_score, so including it here would mask the
+    explicit rank_score passthrough this test asserts.
+    """
     signal = build_trade_signal(
         timestamp_utc=_TS,
         contract=_make_contract(),
@@ -268,17 +273,36 @@ def test_build_trade_signal_optional_flags_set():
         confidence_score=0.70,
         tail_opportunity_flag=True,
         forecast_shift_flag=True,
-        stale_market_flag=True,
         microstructure_score=0.88,
         rank_score=1.25,
         model_version="v2",
     )
     assert signal.tail_opportunity_flag is True
     assert signal.forecast_shift_flag is True
-    assert signal.stale_market_flag is True
+    assert signal.stale_market_flag is False
     assert signal.microstructure_score == pytest.approx(0.88)
     assert signal.rank_score == pytest.approx(1.25)
     assert signal.model_version == "v2"
+
+
+def test_build_trade_signal_stale_market_forces_hold():
+    """stale_market_flag=True hard-filters: HOLD, rank_score 0, confidence crushed."""
+    signal = build_trade_signal(
+        timestamp_utc=_TS,
+        contract=_make_contract(),
+        model_probability=0.65,
+        market_probability=0.50,
+        signal_threshold=0.10,
+        confidence_score=0.70,
+        stale_market_flag=True,
+        rank_score=1.25,  # explicit rank_score must NOT survive a hard filter
+    )
+    assert signal.stale_market_flag is True
+    assert signal.signal_side == "HOLD"
+    assert signal.rank_score == pytest.approx(0.0)
+    assert signal.confidence_score == pytest.approx(0.70 * 0.15, abs=1e-6)
+    # Raw alpha is never altered by filters.
+    assert signal.alpha == pytest.approx(0.15)
 
 
 def test_build_trade_signal_invalid_model_probability():
@@ -479,7 +503,13 @@ def test_build_trade_signal_explicit_rank_score_preserved():
 
 
 def test_build_trade_signal_rank_score_does_not_alter_alpha():
-    """rank_score computation must never change alpha or signal_side."""
+    """rank_score computation must never change alpha or signal_side.
+
+    Uses non-filtering enhancements only: stale_market_flag is a hard
+    filter that legitimately overrides signal_side to HOLD (alpha itself
+    still never changes — that case is covered by
+    test_build_trade_signal_stale_market_forces_hold).
+    """
     signal = build_trade_signal(
         timestamp_utc=_TS,
         contract=_make_contract(),
@@ -488,7 +518,6 @@ def test_build_trade_signal_rank_score_does_not_alter_alpha():
         signal_threshold=0.10,
         confidence_score=0.80,
         forecast_shift_flag=True,
-        stale_market_flag=True,
         microstructure_score=0.90,
     )
     assert signal.alpha == pytest.approx(0.20)

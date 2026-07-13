@@ -19,7 +19,9 @@ Covers:
 
 import pytest
 from datetime import date, datetime
+from unittest.mock import patch
 
+from deep_isobar.calibration import bias_loader
 from deep_isobar.core.types import CityProfile, ForecastPoint
 from deep_isobar.models.temperature_ensemble import build_temperature_ensemble
 
@@ -77,11 +79,15 @@ def _make_fp(model_name: str, value: float, metric: str = "high_temp_f", target_
 
 
 def test_equal_weighting_methodology():
-    """All None weights → methodology == 'equal_weight_normal'."""
+    """All None weights → methodology == 'equal_weight_decay'.
+
+    Lead-time decay weighting is always on now; the ``_decay`` suffix
+    replaced the pre-decay ``_normal`` naming.
+    """
     profile = _make_profile()
     forecasts = [_make_fp("GFS", 70.0), _make_fp("ECMWF", 74.0)]
     result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
-    assert result.methodology == "equal_weight_normal"
+    assert result.methodology == "equal_weight_decay"
 
 
 def test_equal_weighting_mean():
@@ -98,11 +104,11 @@ def test_equal_weighting_mean():
 
 
 def test_weighted_methodology():
-    """Profile weights set → methodology == 'weighted_normal'."""
+    """Profile weights set → methodology == 'weighted_decay'."""
     profile = _make_profile(model_weight_gfs=0.6, model_weight_ecmwf=0.4)
     forecasts = [_make_fp("GFS", 70.0), _make_fp("ECMWF", 80.0)]
     result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
-    assert result.methodology == "weighted_normal"
+    assert result.methodology == "weighted_decay"
 
 
 def test_weighted_mean():
@@ -126,7 +132,7 @@ def test_unknown_model_fallback_weight():
     result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
     expected_mean = (1 / 3) * 60.0 + (2 / 3) * 90.0
     assert result.ensemble_mean_f == pytest.approx(expected_mean)
-    assert result.methodology == "weighted_normal"
+    assert result.methodology == "weighted_decay"
 
 
 # ---------------------------------------------------------------------------
@@ -134,28 +140,37 @@ def test_unknown_model_fallback_weight():
 # ---------------------------------------------------------------------------
 
 
-def test_mean_bias_correction_applied():
-    """bias_corrected_mean_f includes mean_bias_correction_f."""
-    profile = _make_profile(mean_bias_correction_f=2.5)
+def test_dynamic_mean_bias_applied():
+    """bias_corrected_mean_f includes the bias_loader's dynamic mean bias.
+
+    Mean bias now comes from the per-station monthly profiles via
+    ``bias_loader.get_current_bias``; the static
+    ``CityProfile.mean_bias_correction_f`` is legacy and no longer applied
+    by the ensemble.
+    """
+    profile = _make_profile(mean_bias_correction_f=2.5)  # legacy — must be ignored
     forecasts = [_make_fp("GFS", 70.0)]
-    result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
-    assert result.bias_corrected_mean_f == pytest.approx(70.0 + 2.5)
+    with patch.object(bias_loader, "get_current_bias", return_value=(1.7, 1.0)):
+        result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
+    assert result.bias_corrected_mean_f == pytest.approx(70.0 + 1.7)
 
 
 def test_heat_bias_applied_for_high_temp():
     """heat_bias_adjustment_f is added for metric='high_temp_f'."""
-    profile = _make_profile(mean_bias_correction_f=1.0, heat_bias_adjustment_f=0.8)
+    profile = _make_profile(heat_bias_adjustment_f=0.8)
     forecasts = [_make_fp("GFS", 70.0, metric="high_temp_f")]
-    result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
-    assert result.bias_corrected_mean_f == pytest.approx(70.0 + 1.0 + 0.8)
+    with patch.object(bias_loader, "get_current_bias", return_value=(0.0, 1.0)):
+        result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
+    assert result.bias_corrected_mean_f == pytest.approx(70.0 + 0.8)
 
 
 def test_cold_bias_applied_for_low_temp():
     """cold_bias_adjustment_f is added for metric='low_temp_f'."""
-    profile = _make_profile(mean_bias_correction_f=1.0, cold_bias_adjustment_f=-0.5)
+    profile = _make_profile(cold_bias_adjustment_f=-0.5)
     forecasts = [_make_fp("GFS", 50.0, metric="low_temp_f")]
-    result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "low_temp_f", RUN_TIME)
-    assert result.bias_corrected_mean_f == pytest.approx(50.0 + 1.0 + (-0.5))
+    with patch.object(bias_loader, "get_current_bias", return_value=(0.0, 1.0)):
+        result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "low_temp_f", RUN_TIME)
+    assert result.bias_corrected_mean_f == pytest.approx(50.0 + (-0.5))
 
 
 def test_heat_bias_not_applied_for_low_temp():
@@ -171,19 +186,25 @@ def test_heat_bias_not_applied_for_low_temp():
 # ---------------------------------------------------------------------------
 
 
-def test_adjusted_std_equals_std_times_multiplier():
-    """adjusted_std_f == ensemble_std_f * variance_multiplier."""
-    profile = _make_profile(variance_multiplier=1.4)
+def test_adjusted_std_uses_dynamic_multiplier():
+    """adjusted_std_f == ensemble_std_f * the bias_loader's dynamic multiplier.
+
+    The static ``CityProfile.variance_multiplier`` is legacy — the ensemble
+    now sources the multiplier from the monthly bias profiles.
+    """
+    profile = _make_profile(variance_multiplier=9.9)  # legacy — must be ignored
     forecasts = [_make_fp("GFS", 70.0), _make_fp("ECMWF", 76.0)]
-    result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
+    with patch.object(bias_loader, "get_current_bias", return_value=(0.0, 1.4)):
+        result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
     assert result.adjusted_std_f == pytest.approx(result.ensemble_std_f * 1.4)
 
 
 def test_variance_multiplier_stored():
-    """variance_multiplier field echoes city_profile.variance_multiplier."""
-    profile = _make_profile(variance_multiplier=1.2)
+    """variance_multiplier field echoes the dynamic multiplier used."""
+    profile = _make_profile()
     forecasts = [_make_fp("GFS", 70.0)]
-    result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
+    with patch.object(bias_loader, "get_current_bias", return_value=(0.0, 1.2)):
+        result = build_temperature_ensemble(profile, forecasts, TARGET_DATE, "high_temp_f", RUN_TIME)
     assert result.variance_multiplier == 1.2
 
 

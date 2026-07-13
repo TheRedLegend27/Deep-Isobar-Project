@@ -195,11 +195,21 @@ class TestComputeStalenessSeconds:
         assert compute_staleness_seconds(snap, _NOW) == pytest.approx(3600.0)
 
     def test_negative_staleness_raises(self):
-        """now_utc earlier than snapshot → ValueError."""
+        """now_utc more than 5s before the snapshot → ValueError.
+
+        Up to 5s of negative delta is tolerated as clock skew between the
+        local machine and the exchange timestamp; beyond that it's a bug.
+        """
         snap = _snap(timestamp_utc=_NOW)
-        earlier = _NOW - timedelta(seconds=1)
+        earlier = _NOW - timedelta(seconds=10)
         with pytest.raises(ValueError, match="earlier"):
             compute_staleness_seconds(snap, earlier)
+
+    def test_subsecond_clock_skew_treated_as_fresh(self):
+        """Small negative delta (clock skew ≤5s) clamps to 0.0, no raise."""
+        snap = _snap(timestamp_utc=_NOW)
+        earlier = _NOW - timedelta(seconds=1)
+        assert compute_staleness_seconds(snap, earlier) == pytest.approx(0.0)
 
     def test_mismatched_timezone_aware_naive_raises(self):
         """Mixing tz-aware and naive datetimes raises ValueError."""
@@ -322,10 +332,10 @@ class TestComputeMicrostructureScore:
         assert score == pytest.approx((0.80 + 0.90 + 0.0) / 3.0, abs=1e-6)
 
     def test_now_earlier_than_snapshot_raises(self):
-        """now_utc before snapshot.timestamp_utc raises ValueError."""
+        """now_utc >5s before snapshot.timestamp_utc raises (skew tolerance)."""
         snap = _snap(timestamp_utc=_NOW)
         with pytest.raises(ValueError):
-            compute_microstructure_score(snap, _NOW - timedelta(seconds=1))
+            compute_microstructure_score(snap, _NOW - timedelta(seconds=10))
 
     def test_crossed_book_raises_not_silently_swallowed(self):
         """Crossed book (bid > ask) propagates ValueError rather than being masked."""

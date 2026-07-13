@@ -91,7 +91,7 @@ def _make_signal(
 def test_evaluate_returns_trade_signal():
     """Returns a TradeSignal instance."""
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=55.0, ask=57.0)
+    ob = _make_orderbook(bid=0.55, ask=0.57)
     result = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -104,10 +104,10 @@ def test_evaluate_returns_trade_signal():
 
 def test_evaluate_buy_signal():
     """Model probability >> market probability → BUY."""
-    # market mid = (40+42)/2 = 41 cents → 0.41
+    # market mid = (0.40+0.42)/2 = 0.41 (dollar-decimal prices, as live)
     # model = 0.70 → alpha = 0.29 > threshold 0.10 → BUY
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -123,10 +123,10 @@ def test_evaluate_buy_signal():
 
 def test_evaluate_sell_signal():
     """Model probability << market probability → SELL."""
-    # market mid = (72+74)/2 = 73 cents → 0.73
+    # market mid = (0.72+0.74)/2 = 0.73
     # model = 0.45 → alpha = -0.28 < -0.10 → SELL
     surface = {80: 0.45}
-    ob = _make_orderbook(bid=72.0, ask=74.0)
+    ob = _make_orderbook(bid=0.72, ask=0.74)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -140,10 +140,10 @@ def test_evaluate_sell_signal():
 
 def test_evaluate_hold_signal():
     """Probabilities close together → HOLD."""
-    # market mid = (59+61)/2 = 60 cents → 0.60
+    # market mid = (0.59+0.61)/2 = 0.60
     # model = 0.62 → alpha = 0.02 < 0.10 → HOLD
     surface = {80: 0.62}
-    ob = _make_orderbook(bid=59.0, ask=61.0)
+    ob = _make_orderbook(bid=0.59, ask=0.61)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -157,7 +157,7 @@ def test_evaluate_hold_signal():
 def test_evaluate_confidence_score_equals_abs_alpha():
     """confidence_score is set to abs(alpha) for the MVP."""
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -178,7 +178,7 @@ def test_evaluate_contract_fields_propagated():
         comparison_operator="ge",
     )
     surface = {85: 0.65}
-    ob = _make_orderbook(bid=50.0, ask=52.0, contract_id="CHI_HIGH_TEMP_F_GE_85_20260320")
+    ob = _make_orderbook(bid=0.50, ask=0.52, contract_id="CHI_HIGH_TEMP_F_GE_85_20260320")
     signal = evaluate_contract_opportunity(
         contract=contract,
         probability_surface=surface,
@@ -207,7 +207,7 @@ def test_evaluate_timestamp_defaults_to_now(monkeypatch):
     monkeypatch.setattr(scanner_mod, "datetime", _FakeDatetime)
 
     surface = {80: 0.65}
-    ob = _make_orderbook(bid=50.0, ask=52.0)
+    ob = _make_orderbook(bid=0.50, ask=0.52)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -242,7 +242,7 @@ def test_evaluate_decimal_priced_orderbook():
 def test_evaluate_raises_key_error_on_missing_threshold():
     """KeyError when contract.threshold_f is absent from probability_surface."""
     surface = {75: 0.70, 85: 0.40}   # 80 is missing
-    ob = _make_orderbook(bid=55.0, ask=57.0)
+    ob = _make_orderbook(bid=0.55, ask=0.57)
     with pytest.raises(KeyError, match="80"):
         evaluate_contract_opportunity(
             contract=_make_contract(80),
@@ -277,7 +277,7 @@ def test_evaluate_raises_on_no_usable_price():
 def test_evaluate_raises_on_invalid_signal_threshold():
     """ValueError when signal_threshold <= 0."""
     surface = {80: 0.65}
-    ob = _make_orderbook(bid=55.0, ask=57.0)
+    ob = _make_orderbook(bid=0.55, ask=0.57)
     with pytest.raises(ValueError, match="threshold"):
         evaluate_contract_opportunity(
             contract=_make_contract(80),
@@ -426,7 +426,7 @@ def test_rank_deterministic_regardless_of_input_order():
 def test_evaluate_produces_rank_score():
     """evaluate_contract_opportunity returns a signal with a non-None rank_score."""
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -441,7 +441,7 @@ def test_evaluate_produces_rank_score():
 def test_evaluate_rank_score_equals_abs_alpha_with_no_flags():
     """Without feature flags, rank_score == abs(alpha) (no bonuses applied)."""
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -457,14 +457,14 @@ def test_evaluate_rank_score_equals_abs_alpha_with_no_flags():
 # evaluate_contract_opportunity — enhancement flag pass-through
 # ---------------------------------------------------------------------------
 # Shared setup for all enhancement tests:
-#   model_probability = 0.70, market mid = (40+42)/2 = 41¢ → 0.41
+#   model_probability = 0.70, market mid = (0.40+0.42)/2 = 0.41
 #   alpha = 0.29, abs_alpha = 0.29
 
 
 def test_evaluate_passes_forecast_shift_flag():
     """forecast_shift_flag=True is stored on the signal and adds shift_bonus to rank_score."""
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -479,9 +479,14 @@ def test_evaluate_passes_forecast_shift_flag():
 
 
 def test_evaluate_passes_stale_market_flag():
-    """stale_market_flag=True is stored on the signal and adds lag_bonus to rank_score."""
+    """stale_market_flag=True is a HARD FILTER: forced HOLD, rank_score 0.
+
+    A stale market price can't be trusted as a fill price, so the signal
+    must never compete with live opportunities (semantics since the
+    enhancement hard filters landed; the old +0.05 lag bonus is gone).
+    """
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -491,14 +496,18 @@ def test_evaluate_passes_stale_market_flag():
         stale_market_flag=True,
     )
     assert signal.stale_market_flag is True
-    # abs(alpha)=0.29 + lag_bonus=0.05 → 0.34
-    assert signal.rank_score == pytest.approx(0.34, abs=1e-6)
+    assert signal.signal_side == "HOLD"
+    assert signal.rank_score == pytest.approx(0.0)
+    # Confidence is crushed by the stale factor: 0.29 * 0.15
+    assert signal.confidence_score == pytest.approx(0.29 * 0.15, abs=1e-6)
+    # Raw alpha itself is never altered by filters.
+    assert signal.alpha == pytest.approx(0.29, abs=1e-6)
 
 
 def test_evaluate_passes_microstructure_score():
     """microstructure_score is stored on the signal and contributes to rank_score."""
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -519,7 +528,7 @@ def test_evaluate_tail_flag_boosts_rank_score():
     rank_score = max(0.29, 0.435) = 0.435
     """
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -536,7 +545,7 @@ def test_evaluate_tail_flag_boosts_rank_score():
 def test_evaluate_tail_does_not_alter_alpha():
     """Tail boost must not change alpha, absolute_alpha, or signal_side."""
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -552,18 +561,20 @@ def test_evaluate_tail_does_not_alter_alpha():
 
 
 def test_evaluate_all_enhancement_flags_combined():
-    """All enhancement flags active: rank_score accumulates all bonuses.
+    """All non-filtering enhancements active: rank_score accumulates bonuses.
+
+    stale_market_flag is deliberately absent — it is a hard filter that
+    zeroes rank_score (covered by test_evaluate_passes_stale_market_flag).
 
     alpha=0.29, tail_multiplier=1.5:
       tail_rank_score = 0.29 * 1.5 = 0.435
       base            = max(0.29, 0.435) = 0.435
       + shift_bonus   = 0.05
-      + lag_bonus     = 0.05
       + micro_score*w = 0.80 * 0.10 = 0.08
-      rank_score      = 0.615
+      rank_score      = 0.565
     """
     surface = {80: 0.70}
-    ob = _make_orderbook(bid=40.0, ask=42.0)
+    ob = _make_orderbook(bid=0.40, ask=0.42)
     signal = evaluate_contract_opportunity(
         contract=_make_contract(80),
         probability_surface=surface,
@@ -571,18 +582,31 @@ def test_evaluate_all_enhancement_flags_combined():
         signal_threshold=_THRESHOLD,
         timestamp_utc=_TS,
         forecast_shift_flag=True,
-        stale_market_flag=True,
         microstructure_score=0.80,
         tail_opportunity_flag=True,
         tail_multiplier=1.5,
     )
     assert signal.forecast_shift_flag is True
-    assert signal.stale_market_flag is True
     assert signal.microstructure_score == pytest.approx(0.80)
     assert signal.tail_opportunity_flag is True
-    assert signal.rank_score == pytest.approx(0.615, abs=1e-6)
+    assert signal.rank_score == pytest.approx(0.565, abs=1e-6)
     # Raw alpha unchanged
     assert signal.alpha == pytest.approx(0.29, abs=1e-6)
+
+
+def test_evaluate_wide_spread_forces_hold():
+    """spread > 0.40 is a hard filter: HOLD + rank_score 0 (fill cost eats edge)."""
+    surface = {80: 0.70}
+    ob = _make_orderbook(bid=0.10, ask=0.60)  # 50-cent spread
+    signal = evaluate_contract_opportunity(
+        contract=_make_contract(80),
+        probability_surface=surface,
+        orderbook=ob,
+        signal_threshold=_THRESHOLD,
+        timestamp_utc=_TS,
+    )
+    assert signal.signal_side == "HOLD"
+    assert signal.rank_score == pytest.approx(0.0)
 
 
 # ── probability-surface keying (2026-07-04 collision bug) ────────────────────

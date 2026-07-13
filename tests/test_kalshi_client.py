@@ -54,14 +54,27 @@ def _make_market_dict(
     title: str = "Chicago High Temp",
     created_time: str | None = "2026-03-15T00:00:00Z",
     latest_expiration_time: str | None = "2026-03-18T23:00:00Z",
+    strike_type: str = "between",
+    floor_strike: int | None = 51,
+    cap_strike: int | None = 52,
 ) -> dict:
-    """Build a minimal Kalshi v2 market API dict."""
+    """Build a minimal Kalshi v2 market API dict.
+
+    ``strike_type``/``floor_strike``/``cap_strike`` are MANDATORY in real
+    payloads and ``_parse_contract`` rejects markets without them (the
+    2026-07-12 validation hardening) — the defaults model the B51.5
+    "51-52°" bracket.  T-ticker tests must pass explicit values: the
+    ticker letter does NOT determine direction (2026-07-05 lesson).
+    """
     return {
         "ticker": ticker,
         "status": status,
         "rules_primary": title,
         "created_time": created_time,
         "latest_expiration_time": latest_expiration_time,
+        "strike_type": strike_type,
+        "floor_strike": floor_strike,
+        "cap_strike": cap_strike,
         "yes_bid_dollars": "0.1500",
         "yes_ask_dollars": "0.1800",
         "last_price_dollars": "0.1600",
@@ -174,12 +187,27 @@ def test_parse_contract_kx_series_fields():
     contract = kc._parse_contract(_make_market_dict("KXHIGHCHI-26MAR18-B51.5"), _NOW)
     assert contract.city == "Chicago"
     assert contract.metric == "high_temp_f"
-    assert contract.comparison_operator == "ge"
+    # Brackets carry strike_type verbatim; "ge" was the pre-strike_type legacy.
+    assert contract.comparison_operator == "between"
+    assert contract.strike_type == "between"
+    assert contract.floor_strike == 51
+    assert contract.cap_strike == 52
     assert contract.threshold_f == 52
     assert contract.target_date == date(2026, 3, 18)
     assert contract.settlement_source == "NWS"
     assert contract.market_source == "Kalshi"
     assert contract.contract_id == "KXHIGHCHI-26MAR18-B51.5"
+
+
+def test_parse_contract_missing_strike_type_returns_none():
+    """A market without strike_type must be rejected, never guessed.
+
+    Guessing direction from the ticker mis-sided T-contracts (2026-07-05);
+    the parser now requires the API's strike_type outright.
+    """
+    market = _make_market_dict()
+    del market["strike_type"]
+    assert kc._parse_contract(market, _NOW) is None
 
 
 def test_parse_contract_unknown_series_returns_none():
@@ -391,7 +419,7 @@ def test_fetch_live_contracts_stub_chicago_high_temp_fields(_):
     for c in kc.fetch_live_contracts("Kalshi"):
         assert c.city == "Chicago"
         assert c.metric == "high_temp_f"
-        assert c.comparison_operator == "ge"
+        assert c.comparison_operator == "gt"   # stubs are "greater" tails
         assert c.market_source == "Kalshi"
         assert isinstance(c.threshold_f, int)
         assert isinstance(c.target_date, date)
@@ -434,8 +462,8 @@ def test_fetch_orderbook_wrong_source_raises():
 def test_fetch_live_contracts_live_parses_api_response(mock_get, _):
     mock_get.return_value = {
         "markets": [
-            _make_market_dict("KXHIGHCHI-26MAR18-B90"),
-            _make_market_dict("KXHIGHCHI-26MAR18-B75"),
+            _make_market_dict("KXHIGHCHI-26MAR18-B90", floor_strike=89, cap_strike=90),
+            _make_market_dict("KXHIGHCHI-26MAR18-B75", floor_strike=74, cap_strike=75),
         ],
         "cursor": None,
     }
@@ -452,8 +480,12 @@ def test_fetch_live_contracts_parses_t_format_tickers(mock_get, _):
     """T-prefix edge-bracket tickers (e.g. KXHIGHCHI-26MAR17-T30) are parsed."""
     mock_get.return_value = {
         "markets": [
-            _make_market_dict("KXHIGHCHI-26MAR17-T30"),
-            _make_market_dict("KXHIGHCHI-26MAR17-B27.5"),
+            # Low-edge tail: "29° or below" — direction comes from the API's
+            # strike_type, never from the T-prefix.
+            _make_market_dict("KXHIGHCHI-26MAR17-T30",
+                              strike_type="less", floor_strike=None, cap_strike=30),
+            _make_market_dict("KXHIGHCHI-26MAR17-B27.5",
+                              floor_strike=27, cap_strike=28),
         ],
         "cursor": None,
     }

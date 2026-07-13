@@ -36,6 +36,8 @@ _FULL_CITY: dict = {
     "city": "FullCity",
     "city_code": "FUL",
     "station_id": "KFUL",
+    "variance_multiplier": 1.3,
+    "kde_bandwidth": 1.5,
     "tail_multiplier": 1.15,
     "model_weight_gfs": 0.4,
     "model_weight_ecmwf": 0.4,
@@ -245,9 +247,13 @@ class TestGetCityProfile:
             get_city_profile("testcity", config_dir=str(config_dir))
 
     def test_real_config_chicago(self) -> None:
-        """Smoke test against the actual project config."""
+        """Smoke test against the actual project config.
+
+        Kalshi settles Chicago on Midway (KMDW), not O'Hare — this pins the
+        settlement-correct station so a config regression to KORD screams.
+        """
         p = get_city_profile("Chicago")
-        assert p.station_id == "KORD"
+        assert p.station_id == "KMDW"
         assert p.city_code == "CHI"
 
     def test_preserves_model_weights(self) -> None:
@@ -257,16 +263,20 @@ class TestGetCityProfile:
         assert p.model_weight_ecmwf is not None
         assert p.model_weight_nam is not None
 
-    def test_preserves_variance_multiplier(self) -> None:
-        p = get_city_profile("Denver")
+    # Round-trip preservation is asserted against the fixture config, not the
+    # real cities.yaml — real values change on every recalibration, and these
+    # tests broke exactly that way when Denver was recalibrated.
+
+    def test_preserves_variance_multiplier(self, full_config_dir: Path) -> None:
+        p = get_city_profile("FullCity", config_dir=str(full_config_dir))
         assert p.variance_multiplier == 1.3
 
-    def test_preserves_kde_bandwidth(self) -> None:
-        p = get_city_profile("Denver")
+    def test_preserves_kde_bandwidth(self, full_config_dir: Path) -> None:
+        p = get_city_profile("FullCity", config_dir=str(full_config_dir))
         assert p.kde_bandwidth == 1.5
 
-    def test_preserves_tail_multiplier(self) -> None:
-        p = get_city_profile("Denver")
+    def test_preserves_tail_multiplier(self, full_config_dir: Path) -> None:
+        p = get_city_profile("FullCity", config_dir=str(full_config_dir))
         assert p.tail_multiplier == 1.15
 
 
