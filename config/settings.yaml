@@ -31,6 +31,13 @@ scheduler:
     - name: paper_trade_session
       module: deep_isobar.research.paper_trade_session
       at: "10:30"
+    # Ops health invariants — screams (red embed + nonzero exit → supervisor
+    # failure embed) the day the system starts failing silently: dead
+    # session, unsettled positions >48h, silent/stub-shaped collector,
+    # stale params, missing scorecards.  Also rendered atop the scorecard.
+    - name: ops_health
+      module: deep_isobar.ops.health
+      at: "11:15"
     - name: intraday_check
       module: deep_isobar.research.intraday_check
       at: "14:00"

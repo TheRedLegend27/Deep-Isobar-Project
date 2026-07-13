@@ -53,6 +53,11 @@ from deep_isobar.notifications.discord_notifier import (
     COLOR_RED,
     post_embed,
 )
+from deep_isobar.ops.health import (
+    post_alarm_embed,
+    render_health_section,
+    run_health_checks,
+)
 from deep_isobar.research.forecast_evaluation import (
     modal_bucket_prob,
     pit_histogram,
@@ -264,8 +269,13 @@ def render_markdown(
     stats7: dict,
     stats30: dict,
     calibrations: list[dict],
+    health_section: str = "",
 ) -> str:
     lines: list[str] = [f"# Deep Isobar scorecard — {asof}", ""]
+
+    # ── 0. Ops health — alarms live above everything they protect ────────
+    if health_section:
+        lines.append(health_section)
 
     # ── 1. Latest settlements ────────────────────────────────────────────
     lines.append(f"## Settled trades ({latest_day or 'none yet'})")
@@ -460,7 +470,11 @@ def main(argv: list[str] | None = None) -> int:
             if cal is not None:
                 calibrations.append(cal)
 
-    report = render_markdown(asof, latest, latest_day, stats7, stats30, calibrations)
+    health_checks = run_health_checks()
+    report = render_markdown(
+        asof, latest, latest_day, stats7, stats30, calibrations,
+        health_section=render_health_section(health_checks),
+    )
     print(report)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -473,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
             latest, latest_day, stats7, stats30, calibrations
         )
         post_embed(title, description, color, fields)
+        post_alarm_embed(health_checks)
 
     return 0
 
