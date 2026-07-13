@@ -128,6 +128,50 @@ def _fetch_noaa_actual(city_name: str, settle_date: date) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Settlement rule
+# ---------------------------------------------------------------------------
+
+
+def realized_yes_outcome(
+    strike_type: str,
+    floor_strike: int | None,
+    cap_strike: int | None,
+    settled_temp: float,
+) -> int:
+    """Kalshi YES outcome (1/0) for a contract given the settled temperature.
+
+    The single source of truth for the exchange's settlement conventions
+    (verified against live API titles and official results 2026-07-05):
+
+    - ``less``    : YES iff ``settled_temp <  cap_strike``
+    - ``greater`` : YES iff ``settled_temp >  floor_strike``
+    - ``between`` : YES iff ``floor_strike <= settled_temp <= cap_strike``
+      (cap INCLUSIVE — B82.5 = "82-83°" pays on 82 AND 83)
+
+    Mirrors :func:`~deep_isobar.models.probability_engine.probability_for_contract`
+    exactly; the golden-fixture suite asserts the two never diverge.
+
+    Raises:
+        ValueError: On an unknown strike_type or a missing required strike —
+            grading must never guess (T-tickers are "less" OR "greater").
+    """
+    st = (strike_type or "").lower().strip()
+    if st == "less":
+        if cap_strike is None:
+            raise ValueError("less contract requires cap_strike")
+        return 1 if settled_temp < cap_strike else 0
+    if st == "greater":
+        if floor_strike is None:
+            raise ValueError("greater contract requires floor_strike")
+        return 1 if settled_temp > floor_strike else 0
+    if st == "between":
+        if floor_strike is None or cap_strike is None:
+            raise ValueError("between contract requires floor_strike and cap_strike")
+        return 1 if floor_strike <= settled_temp <= cap_strike else 0
+    raise ValueError(f"unknown strike_type {strike_type!r}")
+
+
+# ---------------------------------------------------------------------------
 # P&L calculation
 # ---------------------------------------------------------------------------
 
@@ -252,38 +296,28 @@ def _settle_open_trades(
         floor_strike = _parse_optional_int(row.get("floor_strike"))
         cap_strike   = _parse_optional_int(row.get("cap_strike"))
 
-        if strike_type == "less":
-            if cap_strike is None:
-                cap_strike = int(float(row["threshold_f"]))
-                logger.warning(
-                    "settle: missing cap_strike for %r — using threshold_f=%s",
-                    row.get("contract_ticker"), cap_strike,
-                )
-            realized_outcome = 1 if settled_temp < cap_strike else 0
-        elif strike_type == "greater":
-            if floor_strike is None:
-                floor_strike = int(float(row["threshold_f"]))
-                logger.warning(
-                    "settle: missing floor_strike for %r — using threshold_f=%s",
-                    row.get("contract_ticker"), floor_strike,
-                )
-            realized_outcome = 1 if settled_temp > floor_strike else 0
-        elif strike_type == "between":
-            # CAP INCLUSIVE — Kalshi's B82.5 = "82-83°" pays on 82 AND 83
-            # (verified against live API titles 2026-07-05).  Matches the
-            # corrected probability_for_contract convention.
-            if floor_strike is None or cap_strike is None:
-                logger.warning(
-                    "settle: between contract %r missing floor/cap strike "
-                    "(%r/%r) — skipping.",
-                    row.get("contract_ticker"), floor_strike, cap_strike,
-                )
-                continue
-            realized_outcome = 1 if floor_strike <= settled_temp <= cap_strike else 0
-        else:
+        # Legacy rows may lack tail strikes — threshold_f carried the value.
+        if strike_type == "less" and cap_strike is None:
+            cap_strike = int(float(row["threshold_f"]))
             logger.warning(
-                "settle: unexpected strike_type %r for %r — skipping.",
-                strike_type, row.get("contract_ticker"),
+                "settle: missing cap_strike for %r — using threshold_f=%s",
+                row.get("contract_ticker"), cap_strike,
+            )
+        elif strike_type == "greater" and floor_strike is None:
+            floor_strike = int(float(row["threshold_f"]))
+            logger.warning(
+                "settle: missing floor_strike for %r — using threshold_f=%s",
+                row.get("contract_ticker"), floor_strike,
+            )
+
+        try:
+            realized_outcome = realized_yes_outcome(
+                strike_type, floor_strike, cap_strike, settled_temp
+            )
+        except ValueError as exc:
+            logger.warning(
+                "settle: cannot grade %r (%s) — skipping.",
+                row.get("contract_ticker"), exc,
             )
             continue
 
