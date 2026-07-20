@@ -22,6 +22,16 @@ Checks (config under ``risk.preflight``):
    ``max_sigma_f``] indicates a broken variance input.
 6. **contract_count** — fewer than ``min_contracts`` live contracts means
    the market isn't really open for that day.
+7. **smoke_gate** — wildfire smoke over the station.  Motivated by the
+   2026-07-14..17 slump: Canadian smoke attenuated insolation and actual
+   highs came in 5–10°F below ALL guidance (GFS/ECMWF don't couple wildfire
+   aerosols; NBM missed identically) — the model has no edge under smoke,
+   so stand down.  Detection is free from METARs we already consume: any
+   ``FU`` (smoke) present-weather code, or ``HZ`` (haze) with visibility at
+   or below ``smoke_max_vis_mi``, in the last ``smoke_lookback_hours`` hours
+   blocks the city; haze with good visibility only warns.  The session runs
+   ~10:30 for tomorrow's market — current smoke is a persistence proxy
+   (smoke episodes last days), not a forecast.
 
 Usage::
 
@@ -51,7 +61,59 @@ _DEFAULTS = {
     "min_sigma_f": 0.5,
     "max_sigma_f": 15.0,
     "min_contracts": 3,
+    "smoke_gate": True,
+    "smoke_lookback_hours": 6,
+    "smoke_max_vis_mi": 6.0,
 }
+
+
+@dataclass
+class SmokeReport:
+    """Summary of recent METAR present-weather at a station, for the smoke gate."""
+
+    n_obs: int
+    n_smoke: int          # observations reporting FU
+    n_haze_low_vis: int   # observations reporting HZ at/below the vis threshold
+    n_haze: int           # observations reporting HZ at any visibility
+    min_vis_mi: float | None
+
+
+def smoke_report(station_id: str) -> SmokeReport | None:
+    """Best-effort METAR sweep for the smoke gate; None when gate is off or fetch fails.
+
+    Called by the session (like :func:`training_history_bounds`) so
+    :func:`run_preflight` itself stays network-free and testable.
+    """
+    if not bool(_cfg("smoke_gate")):
+        return None
+    try:
+        from deep_isobar.anomaly.metar_fetcher import fetch_metars, parse_metar_fields
+
+        hours = int(_cfg("smoke_lookback_hours"))
+        vis_threshold = float(_cfg("smoke_max_vis_mi"))
+        raw = fetch_metars(station_id, hours=hours)
+        if not raw:
+            return None
+        n_smoke = n_haze = n_haze_low_vis = 0
+        min_vis: float | None = None
+        for metar in raw:
+            fields = parse_metar_fields(metar)
+            vis = fields["visibility_mi"]
+            min_vis = vis if min_vis is None else min(min_vis, vis)
+            codes = fields["wx_codes"]
+            if "FU" in codes:
+                n_smoke += 1
+            if "HZ" in codes:
+                n_haze += 1
+                if vis <= vis_threshold:
+                    n_haze_low_vis += 1
+        return SmokeReport(
+            n_obs=len(raw), n_smoke=n_smoke,
+            n_haze_low_vis=n_haze_low_vis, n_haze=n_haze, min_vis_mi=min_vis,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("could not build smoke report for %s", station_id)
+        return None
 
 
 @dataclass
@@ -88,6 +150,7 @@ def run_preflight(
     market_is_live: bool,
     hist_min_f: float | None = None,
     hist_max_f: float | None = None,
+    smoke: SmokeReport | None = None,
 ) -> PreflightResult:
     """Run every circuit breaker for one city; any failure blocks trading.
 
@@ -102,6 +165,8 @@ def run_preflight(
         hist_min_f / hist_max_f: Observed min/max settlement highs from the
             station's training history (bounds check); None skips with a
             warning.
+        smoke: Recent-METAR summary from :func:`smoke_report`; None skips
+            the smoke gate with a warning when the gate is enabled.
     """
     if not bool(_cfg("enabled")):
         return PreflightResult(ok=True, warnings=["preflight disabled via config"])
@@ -164,6 +229,27 @@ def run_preflight(
     min_contracts = int(_cfg("min_contracts"))
     if n_contracts < min_contracts:
         failures.append(f"only {n_contracts} live contracts (min {min_contracts})")
+
+    # 7. Smoke gate
+    if bool(_cfg("smoke_gate")):
+        if smoke is None:
+            warnings.append("smoke gate enabled but no recent METARs available")
+        elif smoke.n_smoke > 0 or smoke.n_haze_low_vis > 0:
+            vis_threshold = float(_cfg("smoke_max_vis_mi"))
+            detail = (
+                f"{smoke.n_smoke}×FU, {smoke.n_haze_low_vis}×HZ≤{vis_threshold:g}mi "
+                f"in last {smoke.n_obs} obs (min vis "
+                f"{smoke.min_vis_mi:.1f}mi)" if smoke.min_vis_mi is not None
+                else f"{smoke.n_smoke}×FU in last {smoke.n_obs} obs"
+            )
+            failures.append(
+                f"wildfire smoke over station — model has no edge under smoke ({detail})"
+            )
+        elif smoke.n_haze > 0:
+            warnings.append(
+                f"haze reported ({smoke.n_haze}/{smoke.n_obs} obs, vis OK) — "
+                "possible smoke aloft, watch residuals"
+            )
 
     result = PreflightResult(ok=not failures, failures=failures, warnings=warnings)
     if not result.ok:

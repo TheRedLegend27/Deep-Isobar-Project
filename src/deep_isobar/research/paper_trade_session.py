@@ -61,6 +61,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, etc.
 
 from deep_isobar.calibration.emos import emos_predict, load_params as load_emos_params
+from deep_isobar.calibration.emos_training import fetch_live_trend_f
 from deep_isobar.core.lst import lst_timezone
 from deep_isobar.core.types import CityProfile, ForecastPoint, TradeSignal
 from deep_isobar.data.city_universe import get_city_universe
@@ -88,7 +89,11 @@ from deep_isobar.market.microstructure_scanner import compute_microstructure_sco
 from deep_isobar.models.probability_engine import probability_for_contract
 from deep_isobar.models.temperature_ensemble import build_temperature_ensemble
 from deep_isobar.trading.distribution_tail_alpha import is_tail_threshold
-from deep_isobar.trading.preflight import run_preflight, training_history_bounds
+from deep_isobar.trading.preflight import (
+    run_preflight,
+    smoke_report,
+    training_history_bounds,
+)
 from deep_isobar.market.kalshi_client import is_live_mode as kalshi_is_live_mode
 from deep_isobar.config import get_setting
 from deep_isobar.notifications.discord_notifier import (
@@ -725,11 +730,34 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                     "climatological spread", city_label, exc,
                 )
 
+        # Run-to-run trend feeds the fitted e_trend variance term (widens
+        # sigma on regime-change/frontal days — the Jul 14-15 Dallas cold
+        # busts).  Only fetched when the fit actually carries the term; a
+        # failed fetch degrades to no widening, never blocks the session.
+        trend_f = None
+        if emos_params.e_trend > 0.0 and city.nws_lat and city.nws_lon:
+            try:
+                trend_f = fetch_live_trend_f(
+                    city.nws_lat, city.nws_lon, city.timezone, tomorrow,
+                    station_id=city.station_id,
+                )
+                logger.info(
+                    "[%s] Run-to-run trend for %s: %s",
+                    city_label, tomorrow,
+                    f"{trend_f:+.1f}°F" if trend_f is not None else "n/a (no prior run view)",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[%s] Live trend fetch failed (%s) — sigma loses today's "
+                    "trend widening", city_label, exc,
+                )
+
         try:
             effective_mean, effective_std = emos_predict(
                 emos_params,
                 {p.model_name: p.forecast_value_f for p in forecast_points},
                 ensemble_spread_var=ens_spread_var,
+                trend_f=trend_f,
             )
         except ValueError as exc:
             msg = f"EMOS predict failed ({exc}) — skipping city rather than trading uncalibrated."
@@ -897,6 +925,7 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
             market_is_live=kalshi_is_live_mode(),
             hist_min_f=hist_lo,
             hist_max_f=hist_hi,
+            smoke=smoke_report(city.station_id),
         )
         if not preflight.ok:
             msg = f"Preflight blocked trading: {preflight.summary()}"

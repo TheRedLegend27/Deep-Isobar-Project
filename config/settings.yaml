@@ -105,6 +105,12 @@ risk:
     min_sigma_f: 0.5
     max_sigma_f: 15.0
     min_contracts: 3
+    # Wildfire-smoke stand-down (2026-07-14..17 Canadian smoke slump: NE
+    # actuals came in 5-10F below ALL guidance; no model edge under smoke).
+    # Block on any FU, or HZ with vis <= smoke_max_vis_mi, in recent METARs.
+    smoke_gate: true
+    smoke_lookback_hours: 6
+    smoke_max_vis_mi: 6.0
 
   # Lowered 0.38 -> 0.10 with the EMOS calibration upgrade (2026-06-12).
   # The 0.38 threshold was a symptom of the mis-specified distribution
@@ -162,6 +168,16 @@ emos:
   # NOT beat base on holdout and are not enabled (see
   # research/validate_emos_variants.py).
   nonneg_weights: true
+  # Per-station overrides beat the global keys above; key is the fit key
+  # (KDFW = highs, KDFW_low = lows).  Ships only through the holdout race.
+  station_overrides:
+    # Dallas trend-variance: validated 2026-07-19 after the fixed-LST refetch
+    # filled trend_f (104/109 days).  Holdout CRPS 1.663->1.569 (15d),
+    # 1.380->1.312 (20d), 1.228->1.189 (25d) — the Jul 14-17 frontal cold
+    # busts are exactly the wide-trend days e_trend widens sigma on.  Flat or
+    # slightly worse at the other 4 stations (Boston +1%), so Dallas only.
+    KDFW:
+      trend_variance: true
   ridge_lambda: 0.0
   trend_variance: false
 

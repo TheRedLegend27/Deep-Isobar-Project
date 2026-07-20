@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import urllib.request
 from datetime import date, timedelta
@@ -161,6 +162,134 @@ def fetch_t1_member_maxes(
             )
     # Drop today's partial day — the trace is incomplete until local midnight.
     return daily[daily.index < date.today()]
+
+
+def _runview_path(station_id: str, training_dir: Path | None = None) -> Path:
+    d = training_dir or _TRAINING_DIR
+    return d / f"{station_id}_runviews.parquet"
+
+
+def _record_run_views(
+    station_id: str, views: dict[date, float], training_dir: Path | None = None
+) -> None:
+    """Bank today's multi-model mean view of each future target day.
+
+    The Previous Runs API serves ``previous_dayN`` only for PAST timestamps
+    (for future hours it mirrors the current run — verified live 2026-07-19),
+    so yesterday's view of tomorrow is not fetchable.  Like the T+1 spread
+    history, run views therefore accumulate forward: each session records
+    today's views, and tomorrow's session diffs against them.
+    """
+    path = _runview_path(station_id, training_dir)
+    rows = pd.DataFrame(
+        {
+            "recorded_date": [date.today()] * len(views),
+            "target_date": list(views.keys()),
+            "mean_view_f": list(views.values()),
+        }
+    )
+    if path.exists():
+        rows = pd.concat([pd.read_parquet(path), rows], ignore_index=True)
+    rows = rows.drop_duplicates(subset=["recorded_date", "target_date"], keep="last")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows.to_parquet(path, index=False)
+
+
+def fetch_live_trend_f(
+    lat: float,
+    lon: float,
+    timezone_name: str,
+    target_date: date,
+    station_id: str,
+    agg: str = "max",
+) -> float | None:
+    """Run-to-run trend of *target_date*'s multi-model mean view, at session time.
+
+    Matches the training column exactly: the training row for target day T
+    holds ``pd1(T) − pd2(T)`` — the view of T issued on T−1 minus the view
+    issued on T−2.  At session time (day T−1) the first term is today's
+    run, fetched fresh; the second is yesterday's session's recorded view
+    of T (see :func:`_record_run_views`).  Feed the result to
+    :func:`emos_predict` as ``trend_f`` so the fitted ``e_trend`` variance
+    term applies live.
+
+    Always records today's views of T+1/T+2 as a side effect, so the diff
+    becomes available from the second session onward.  Returns None when
+    yesterday's view of *target_date* was never recorded (bootstrap day,
+    missed session) or the fetch has no usable rows.
+    """
+    om_ids = ",".join(EMOS_MODELS.values())
+    url = (
+        f"{_PREVIOUS_RUNS_URL}?latitude={lat}&longitude={lon}"
+        "&hourly=temperature_2m"
+        f"&models={om_ids}"
+        "&temperature_unit=fahrenheit"
+        f"&timezone={quote(lst_timezone(timezone_name), safe='')}"
+        "&forecast_days=3"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "deep-isobar/1.0"})
+    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
+        data = json.loads(resp.read())
+    if data.get("error"):
+        raise ValueError(f"Open-Meteo error: {data.get('reason', 'unknown')}")
+
+    hourly: dict = data.get("hourly", {})
+    times = pd.to_datetime(hourly.get("time", []))
+    if len(times) == 0:
+        return None
+
+    frame = pd.DataFrame({"local_day": times.date})
+    for model, om_id in EMOS_MODELS.items():
+        vals = hourly.get(f"temperature_2m_{om_id}")
+        if vals is None and len(EMOS_MODELS) == 1:
+            vals = hourly.get("temperature_2m")
+        frame[model] = pd.to_numeric(
+            pd.Series(vals if vals is not None else [np.nan] * len(times)), errors="coerce"
+        )
+    daily = (frame.groupby("local_day").min(numeric_only=True) if agg == "min"
+             else frame.groupby("local_day").max(numeric_only=True))
+    # Same skipna mean-across-members as the training column.
+    today_views = {
+        d: float(daily.loc[d].mean())
+        for d in daily.index
+        if d > date.today() and math.isfinite(daily.loc[d].mean())
+    }
+    if today_views:
+        _record_run_views(station_id, today_views)
+
+    current = today_views.get(target_date)
+    if current is None:
+        return None
+    path = _runview_path(station_id)
+    if not path.exists():
+        return None
+    history = pd.read_parquet(path)
+    prior = history[
+        (history["target_date"] == target_date)
+        & (history["recorded_date"] < date.today())
+    ].sort_values("recorded_date")
+    if prior.empty:
+        return None
+    trend = current - float(prior.iloc[-1]["mean_view_f"])
+    return trend if math.isfinite(trend) else None
+
+
+def _fit_option(station_key: str, name: str, default):
+    """Fit option for one station key, with per-station config override.
+
+    ``emos.station_overrides.<key>.<name>`` beats the global ``emos.<name>``.
+    The key is the fit key — ``KDFW`` for highs, ``KDFW_low`` for lows — so
+    the two models of one station can be configured independently.  Model
+    changes still ship only through the holdout race
+    (research/validate_emos_variants.py).
+    """
+    from deep_isobar.config import get_setting
+
+    overrides = get_setting("emos.station_overrides", default={}) or {}
+    station_cfg = overrides.get(station_key) or {}
+    if name in station_cfg:
+        return station_cfg[name]
+    return get_setting(f"emos.{name}", default=default)
 
 
 def _training_path(station_id: str, training_dir: Path | None = None) -> Path:
@@ -323,8 +452,7 @@ def fit_station(
                 city.city, coverage * 100, MIN_SPREAD_COVERAGE * 100,
             )
 
-    from deep_isobar.config import get_setting
-    use_trend = bool(get_setting("emos.trend_variance", default=False))
+    use_trend = bool(_fit_option(key, "trend_variance", default=False))
     params = fit_emos(
         members,
         actuals,
@@ -334,8 +462,8 @@ def fit_station(
         ensemble_spread_var=ens_spread_var,
         trend=(window["trend_f"].to_numpy(dtype=float)
                if use_trend and "trend_f" in window.columns else None),
-        nonneg_weights=bool(get_setting("emos.nonneg_weights", default=False)),
-        ridge_lambda=float(get_setting("emos.ridge_lambda", default=0.0)),
+        nonneg_weights=bool(_fit_option(key, "nonneg_weights", default=False)),
+        ridge_lambda=float(_fit_option(key, "ridge_lambda", default=0.0)),
     )
     params.metric = "low_temp_f" if metric == "low" else "high_temp_f"
     save_params(params, params_dir=params_dir)
