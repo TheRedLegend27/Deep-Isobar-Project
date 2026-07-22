@@ -12,8 +12,9 @@ clears risk thresholds.
 EMOS-calibrated distributions — while **calibrating and collecting order
 books for Kalshi's entire weather universe** (20 cities, daily highs *and*
 lows) in data-only mode, ready to flip on when the track record earns it.
-Runs unattended on a nine-job daily schedule with pre-trade circuit
-breakers and settlement results cross-verified against the exchange.
+Runs unattended on a ten-job daily schedule with pre-trade circuit
+breakers (including a wildfire-smoke stand-down), ops-health invariant
+alarms, and settlement results cross-verified against the exchange.
 
 **Docs:** [Operations manual](docs/OPERATIONS.md) ·
 [Roadmap](docs/ROADMAP.md) · [Server runbook](docs/RUNBOOK_SERVERS.md) ·
@@ -165,7 +166,8 @@ edges are ~3–10 points, and 0.10 stays above Kalshi's taker-fee peak (~1.75%).
 | Task | Time | Module |
 |---|---|---|
 | EMOS refit + spread recording (all 20 cities, highs+lows) | 6:15 AM | `calibration.emos_training` |
-| Morning session (circuit breakers → Kelly-sized trades) | 7:00 AM | `research.paper_trade_session` |
+| Trading session (circuit breakers → Kelly-sized trades) | 10:30 AM | `research.paper_trade_session` |
+| Ops-health invariant alarms (dead session, stale params, stub books, …) | 11:15 AM | `ops.health` |
 | Intraday lock-in check | 2:00 PM | `research.intraday_check` |
 | Settlement (all pending dates) | 6:00 PM | `research.settle_paper_trades` |
 | **Exchange cross-verification** of every graded trade | 6:30 PM | `research.verify_settlements` |
@@ -276,13 +278,14 @@ cfgrib file-locking issues don't exist.
   and tracked; per-city `trade` flag separates learning from trading.
 - **Risk & integrity** — fee-adjusted fractional Kelly with same-day
   correlation haircut; pre-trade circuit breakers (stub/bounds/NBM/params/
-  sigma/liquidity); settlement cross-verified against the exchange nightly.
+  sigma/liquidity/smoke); ops-health invariant alarms so failures are never
+  silent; settlement cross-verified against the exchange nightly.
 - **Evidence loop** — daily scorecard (P&L, Brier-edge-vs-market, CRPS/PIT
   per station); holdout race required before any model change ships.
 - **Data assets** — orderbook history recorder (~305 books/10 min), live
   member-spread history, lookahead-proof as-of store, GEFS archive backfill
   worker for the server fleet.
-- **Ops** — 9-job supervisor with sleep catch-up, launchd/systemd deploys,
+- **Ops** — 10-job supervisor with sleep catch-up, launchd/systemd deploys,
   nightly rotated backups, append-only audit log, xlsx export on API
   endpoints, Discord notifications (optional).
 
@@ -293,8 +296,13 @@ NBM + GEFS/EPS members · Kelly sizing + SELL spreading + fee model · circuit
 breakers · settlement cross-verification · full-universe onboarding (highs +
 lows, data-only) · scorecard/evaluation harness · orderbook collector ·
 maker-fill simulator (verdict: hybrid, not maker-only) · non-negative EMOS
-weights (won its holdout race) · server fleet package (see
-[docs/ROADMAP.md](docs/ROADMAP.md) for the full phased plan).
+weights (won its holdout race) · server fleet package · fixed-LST settlement
+windowing (NWS CLI midnight-LST day, year-round) · ops-health invariant
+alarms · fully green test suite + golden Kalshi fixtures (real payloads
+through parse→probability→settlement) · METAR smoke gate (stands cities down
+under wildfire smoke — blocked Chicago on day one) · per-station EMOS
+overrides (trend-variance shipped Dallas-only after winning its holdout
+rematch) (see [docs/ROADMAP.md](docs/ROADMAP.md) for the full phased plan).
 
 **Next:**
 1. **Server day** (docs/RUNBOOK_SERVERS.md) — Tailscale + Proxmox/TrueNAS,

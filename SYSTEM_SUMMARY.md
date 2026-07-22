@@ -1,5 +1,11 @@
 # Deep Isobar — System Summary
 
+> **⚠️ HISTORICAL SNAPSHOT (April 2026) — do not use as a current reference.**
+> This audit predates the EMOS calibration rewrite, the move to the Mac
+> runtime, the full-universe onboarding, and the entire July hardening pass.
+> Current documentation: [README.md](README.md) ·
+> [docs/OPERATIONS.md](docs/OPERATIONS.md) · [docs/ROADMAP.md](docs/ROADMAP.md).
+
 _Generated: 2026-04-13 by read-only audit. No files modified._
 _Updated April 14, 2026_
 _Changes since April 13: multi-city refactor across all core modules, 4 new cities calibrated and onboarded (Dallas/NYC/Philadelphia/Boston), GFS boolean bug fixed, Boston contract ID normalization, clickable Kalshi deep links and bracket recommendation chips in dashboard._
