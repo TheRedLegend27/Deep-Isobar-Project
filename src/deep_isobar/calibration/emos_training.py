@@ -28,10 +28,13 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import logging
 import math
 import sys
+import time
+import urllib.error
 import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
@@ -59,6 +62,32 @@ _TRAINING_DIR = _PROJECT_ROOT / "data" / "emos_training"
 
 _PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 _HTTP_TIMEOUT_S = 60
+_HTTP_RETRIES = 3
+_HTTP_RETRY_BACKOFF_S = 5
+
+
+def _fetch_json_with_retry(url: str) -> dict:
+    """GET *url* as JSON, retrying on transient network errors.
+
+    The Previous Runs API occasionally drops a connection mid-response
+    (``IncompleteRead``) — one bad fetch used to silently skip that
+    station's daily refit (2026-07-26/27 params_age alarms).
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "deep-isobar/1.0"})
+    last_exc: Exception | None = None
+    for attempt in range(1, _HTTP_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
+                return json.loads(resp.read())
+        except (urllib.error.URLError, http.client.IncompleteRead, TimeoutError, ConnectionError) as exc:
+            last_exc = exc
+            if attempt < _HTTP_RETRIES:
+                logger.warning(
+                    "Open-Meteo fetch failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt, _HTTP_RETRIES, exc, _HTTP_RETRY_BACKOFF_S,
+                )
+                time.sleep(_HTTP_RETRY_BACKOFF_S)
+    raise last_exc  # type: ignore[misc]
 
 # Member set: must match the live session's Open-Meteo model codes so the
 # fitted coefficients apply to live forecasts of the same quantity.  NBM is
@@ -118,9 +147,7 @@ def fetch_t1_member_maxes(
         f"&past_days={min(past_days, MAX_PAST_DAYS)}"
         "&forecast_days=1"
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "deep-isobar/1.0"})
-    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
-        data = json.loads(resp.read())
+    data = _fetch_json_with_retry(url)
     if data.get("error"):
         raise ValueError(f"Open-Meteo error: {data.get('reason', 'unknown')}")
 
@@ -227,9 +254,7 @@ def fetch_live_trend_f(
         f"&timezone={quote(lst_timezone(timezone_name), safe='')}"
         "&forecast_days=3"
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "deep-isobar/1.0"})
-    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
-        data = json.loads(resp.read())
+    data = _fetch_json_with_retry(url)
     if data.get("error"):
         raise ValueError(f"Open-Meteo error: {data.get('reason', 'unknown')}")
 

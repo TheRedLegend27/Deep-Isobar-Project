@@ -331,12 +331,12 @@ def render_markdown(
             f"| Mean \\|alpha\\| | {fmt('mean_abs_alpha', '.3f', False)} |",
         ]
         lines.append("")
-        edge30 = s30["brier_edge"]
+        edge = s7["brier_edge"] if s7.get("n") else s30["brier_edge"]
         lines.append(
             "**Reading:** "
             + (
                 "our probabilities are beating the market on settled trades."
-                if edge30 > 0
+                if edge > 0
                 else "the market's probabilities are beating ours — treat new "
                      "signals with suspicion and check calibration below."
             )

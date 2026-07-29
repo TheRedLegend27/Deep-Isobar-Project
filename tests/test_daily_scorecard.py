@@ -153,6 +153,25 @@ def test_render_markdown_smoke():
     assert "+7.50" in md  # day P&L of the latest settlement day
 
 
+def test_render_markdown_reading_uses_recent_window():
+    """Reading should reflect the 7d edge, not a stale 30d edge of the opposite sign."""
+    empty = pd.DataFrame(columns=["city", "contract_ticker", "direction", "alpha",
+                                  "entry_price", "settled_temp", "status", "realized_pnl"])
+    s7 = {
+        "n": 50, "pnl": 100.0, "win_rate": 0.6,
+        "model_brier": 0.17, "market_brier": 0.22,
+        "brier_edge": 0.05, "mean_abs_alpha": 0.18,
+    }
+    s30 = {
+        "n": 120, "pnl": 300.0, "win_rate": 0.5,
+        "model_brier": 0.23, "market_brier": 0.22,
+        "brier_edge": -0.01, "mean_abs_alpha": 0.18,
+    }
+    md = render_markdown(date(2026, 7, 3), empty, None, s7, s30, [])
+    assert "beating the market" in md
+    assert "treat new" not in md
+
+
 def test_render_markdown_handles_no_trades():
     empty = pd.DataFrame(columns=["city", "contract_ticker", "direction", "alpha",
                                   "entry_price", "settled_temp", "status", "realized_pnl"])

@@ -64,6 +64,11 @@ scheduler:
       module: deep_isobar.data.orderbook_collector
       every_minutes: 10
       window: "06:00-21:00"
+      # Normal runs finish in ~1-2min; the default 1h job timeout let a
+      # stuck Kalshi-API run (2026-07-28) block this single-threaded
+      # supervisor's entire queue for hours. Cap it tight since a timeout
+      # here just means "try again in 10 minutes."
+      timeout_seconds: 300
     # Nightly archive of the unreplaceable data/ assets (trades, params,
     # spread history) — see scripts/backup_data.py.  Retargets to TrueNAS
     # in Phase 1.

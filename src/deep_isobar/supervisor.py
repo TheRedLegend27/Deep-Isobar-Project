@@ -156,6 +156,8 @@ def _run_job(job: dict) -> bool:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_PROJECT_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
 
+    timeout_seconds = job.get("timeout_seconds", _JOB_TIMEOUT_SECONDS)
+
     try:
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(f"\n=== {name} started {started:%Y-%m-%d %H:%M:%S} ===\n")
@@ -166,11 +168,11 @@ def _run_job(job: dict) -> bool:
                 env=env,
                 stdout=fh,
                 stderr=subprocess.STDOUT,
-                timeout=_JOB_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
             )
         ok = proc.returncode == 0
     except subprocess.TimeoutExpired:
-        logger.error("Job %s timed out after %ds", name, _JOB_TIMEOUT_SECONDS)
+        logger.error("Job %s timed out after %ds", name, timeout_seconds)
         ok = False
     except Exception as exc:  # noqa: BLE001
         logger.exception("Job %s failed to launch: %s", name, exc)
