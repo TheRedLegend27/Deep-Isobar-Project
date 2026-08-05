@@ -57,6 +57,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")  # load KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, etc.
 
 from deep_isobar.calibration import bias_loader
+from deep_isobar.config import get_setting
 from deep_isobar.data.city_universe import get_city_profile, load_city_profiles
 from deep_isobar.data.historical_noaa_ingest import fetch_settlement_observations
 from deep_isobar.notifications.discord_notifier import (
@@ -65,6 +66,7 @@ from deep_isobar.notifications.discord_notifier import (
     COLOR_BLUE,
     post_embed,
 )
+from deep_isobar.ops import kill_switch
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +390,59 @@ def _print_pnl_summary(df: pd.DataFrame) -> None:
     print("=" * 58)
 
 
+def _evaluate_kill_switch_triggers(df: pd.DataFrame, session_pnl: float) -> None:
+    """Evaluate the daily-loss / drawdown / consecutive-loss kill-switch
+    triggers (go-live safety build, Part 1) after a settlement pass.
+
+    Uses today's realized P&L directly for the daily-loss trigger, and
+    derives the consecutive-loss streak and drawdown-from-peak from the
+    full settled history in *df* (all cities pooled, chronological by
+    target date). Never raises — an exception here must not take down
+    settlement itself; kill_switch.engage() failures are already
+    best-effort internally, but the derivation here is wrapped defensively
+    too since it runs unattended at 18:00.
+    """
+    try:
+        settled = df[df["status"].isin(["WIN", "LOSS"])].copy()
+        if settled.empty:
+            kill_switch.evaluate_trading_triggers(daily_realized_pnl_usd=session_pnl)
+            return
+
+        settled["realized_pnl"] = pd.to_numeric(
+            settled["realized_pnl"], errors="coerce"
+        ).fillna(0.0)
+        settled = settled.sort_values("date", kind="stable")
+
+        # Consecutive losses: trailing run of LOSS rows in settlement order.
+        consecutive_losses = 0
+        for status in reversed(settled["status"].tolist()):
+            if status == "LOSS":
+                consecutive_losses += 1
+            else:
+                break
+
+        # Equity curve for drawdown: bankroll + cumulative realized P&L by
+        # date, using the single authoritative bankroll figure the smart
+        # sizer also reads (risk.position_sizing.bankroll_usd).
+        bankroll_usd = float(get_setting("risk.position_sizing.bankroll_usd", 500.0))
+        daily_pnl = settled.groupby("date")["realized_pnl"].sum().sort_index()
+        equity_curve = bankroll_usd + daily_pnl.cumsum()
+        peak_equity_usd = float(equity_curve.cummax().iloc[-1])
+        current_equity_usd = float(equity_curve.iloc[-1])
+
+        kill_switch.evaluate_trading_triggers(
+            daily_realized_pnl_usd=session_pnl,
+            current_equity_usd=current_equity_usd,
+            peak_equity_usd=peak_equity_usd,
+            consecutive_losses=consecutive_losses,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "kill-switch trigger evaluation failed — settlement continues, "
+            "but automatic triggers did not run this pass"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Bias-profile update
 # ---------------------------------------------------------------------------
@@ -638,6 +693,10 @@ def settle(settle_date: date) -> None:
                 {"name": "Cumulative P&L",  "value": f"{cumulative_pnl:+.4f}"},
             ],
         )
+
+        # Kill-switch automatic triggers (go-live safety build, Part 1):
+        # daily loss, drawdown-from-peak, consecutive losses.
+        _evaluate_kill_switch_triggers(df, session_pnl)
 
     _print_pnl_summary(df)
 

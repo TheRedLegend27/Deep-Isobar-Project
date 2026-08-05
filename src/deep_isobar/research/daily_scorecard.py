@@ -104,8 +104,8 @@ def load_settled_trades(csv_path: Path | None = None) -> pd.DataFrame:
     path = csv_path or _PAPER_TRADES_CSV
     cols = [
         "date", "city", "contract_ticker", "direction", "alpha", "model_prob",
-        "market_prob", "entry_price", "status", "realized_pnl", "settled_temp",
-        "outcome",
+        "market_prob", "entry_price", "position_size", "status", "realized_pnl",
+        "settled_temp", "outcome",
     ]
     if not path.exists():
         return pd.DataFrame(columns=cols)
@@ -116,7 +116,9 @@ def load_settled_trades(csv_path: Path | None = None) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
     df["date"] = pd.to_datetime(df["date"]).dt.date
-    for col in ("alpha", "model_prob", "market_prob", "entry_price", "realized_pnl"):
+    for col in ("alpha", "model_prob", "market_prob", "entry_price", "position_size", "realized_pnl"):
+        if col not in df.columns:
+            df[col] = float("nan")  # legacy CSVs written before this column existed
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["outcome"] = [
         realized_outcome(d, s) for d, s in zip(df["direction"], df["status"])

@@ -18,6 +18,12 @@ module checks the invariants that break in those failure modes and screams
    30h (the 06:15 refit is running).
 6. **scorecard_gaps** — a scorecard markdown exists for each recent day
    (the 18:45 job is running).
+7. **kill_switch** — surfaces current kill-switch state (see
+   ``ops/kill_switch.py``) so an engaged switch is impossible to miss in
+   the scorecard. Also, when any *other* invariant above is ALARM, this
+   module engages the kill switch itself (automatic trigger #4 from the
+   go-live safety spec) — trading blind on a broken invariant is how small
+   bugs become large losses.
 
 Checks that cannot be judged yet at the current time of day (e.g. session
 activity before 11:00) report SKIP, not OK — silence is never green.
@@ -48,6 +54,7 @@ import pandas as pd
 from deep_isobar.calibration.emos import load_params
 from deep_isobar.data.city_universe import get_city_universe
 from deep_isobar.notifications.discord_notifier import COLOR_RED, post_embed
+from deep_isobar.ops import kill_switch
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +284,24 @@ def check_params_age(
     return HealthCheck(name, OK, f"{checked} stations refit within 30h")
 
 
+def check_kill_switch() -> HealthCheck:
+    """Surface kill-switch state — visibility, not just a gate.
+
+    Reported as ALARM when engaged: an engaged switch is exactly the kind
+    of thing that must be impossible to miss in the daily scorecard, even
+    though it is by design an intentional stop rather than a bug.
+    """
+    name = "kill_switch"
+    state = kill_switch.get_state()
+    if state.engaged:
+        return HealthCheck(
+            name, ALARM,
+            f"ENGAGED — {state.reason or state.detail or 'unknown reason'} "
+            f"(source={state.source or 'unknown'})",
+        )
+    return HealthCheck(name, OK, "disengaged — live order placement permitted")
+
+
 def check_scorecard_gaps(now: datetime, reports_dir: Path) -> HealthCheck:
     """A scorecard file must exist for each of the last few days."""
     name = "scorecard_gaps"
@@ -320,10 +345,11 @@ def run_health_checks(
         lambda: check_stub_books(root / "data" / "market_history"),
         lambda: check_params_age(datetime.now(timezone.utc)),
         lambda: check_scorecard_gaps(now, root / "data" / "reports"),
+        lambda: check_kill_switch(),
     ]
     names = [
         "session_activity", "settlement_currency", "orderbook_freshness",
-        "stub_books", "params_age", "scorecard_gaps",
+        "stub_books", "params_age", "scorecard_gaps", "kill_switch",
     ]
     checks: list[HealthCheck] = []
     for name, spec in zip(names, specs):
@@ -379,6 +405,17 @@ def main(argv: list[str] | None = None) -> int:
     print(render_health_section(checks))
 
     broken = alarms(checks)
+
+    # Automatic trigger #4 (go-live safety spec): any broken invariant
+    # engages the kill switch. Excludes the kill_switch check itself so an
+    # already-engaged switch doesn't trivially re-engage itself as "the
+    # invariant that broke."
+    trading_invariants_broken = [c.name for c in broken if c.name != "kill_switch"]
+    if trading_invariants_broken:
+        reason = kill_switch.check_ops_health_trigger(trading_invariants_broken)
+        if reason:
+            kill_switch.engage(reason, source="ops_health_trigger")
+
     if broken and not args.no_discord:
         post_alarm_embed(checks)
     # Nonzero exit also fires the supervisor's job-FAILED embed.

@@ -45,6 +45,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import sys
 import threading
 import time
@@ -89,6 +90,15 @@ from deep_isobar.market.microstructure_scanner import compute_microstructure_sco
 from deep_isobar.models.probability_engine import probability_for_contract
 from deep_isobar.models.temperature_ensemble import build_temperature_ensemble
 from deep_isobar.trading.distribution_tail_alpha import is_tail_threshold
+from deep_isobar.trading.position_sizer import (
+    StationCalibration,
+    StationTrackRecord,
+    adjust_allocations,
+    apply_sizing_decisions,
+    build_station_track_record,
+    compute_city_daily_cap,
+    log_sizing_decisions,
+)
 from deep_isobar.trading.preflight import (
     run_preflight,
     smoke_report,
@@ -96,6 +106,7 @@ from deep_isobar.trading.preflight import (
 )
 from deep_isobar.market.kalshi_client import is_live_mode as kalshi_is_live_mode
 from deep_isobar.config import get_setting
+from deep_isobar.ops import kill_switch
 from deep_isobar.notifications.discord_notifier import (
     COLOR_AMBER,
     COLOR_BLUE,
@@ -591,6 +602,59 @@ def _logged_trade_keys(path: Path) -> set[tuple[str, str]]:
             (r.get("date", ""), r.get("contract_ticker", ""))
             for r in csv.DictReader(fh)
         }
+
+
+# ---------------------------------------------------------------------------
+# Position sizer evidence — best-effort; a failure here degrades to a
+# neutral (1.0) multiplier, never blocks trading. See trading/position_sizer.py.
+# ---------------------------------------------------------------------------
+
+
+def _station_calibration_for_sizer(city: CityProfile) -> "StationCalibration | None":
+    """Build the sizer's calibration-quality input from the current EMOS params.
+
+    Best-effort: any failure (no params yet, unreadable training parquet)
+    returns None, which the sizer treats as neutral (no adjustment) — a
+    missing calibration read must never become an extra size-up or a hard
+    block, just no additional evidence.
+    """
+    try:
+        from deep_isobar.research.daily_scorecard import station_calibration as _calib
+
+        result = _calib(city)
+        if result is None:
+            return None
+        nbm_mae = result.get("nbm_mae")
+        if nbm_mae is None or math.isnan(nbm_mae):
+            nbm_mae = None
+        pit_hist = result.get("pit_hist")
+        return StationCalibration(
+            mae=float(result["mae"]),
+            nbm_mae=nbm_mae,
+            pit_hist=tuple(float(x) for x in pit_hist) if pit_hist is not None else None,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[%s] station calibration unavailable for sizer", city.city, exc_info=True)
+        return None
+
+
+def _station_track_record_for_sizer(
+    city: CityProfile, asof: date,
+) -> "StationTrackRecord | None":
+    """Build the sizer's track-record input from settled trades strictly before *asof*.
+
+    Best-effort, same degrade-to-None-on-failure contract as
+    :func:`_station_calibration_for_sizer`.
+    """
+    try:
+        from deep_isobar.research.daily_scorecard import load_settled_trades
+
+        with _CSV_LOCK:
+            settled = load_settled_trades(_PAPER_TRADES_CSV)
+        return build_station_track_record(settled, city.city, asof)
+    except Exception:  # noqa: BLE001
+        logger.debug("[%s] station track record unavailable for sizer", city.city, exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1096,29 +1160,22 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
         if spreading_enabled:
             from deep_isobar.trading.bracket_spreader import build_spread, log_spread_summary
 
-            dynamic_cfg = multi_bracket_cfg.get("dynamic_sizing", {})
-            if dynamic_cfg.get("enabled", False):
-                from deep_isobar.trading.position_sizer import compute_exposure, log_sizing_decision
-                sizing = compute_exposure(
-                    anomaly_report=anomaly,
-                    ensemble_std_f=ensemble.ensemble_std_f,
-                    cfg=dynamic_cfg,
+            # ── City daily cap (go-live safety build, Part 2 smart sizer) ──
+            # Bankroll-relative, from the single authoritative figure at
+            # risk.position_sizing.bankroll_usd — collapses what used to be
+            # two independently-configured numbers (kelly.bankroll_usd and
+            # dynamic_sizing.base_exposure_usd) that could silently disagree.
+            sizing_cfg = get_setting("risk.position_sizing", default={})
+            bankroll_usd = float(sizing_cfg.get("bankroll_usd", 500.0))
+            n_active_trading_cities = sum(
+                1 for c in get_city_universe() if c.active and c.trade
+            )
+            if sizing_cfg.get("enabled", True):
+                daily_exposure_cap_usd = compute_city_daily_cap(
+                    bankroll_usd, n_active_trading_cities, sizing_cfg,
                 )
-                log_sizing_decision(sizing, logger)
-                daily_exposure_cap_usd = sizing.final_exposure_usd
             else:
-                sizing = None
                 daily_exposure_cap_usd = multi_bracket_cfg.get("daily_exposure_cap_usd", 50.0)
-
-            for row in all_rows:
-                if sizing is not None:
-                    row["sizing_base_usd"] = sizing.base_exposure_usd
-                    row["sizing_final_usd"] = sizing.final_exposure_usd
-                    row["sizing_reasoning"] = sizing.reasoning
-                else:
-                    row["sizing_base_usd"] = daily_exposure_cap_usd
-                    row["sizing_final_usd"] = daily_exposure_cap_usd
-                    row["sizing_reasoning"] = "dynamic sizing disabled"
 
             open_rows_pre_spread = [r for r in all_rows if r["status"] == "OPEN"]
             open_signals = [signal_lookup[r["contract_ticker"]] for r in open_rows_pre_spread]
@@ -1132,6 +1189,9 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                     if r["entry_price"] != ""
                 }
                 kelly_cfg = dict(multi_bracket_cfg.get("kelly", {}))
+                # bankroll_usd is intentionally not read from multi_bracket.kelly
+                # config — the single authoritative figure above always wins.
+                kelly_cfg["bankroll_usd"] = bankroll_usd
                 # Haircut for same-airmass correlation: every active city
                 # trades the same day, so N defaults to the city count.
                 kelly_cfg.setdefault(
@@ -1149,6 +1209,31 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                     kelly_cfg=kelly_cfg,
                 )
                 log_spread_summary(allocations, logger)
+
+                # ── Per-trade evidence multipliers + hard per-trade cap ─────
+                # Kelly decided the raw shape above; this layers on the
+                # entry-price tail haircut, per-station calibration quality,
+                # per-station track record, and the anomaly/spread multiplier
+                # (unchanged logic, now applied per-trade), then clamps to
+                # the hard per-trade cap — see trading/position_sizer.py.
+                if allocations and sizing_cfg.get("enabled", True):
+                    station_calib = _station_calibration_for_sizer(city)
+                    track_record = _station_track_record_for_sizer(city, tomorrow)
+                    decisions = adjust_allocations(
+                        allocations,
+                        bankroll_usd=bankroll_usd,
+                        entry_prices=entry_prices,
+                        anomaly_report=anomaly,
+                        ensemble_std_f=ensemble.ensemble_std_f,
+                        station_calibration=station_calib,
+                        station_track_record=track_record,
+                        cfg=sizing_cfg,
+                    )
+                    log_sizing_decisions(decisions, logger)
+                    apply_sizing_decisions(allocations, decisions, entry_prices)
+                    reasoning_by_id = {d.contract_id: d for d in decisions}
+                else:
+                    reasoning_by_id = {}
 
                 if allocations:
                     n_total = len(allocations)
@@ -1169,6 +1254,15 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                             )
                             row["spread_rank"] = alloc.rank
                             row["spread_total_contracts"] = n_total
+                            decision = reasoning_by_id.get(ticker)
+                            if decision is not None:
+                                row["sizing_base_usd"] = decision.kelly_usd
+                                row["sizing_final_usd"] = decision.final_stake_usd
+                                row["sizing_reasoning"] = decision.reasoning
+                            else:
+                                row["sizing_base_usd"] = alloc.allocated_usd
+                                row["sizing_final_usd"] = alloc.allocated_usd
+                                row["sizing_reasoning"] = "position sizing disabled — raw kelly allocation"
                         else:
                             row["status"] = "SPREAD_SKIP"
                             row["spread_total_contracts"] = n_total
@@ -1312,6 +1406,27 @@ def main(dry_run: bool = False) -> None:
         dry_run: When ``True``, print signals to stdout without writing to
             any CSV file.
     """
+    # ── Kill switch — checked before any city is processed ────────────────
+    # Independent of the per-city gate inside run_preflight() and the final
+    # gate inside submit_live_trade(); a wedged supervisor or a missed call
+    # in one layer must never be the only thing standing between an
+    # engaged switch and a new day's trading.
+    if kill_switch.is_engaged():
+        state = kill_switch.get_state()
+        msg = (
+            "KILL SWITCH ENGAGED — refusing to run the session. "
+            f"reason={state.reason or state.detail or 'unknown'} "
+            f"source={state.source or 'unknown'}"
+        )
+        logger.critical(msg)
+        if not dry_run:
+            post_embed(
+                title="🛑 Session refused — KILL SWITCH ENGAGED",
+                description=msg,
+                color=COLOR_RED,
+            )
+        return
+
     today = date.today()
     tomorrow = today + timedelta(days=1)
 

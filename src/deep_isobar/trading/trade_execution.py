@@ -28,6 +28,7 @@ import logging
 from datetime import datetime, timezone
 
 from deep_isobar.core.types import ExecutedTrade, TradeSignal
+from deep_isobar.ops import kill_switch
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +115,13 @@ def submit_live_trade(
 
     .. warning::
 
-        **Not implemented.**  This function always raises ``RuntimeError``.
-        It is a placeholder for Phase 7 (live execution) and will be wired to
-        a real exchange client (e.g. ``kalshi_client``) in a future build step.
+        **Not implemented.**  Beyond the kill-switch guard below, this
+        function always raises ``RuntimeError``.  It is a placeholder for
+        Phase 7 (live execution) and will be wired to a real exchange
+        client (e.g. ``kalshi_client``) in a future build step.  When that
+        happens, the kill-switch check below MUST remain the final gate
+        immediately before the network call — do not let any new logic
+        land between it and the order submission.
 
     Args:
         market_source: Exchange identifier, e.g. ``"Kalshi"``.
@@ -127,8 +132,21 @@ def submit_live_trade(
         order_type: Order type, default ``"limit"``.
 
     Raises:
-        RuntimeError: Always — live trading is not yet implemented.
+        KillSwitchEngagedError: If the kill switch is engaged — checked
+            before anything else, including the "not implemented" guard.
+        RuntimeError: Otherwise, always — live trading is not yet implemented.
     """
+    # ── Kill switch — the final guard before the (future) network call ────
+    if kill_switch.is_engaged():
+        state = kill_switch.get_state()
+        raise kill_switch.KillSwitchEngagedError(
+            "submit_live_trade refused: KILL SWITCH ENGAGED — "
+            f"reason={state.reason or state.detail or 'unknown'!r} "
+            f"source={state.source or 'unknown'!r}. "
+            f"Attempted: market_source={market_source!r} contract={contract_id!r} "
+            f"side={side!r} qty={quantity} price={price}"
+        )
+
     raise RuntimeError(
         "Live trading not implemented yet. "
         f"Attempted: market_source={market_source!r} contract={contract_id!r} "

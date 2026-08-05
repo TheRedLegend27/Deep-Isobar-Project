@@ -8,6 +8,10 @@ failed preflight means the city logs nothing and alerts.
 
 Checks (config under ``risk.preflight``):
 
+0. **kill_switch** — checked first, unconditionally, even when the rest of
+   preflight is disabled via config (``risk.preflight.enabled: false``
+   must never be a way to route around the kill switch).  See
+   ``ops/kill_switch.py``.
 1. **live_market**   — the Kalshi client must be in live mode.  Stub books
    price everything at 0.50 and any "edge" against them is fiction.
 2. **forecast_bounds** — the calibrated mean must sit within the observed
@@ -48,6 +52,7 @@ from datetime import datetime, timezone
 
 from deep_isobar.calibration.emos import EMOSParams
 from deep_isobar.config import get_setting
+from deep_isobar.ops import kill_switch
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +173,22 @@ def run_preflight(
         smoke: Recent-METAR summary from :func:`smoke_report`; None skips
             the smoke gate with a warning when the gate is enabled.
     """
+    # 0. Kill switch — unconditional, even when the rest of preflight is
+    # disabled via config. This is a per-city gate; the session loop and
+    # submit_live_trade each check it independently too.
+    if kill_switch.is_engaged():
+        state = kill_switch.get_state()
+        result = PreflightResult(
+            ok=False,
+            failures=[
+                "KILL SWITCH ENGAGED — "
+                f"reason={state.reason or state.detail or 'unknown'!r} "
+                f"source={state.source or 'unknown'!r}"
+            ],
+        )
+        logger.critical("[%s] PREFLIGHT BLOCKED — %s", city_name, result.summary())
+        return result
+
     if not bool(_cfg("enabled")):
         return PreflightResult(ok=True, warnings=["preflight disabled via config"])
 
