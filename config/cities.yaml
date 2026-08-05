@@ -251,8 +251,15 @@ cities:
      nws_lat: 29.6454, nws_lon: -95.2789,
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
 
+  # Flipped to trade: true 2026-08-05 — deepest book of any active city
+  # (avg OI ~12.7k, 2x New York), CRPS/MAE beat NBM on both legs, LA LOW's
+  # CRPS (0.448) is the best of any station in the 08-04 scorecard, no
+  # NBM-divergence flag. Book-level Brier edge streak was at 2 of the
+  # gated 2-3 weeks (positive since 07-22); flipped early on the strength
+  # of LA's individual liquidity/calibration evidence (see docs/ROADMAP.md
+  # Phase 4). Still paper_trade: true — no live capital exposure.
   - {city: Los Angeles, city_code: LAX, state: CA, country: US, timezone: America/Los_Angeles,
-     station_id: KLAX, settlement_source: NWS, active: true, trade: false,
+     station_id: KLAX, settlement_source: NWS, active: true, trade: true,
      kalshi_series: KXHIGHLAX, kalshi_low_series: KXLOWTLAX, acis_station_id: KLAX,
      nws_lat: 33.9382, nws_lon: -118.3866,
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
