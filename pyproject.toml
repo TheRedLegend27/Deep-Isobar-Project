@@ -23,6 +23,7 @@ dependencies = [
     "python-dotenv",
     "anthropic",
     "openpyxl",
+    "matplotlib",
 ]
 
 [tool.pytest.ini_options]

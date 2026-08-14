@@ -24,3 +24,6 @@ uvicorn[standard]
 # Auth
 python-jose[cryptography]
 bcrypt
+
+# Charts
+matplotlib
