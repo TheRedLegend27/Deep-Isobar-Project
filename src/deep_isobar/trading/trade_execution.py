@@ -1,7 +1,8 @@
 """Trade execution for Deep Isobar.
 
-MVP implementation supporting paper trading only.  Live execution raises
-``RuntimeError`` until a real exchange client is wired in.
+Paper trading plus gated live execution via ``kalshi_client.create_order``.
+Live orders are refused with :class:`LiveTradingDisabledError` until
+``runtime.paper_trade`` is set to exactly ``False`` in settings.yaml.
 
 Canonical interface (from INTERFACES.md)::
 
@@ -17,17 +18,22 @@ Paper trade behaviour:
   no slippage modelled at MVP stage)
 - Sets ``avg_fill_price`` equal to ``price`` (no market impact)
 
-Live trade behaviour:
-- Raises ``RuntimeError`` unconditionally — placeholder for Phase 7
+Live trade behaviour (see ``submit_live_trade`` for the full gate order):
+- Refused while ``runtime.paper_trade`` is not exactly ``False``
+- Kill switch checked immediately before the network call, always last
+- SELL signals are placed as long-NO orders at the complementary price
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import uuid
 from datetime import datetime, timezone
 
+from deep_isobar.config import get_setting
 from deep_isobar.core.types import ExecutedTrade, TradeSignal
+from deep_isobar.market import kalshi_client
 from deep_isobar.ops import kill_switch
 
 logger = logging.getLogger(__name__)
@@ -103,6 +109,21 @@ def execute_paper_trade(
     )
 
 
+class LiveTradingDisabledError(RuntimeError):
+    """Raised when live order placement is attempted while the system is
+    configured for paper trading (``runtime.paper_trade`` is not exactly
+    ``False`` in config/settings.yaml)."""
+
+
+# Kalshi order statuses → our execution_status vocabulary.
+_KALSHI_STATUS_MAP = {
+    "executed": "filled",
+    "resting":  "open",
+    "pending":  "pending",
+    "canceled": "canceled",
+}
+
+
 def submit_live_trade(
     market_source: str,
     contract_id: str,
@@ -110,33 +131,90 @@ def submit_live_trade(
     quantity: float,
     price: float,
     order_type: str = "limit",
+    client_order_id: str | None = None,
 ) -> ExecutedTrade:
-    """Submit a live order to an exchange.
+    """Submit a live order to Kalshi.
 
-    .. warning::
+    Signal-side semantics match the paper book: ``side="BUY"`` buys the
+    YES contract at *price*; ``side="SELL"`` is expressed as buying the NO
+    contract at ``1 − price`` (Kalshi has no naked shorting — betting
+    against IS buying NO; same convention as ``trading/kelly.py``).
+    ``price`` is always in YES-space, exactly as recorded in
+    ``paper_trades.csv``.
 
-        **Not implemented.**  Beyond the kill-switch guard below, this
-        function always raises ``RuntimeError``.  It is a placeholder for
-        Phase 7 (live execution) and will be wired to a real exchange
-        client (e.g. ``kalshi_client``) in a future build step.  When that
-        happens, the kill-switch check below MUST remain the final gate
-        immediately before the network call — do not let any new logic
-        land between it and the order submission.
+    Three gates run before any network traffic, in order:
+
+    1. **Input validation** — ``ValueError`` on bad side/quantity/price.
+    2. **Live-trading flag** — ``runtime.paper_trade`` in settings.yaml
+       must be **exactly** ``False`` (not merely falsy, and absent means
+       paper).  Otherwise :class:`LiveTradingDisabledError`.  This is the
+       single switch that keeps the whole system paper-only today.
+    3. **Position limit** — contracts must not exceed
+       ``risk.max_position_per_contract``.
+
+    The kill switch is checked LAST, immediately before the order call —
+    per the go-live safety spec, no logic may ever land between that check
+    and the network submission.
 
     Args:
-        market_source: Exchange identifier, e.g. ``"Kalshi"``.
-        contract_id: Exchange contract ID.
-        side: ``"BUY"`` or ``"SELL"``.
-        quantity: Number of units to trade.
-        price: Limit price per unit.
-        order_type: Order type, default ``"limit"``.
+        market_source: Exchange identifier — only ``"Kalshi"`` is supported.
+        contract_id: Kalshi market ticker, e.g. ``"KXHIGHLAX-26AUG18-B77.5"``.
+        side: ``"BUY"`` or ``"SELL"`` (signal-side vocabulary).
+        quantity: Number of contracts — must be a positive whole number.
+        price: YES-space limit price as a decimal probability in (0, 1).
+        order_type: ``"limit"`` (default) or ``"market"``.
+        client_order_id: Idempotency key passed through to Kalshi.  Reuse
+            the SAME id when retrying after an ambiguous network failure —
+            Kalshi rejects duplicates instead of double-filling.  Auto-
+            generated (UUID4) when omitted.
 
     Raises:
-        KillSwitchEngagedError: If the kill switch is engaged — checked
-            before anything else, including the "not implemented" guard.
-        RuntimeError: Otherwise, always — live trading is not yet implemented.
+        ValueError: On invalid arguments.
+        LiveTradingDisabledError: While ``runtime.paper_trade`` is not
+            exactly ``False``.
+        KillSwitchEngagedError: If the kill switch is engaged.
+        RuntimeError: On any exchange/API failure (from ``create_order``).
     """
-    # ── Kill switch — the final guard before the (future) network call ────
+    # ── Gate 1: input validation — no side effects ────────────────────────
+    if market_source != "Kalshi":
+        raise ValueError(f"unsupported market_source {market_source!r} — only 'Kalshi'")
+    if side not in ("BUY", "SELL"):
+        raise ValueError(f"side must be 'BUY' or 'SELL', got {side!r}")
+    if quantity <= 0 or quantity != int(quantity):
+        raise ValueError(f"quantity must be a positive whole number of contracts, got {quantity}")
+    if not (0.0 < price < 1.0):
+        raise ValueError(f"price must be strictly inside (0.0, 1.0), got {price}")
+
+    count = int(quantity)
+
+    # ── Gate 2: the paper/live switch ─────────────────────────────────────
+    if get_setting("runtime.paper_trade", True) is not False:
+        raise LiveTradingDisabledError(
+            "submit_live_trade refused: runtime.paper_trade is not False — "
+            "the system is configured for paper trading. Flip it in "
+            "config/settings.yaml only as a deliberate go-live decision. "
+            f"Attempted: contract={contract_id!r} side={side!r} "
+            f"qty={quantity} price={price}"
+        )
+
+    # ── Gate 3: hard per-contract position limit ──────────────────────────
+    max_contracts = int(get_setting("risk.max_position_per_contract", 100))
+    if count > max_contracts:
+        raise ValueError(
+            f"quantity {count} exceeds risk.max_position_per_contract={max_contracts}"
+        )
+
+    # SELL = long NO at the complementary price (see docstring).
+    if side == "BUY":
+        kalshi_side, price_cents = "yes", round(price * 100)
+    else:
+        kalshi_side, price_cents = "no", round((1.0 - price) * 100)
+    price_cents = min(99, max(1, price_cents))
+
+    idem_key = client_order_id or str(uuid.uuid4())
+    timestamp_utc = datetime.now(timezone.utc)
+
+    # ── Kill switch — the FINAL guard before the network call ─────────────
     if kill_switch.is_engaged():
         state = kill_switch.get_state()
         raise kill_switch.KillSwitchEngagedError(
@@ -147,10 +225,37 @@ def submit_live_trade(
             f"side={side!r} qty={quantity} price={price}"
         )
 
-    raise RuntimeError(
-        "Live trading not implemented yet. "
-        f"Attempted: market_source={market_source!r} contract={contract_id!r} "
-        f"side={side!r} qty={quantity} price={price} order_type={order_type!r}"
+    order = kalshi_client.create_order(
+        ticker=contract_id,
+        action="buy",
+        side=kalshi_side,
+        count=count,
+        price_cents=price_cents,
+        client_order_id=idem_key,
+        order_type=order_type,
+    )
+
+    status = _KALSHI_STATUS_MAP.get(str(order.get("status", "")).lower(), "unknown")
+    filled = status == "filled"
+
+    return ExecutedTrade(
+        timestamp_utc=timestamp_utc,
+        trade_id=f"LIVE-{idem_key[:8]}",
+        contract_id=contract_id,
+        market_source=market_source,
+        side=side,
+        quantity=float(count),
+        price=price,
+        order_type=order_type,
+        execution_status=status,
+        fill_quantity=float(count) if filled else None,
+        avg_fill_price=price if filled else None,
+        exchange_order_id=str(order.get("order_id")),
+        paper_trade_flag=False,
+        notes=(
+            f"Live Kalshi order — side={kalshi_side} price={price_cents}¢ "
+            f"client_order_id={idem_key}"
+        ),
     )
 
 

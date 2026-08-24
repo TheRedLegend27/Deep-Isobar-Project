@@ -140,6 +140,11 @@ risk:
     max_contracts_per_session: 3      # max number of brackets to enter (per city)
     daily_exposure_cap_usd: 50.0      # static fallback only when position_sizing.enabled: false
     min_alpha_to_spread: 0.10         # must clear same threshold as primary signal
+    # No shorting near-certain contracts: 348-trade replay (2026-08-22)
+    # showed SELLs entered at YES >= 0.50 went 2W/10L for -$35 — tiny
+    # premiums against dollar-sized busts. SELLs below this still trade
+    # (0.20-0.35 entries were the profitable SELL band, +$66 on 53).
+    max_sell_entry_price: 0.50
     allocation_method: kelly          # proportional | equal | kelly
     # Fee-adjusted fractional Kelly (research report 2026-06, Q6).  BUY and
     # SELL both spread; edges that die to the 0.07*P*(1-P) taker fee size
@@ -151,7 +156,12 @@ risk:
     kelly:
       fraction: 0.25                  # fractional Kelly (raw Kelly overbets)
       avg_pairwise_correlation: 0.6   # same-day city outcome correlation
-      # n_correlated_bets: 5          # default: number of active cities
+      # n_correlated_bets: 5          # default: number of TRADING cities
+      # Brackets within one city all settle on the same temperature — a
+      # bust takes out the whole spread (LA, 3 separate days, Aug 2026).
+      # k same-city brackets are sized as ~one bet: each divided by
+      # 1+(k-1)*rho.  0 disables.
+      within_city_correlation: 0.8
 
   # Smart position sizer (trading/position_sizer.py) — go-live safety build,
   # Part 2.  Replaced the old static-$50-base dynamic_sizing block: across
@@ -238,6 +248,28 @@ emos:
       trend_variance: true
   ridge_lambda: 0.0
   trend_variance: false
+
+# Numeric trade-flip gate (research/flip_gate.py) — the objective criteria a
+# data-only city must meet before `trade: false` -> `true` in cities.yaml.
+# Replaces the judgment-call flips (LA was flipped 2026-08-05 on book depth +
+# calibration and went 1W/15L; a track-record criterion now blocks re-flips
+# of cities the paper book has already falsified).  Run:
+#   python -m deep_isobar.research.flip_gate
+flip_gate:
+  window_days: 30              # calibration lookback (matches scorecard)
+  min_calibration_days: 21     # need >= this many scored days in window
+  max_crps_f: 1.00             # 30d CRPS ceiling (Boston, worst trader, ~1.00)
+  require_beats_nbm: true      # EMOS MAE must beat NBM MAE (else no model edge)
+  liquidity_days: 14           # orderbook lookback from the collector archive
+  max_median_spread: 0.06      # median best_ask - best_bid (fraction of $1)
+  # Benchmarked 2026-08-22 on 14d of books: the five profitable trading
+  # cities score 59-72% (deep-tail strikes quote one-sided; NY = 59%), so
+  # the bar sits just below the worst of them, not at an aspirational 75%.
+  min_two_sided_frac: 0.55     # fraction of quotes with both bid and ask live
+  min_series_volume_24h: 100.0 # median per-snapshot total volume across strikes
+  # Cities with a real paper track record must not be re-flipped past it:
+  # with >= min_track_trades settled in the last 60d, P&L must be positive.
+  min_track_trades: 10
 
 models:
   default_metric: high_temp_f

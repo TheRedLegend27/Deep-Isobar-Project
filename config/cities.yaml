@@ -166,7 +166,7 @@ cities:
     station_id: KPHX
     settlement_source: NWS
     active: true
-    trade: false
+    trade: true   # flip gate PASS 2026-08-22: CRPS 0.875, MAE 1.22 vs NBM 2.29, spread 1c, vol 16.6k
     kalshi_series: KXHIGHTPHX
     kalshi_low_series: KXLOWTPHX
     acis_station_id: KPHX
@@ -185,7 +185,7 @@ cities:
     station_id: KDEN
     settlement_source: NWS
     active: true
-    trade: false
+    trade: true   # flip gate PASS 2026-08-22: CRPS 0.921, MAE 1.23 vs NBM 2.65, spread 1c, vol 15.8k
     kalshi_series: KXHIGHDEN
     kalshi_low_series: KXLOWTDEN
     acis_station_id: KDEN
@@ -204,7 +204,7 @@ cities:
     station_id: KMIA
     settlement_source: NWS
     active: true
-    trade: false
+    trade: true   # flip gate PASS 2026-08-22: CRPS 0.611, MAE 0.81 vs NBM 2.20, spread 1c, vol 62.5k
     kalshi_series: KXHIGHMIA
     kalshi_low_series: KXLOWTMIA
     acis_station_id: KMIA
@@ -240,32 +240,39 @@ cities:
   # text; Houston is Hobby (KHOU).  All trade: false.
 
   - {city: Austin, city_code: AUS, state: TX, country: US, timezone: America/Chicago,
-     station_id: KAUS, settlement_source: NWS, active: true, trade: false,
+     # flip gate PASS 2026-08-22: CRPS 0.564 (best of any HIGH station), MAE 0.74 vs NBM 1.88
+     station_id: KAUS, settlement_source: NWS, active: true, trade: true,
      kalshi_series: KXHIGHAUS, kalshi_low_series: KXLOWTAUS, acis_station_id: KAUS,
      nws_lat: 30.1945, nws_lon: -97.6699,
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
 
   - {city: Houston, city_code: HOU, state: TX, country: US, timezone: America/Chicago,
-     station_id: KHOU, settlement_source: NWS, active: true, trade: false,
+     # flip gate PASS 2026-08-22: CRPS 0.697, MAE 1.03 vs NBM 1.55
+     station_id: KHOU, settlement_source: NWS, active: true, trade: true,
      kalshi_series: KXHIGHTHOU, kalshi_low_series: KXLOWTHOU, acis_station_id: KHOU,
      nws_lat: 29.6454, nws_lon: -95.2789,
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
 
-  # Flipped to trade: true 2026-08-05 — deepest book of any active city
-  # (avg OI ~12.7k, 2x New York), CRPS/MAE beat NBM on both legs, LA LOW's
-  # CRPS (0.448) is the best of any station in the 08-04 scorecard, no
-  # NBM-divergence flag. Book-level Brier edge streak was at 2 of the
-  # gated 2-3 weeks (positive since 07-22); flipped early on the strength
-  # of LA's individual liquidity/calibration evidence (see docs/ROADMAP.md
-  # Phase 4). Still paper_trade: true — no live capital exposure.
+  # UN-FLIPPED to trade: false 2026-08-22 after 1W/15L, -$19.33 since the
+  # 2026-08-05 flip. Mechanism, visible in every settled row: the ensemble
+  # mean ran 2-4°F HOT every single trading day (e.g. 83.0->80, 82.7->79,
+  # 84.4->80, 85.4->82) — the marine-layer regime the lows research warned
+  # about, a one-sided bias, not noise. The 08-05 flip rationale (book
+  # depth + calibration CRPS) was real but calibration is scored on stored
+  # forecasts and did not capture the live warm bias. Re-flip only after a
+  # marine-layer covariate / bias correction WINS the holdout race AND
+  # research/flip_gate.py passes (its track-record criterion now blocks
+  # re-flips past a losing paper book). LA LOW remains a top lows-trading
+  # candidate — the same marine layer that busts highs stabilizes lows.
   - {city: Los Angeles, city_code: LAX, state: CA, country: US, timezone: America/Los_Angeles,
-     station_id: KLAX, settlement_source: NWS, active: true, trade: true,
+     station_id: KLAX, settlement_source: NWS, active: true, trade: false,
      kalshi_series: KXHIGHLAX, kalshi_low_series: KXLOWTLAX, acis_station_id: KLAX,
      nws_lat: 33.9382, nws_lon: -118.3866,
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
 
   - {city: Atlanta, city_code: ATL, state: GA, country: US, timezone: America/New_York,
-     station_id: KATL, settlement_source: NWS, active: true, trade: false,
+     # flip gate PASS 2026-08-22: CRPS 0.883, MAE 1.23 vs NBM 2.95
+     station_id: KATL, settlement_source: NWS, active: true, trade: true,
      kalshi_series: KXHIGHTATL, kalshi_low_series: KXLOWTATL, acis_station_id: KATL,
      nws_lat: 33.6301, nws_lon: -84.4418,
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
@@ -289,7 +296,8 @@ cities:
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
 
   - {city: New Orleans, city_code: NOLA, state: LA, country: US, timezone: America/Chicago,
-     station_id: KMSY, settlement_source: NWS, active: true, trade: false,
+     # flip gate PASS 2026-08-22: CRPS 0.747, MAE 0.95 vs NBM 1.44
+     station_id: KMSY, settlement_source: NWS, active: true, trade: true,
      kalshi_series: KXHIGHTNOLA, kalshi_low_series: KXLOWTNOLA, acis_station_id: KMSY,
      nws_lat: 29.9928, nws_lon: -90.2510,
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
@@ -301,7 +309,8 @@ cities:
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}
 
   - {city: San Antonio, city_code: SATX, state: TX, country: US, timezone: America/Chicago,
-     station_id: KSAT, settlement_source: NWS, active: true, trade: false,
+     # flip gate PASS 2026-08-22: CRPS 0.555, MAE 0.75 vs NBM 0.95
+     station_id: KSAT, settlement_source: NWS, active: true, trade: true,
      kalshi_series: KXHIGHTSATX, kalshi_low_series: KXLOWTSATX, acis_station_id: KSAT,
      nws_lat: 29.5443, nws_lon: -98.4839,
      variance_multiplier: 1.0, mean_bias_correction_f: 0.0, kde_bandwidth: 5.5, tail_multiplier: 1.0}

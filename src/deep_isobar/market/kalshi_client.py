@@ -368,6 +368,141 @@ def _kalshi_get(
     return response.json()
 
 
+def _kalshi_post(
+    path: str,
+    body: dict[str, Any],
+    credentials: tuple[str, Any],
+) -> dict[str, Any]:
+    """Make an authenticated POST request to the Kalshi v2 REST API.
+
+    Same RSA-PSS signing scheme as :func:`_kalshi_get` — the signature
+    covers ``timestamp + "POST" + full path`` only, never the JSON body.
+
+    Args:
+        path: Endpoint path without base URL, e.g. ``"/portfolio/orders"``.
+        body: JSON-serialisable request body.
+        credentials: ``(key_id, private_key)`` from :func:`_load_credentials`.
+
+    Returns:
+        Parsed JSON response dict.
+
+    Raises:
+        RuntimeError: On network error or non-2xx HTTP status.
+    """
+    key_id, private_key = credentials
+    base_url = get_setting("markets.kalshi.base_url", _KALSHI_BASE_URL)
+    url = f"{base_url}{path}"
+
+    base_path = urlparse(base_url).path.rstrip("/")
+    sign_path = base_path + path
+
+    headers = _make_auth_headers(key_id, private_key, "POST", sign_path)
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Kalshi API network error on POST {path}: {exc}") from exc
+
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Kalshi API error: POST {path} → HTTP {response.status_code}: "
+            f"{response.text[:200]}"
+        )
+
+    return response.json()
+
+
+def create_order(
+    ticker: str,
+    action: str,
+    side: str,
+    count: int,
+    price_cents: int,
+    client_order_id: str,
+    order_type: str = "limit",
+) -> dict[str, Any]:
+    """Place an order via ``POST /portfolio/orders``.
+
+    This is the low-level exchange call — it performs NO risk checks of its
+    own.  All gating (kill switch, live-trading flag, position limits)
+    belongs in ``trading/trade_execution.submit_live_trade``, the only
+    sanctioned caller.
+
+    Args:
+        ticker: Kalshi market ticker, e.g. ``"KXHIGHLAX-26AUG18-B77.5"``.
+        action: ``"buy"`` or ``"sell"`` (Kalshi's vocabulary — our SELL
+            signals are expressed as *buying* the NO side, so production
+            always passes ``"buy"`` here).
+        side: ``"yes"`` or ``"no"``.
+        count: Number of contracts (positive integer).
+        price_cents: Limit price in integer cents [1, 99] for the chosen
+            side (``yes_price`` for yes, ``no_price`` for no).
+        client_order_id: Caller-supplied idempotency key.  Kalshi rejects a
+            duplicate ``client_order_id`` instead of double-filling, so a
+            retry after an ambiguous network failure MUST reuse the same ID.
+        order_type: ``"limit"`` (default) or ``"market"``.
+
+    Returns:
+        Kalshi's ``order`` response dict (``order_id``, ``status``, …).
+
+    Raises:
+        RuntimeError: In stub mode, without credentials, on network error,
+            on a non-2xx response, or on a malformed response body.
+        ValueError: On invalid argument values (checked before any network
+            traffic).
+    """
+    if action not in ("buy", "sell"):
+        raise ValueError(f"action must be 'buy' or 'sell', got {action!r}")
+    if side not in ("yes", "no"):
+        raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+    if not isinstance(count, int) or count <= 0:
+        raise ValueError(f"count must be a positive integer, got {count!r}")
+    if not isinstance(price_cents, int) or not (1 <= price_cents <= 99):
+        raise ValueError(f"price_cents must be an integer in [1, 99], got {price_cents!r}")
+    if order_type not in ("limit", "market"):
+        raise ValueError(f"order_type must be 'limit' or 'market', got {order_type!r}")
+    if not client_order_id:
+        raise ValueError("client_order_id is required (idempotency key)")
+
+    if _use_stub_mode():
+        raise RuntimeError("create_order refused: stub_mode is enabled — never place stub orders")
+    credentials = _load_credentials()
+    if credentials is None:
+        raise RuntimeError("create_order refused: no Kalshi credentials configured")
+
+    body: dict[str, Any] = {
+        "ticker": ticker,
+        "client_order_id": client_order_id,
+        "action": action,
+        "side": side,
+        "count": count,
+        "type": order_type,
+    }
+    if order_type == "limit":
+        body["yes_price" if side == "yes" else "no_price"] = price_cents
+
+    logger.info(
+        "create_order: ticker=%s action=%s side=%s count=%d price=%d¢ type=%s client_order_id=%s",
+        ticker, action, side, count, price_cents, order_type, client_order_id,
+    )
+    data = _kalshi_post("/portfolio/orders", body, credentials)
+    order = data.get("order")
+    if not isinstance(order, dict) or "order_id" not in order:
+        raise RuntimeError(
+            f"create_order: unexpected response shape (no order.order_id): {str(data)[:200]}"
+        )
+    logger.info(
+        "create_order: accepted — order_id=%s status=%s",
+        order.get("order_id"), order.get("status"),
+    )
+    return order
+
+
 # ---------------------------------------------------------------------------
 # Ticker and contract parsing
 # ---------------------------------------------------------------------------

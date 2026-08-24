@@ -193,9 +193,9 @@ def test_paper_trade_raises_on_price_below_zero():
 # ---------------------------------------------------------------------------
 
 
-def test_submit_live_trade_raises_runtime_error():
-    """submit_live_trade always raises RuntimeError."""
-    with pytest.raises(RuntimeError, match="not implemented"):
+def test_submit_live_trade_refused_under_paper_config():
+    """With runtime.paper_trade at its default (true), live orders refuse."""
+    with pytest.raises(RuntimeError, match="paper"):
         submit_live_trade(
             market_source="Kalshi",
             contract_id="CHI_HIGH_TEMP_F_GE_80_20260320",
@@ -217,8 +217,8 @@ def test_submit_live_trade_raises_with_default_order_type():
         )
 
 
-def test_submit_live_trade_error_mentions_contract():
-    """RuntimeError message includes the contract ID for debuggability."""
+def test_submit_live_trade_refusal_mentions_contract():
+    """The refusal message includes the contract ID for debuggability."""
     cid = "CHI_HIGH_TEMP_F_GE_80_20260320"
     with pytest.raises(RuntimeError, match=cid):
         submit_live_trade(

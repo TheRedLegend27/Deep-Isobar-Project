@@ -58,6 +58,7 @@ def build_spread(
     allocation_method: str,
     entry_prices: dict[str, float] | None = None,
     kelly_cfg: dict | None = None,
+    max_sell_entry_price: float | None = None,
 ) -> list[BracketAllocation]:
     """Build a multi-bracket spread from a list of trade signals.
 
@@ -76,7 +77,15 @@ def build_spread(
         kelly_cfg: For ``kelly`` — keys ``bankroll_usd`` (default 1000),
             ``fraction`` (default 0.25), ``avg_pairwise_correlation``
             (default 0.6), ``n_correlated_bets`` (default 1; pass the number
-            of active cities so same-airmass days aren't overbet).
+            of active cities so same-airmass days aren't overbet),
+            ``within_city_correlation`` (default 0.0 = off; brackets in one
+            spread all settle on the same temperature, so they are close to
+            one bet, not k independent ones).
+        max_sell_entry_price: SELL signals at or above this YES price are
+            excluded before ranking (348-trade replay: SELLs entered at
+            >= 0.50 were 2W/10L for -$35 — shorting near-certain contracts
+            collects pennies against dollar-sized busts).  ``None`` disables
+            the filter; signals with no known entry price are kept.
 
     Returns:
         List of :class:`BracketAllocation` sorted by rank ascending
@@ -91,6 +100,23 @@ def build_spread(
         s for s in signals
         if s.signal_side in ("BUY", "SELL") and abs(s.alpha) >= min_alpha
     ]
+
+    if max_sell_entry_price is not None and entry_prices:
+        kept: list[TradeSignal] = []
+        for s in qualifying:
+            price = entry_prices.get(s.contract_id)
+            if (
+                s.signal_side == "SELL"
+                and price is not None
+                and price >= max_sell_entry_price
+            ):
+                logger.info(
+                    "SELL %s entry %.2f >= max_sell_entry_price %.2f — excluded",
+                    s.contract_id, price, max_sell_entry_price,
+                )
+                continue
+            kept.append(s)
+        qualifying = kept
 
     if not qualifying:
         return []
@@ -284,6 +310,20 @@ def _kelly_allocation(
 
     if not allocations:
         return []
+
+    # Within-city haircut: build_spread is called once per city, and every
+    # bracket here settles on the SAME realized temperature — a miss busts
+    # them together (LA lost 3 positions on one temp on three separate days
+    # in Aug 2026).  Treat k same-city brackets as ~one bet, not k.
+    rho_within = float(kelly_cfg.get("within_city_correlation", 0.0))
+    if rho_within > 0.0 and len(allocations) > 1:
+        within_haircut = correlation_haircut(len(allocations), rho_within)
+        logger.info(
+            "kelly: %d same-city brackets — within-city haircut %.3f (rho=%.2f)",
+            len(allocations), within_haircut, rho_within,
+        )
+        for a in allocations:
+            a.allocated_usd *= within_haircut
 
     total = sum(a.allocated_usd for a in allocations)
     if total > daily_exposure_cap_usd:

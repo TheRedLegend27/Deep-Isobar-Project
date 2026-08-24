@@ -396,22 +396,34 @@ def test_cli_engage_and_release_are_mutually_exclusive_flags():
 
 
 def test_submit_live_trade_blocked_when_engaged(_isolated_switch):
+    from unittest.mock import patch
+
+    from deep_isobar.trading import trade_execution
     from deep_isobar.trading.trade_execution import submit_live_trade
 
     kill_switch.engage(reason="panic", source="unit_test")
-    with pytest.raises(kill_switch.KillSwitchEngagedError, match="panic"):
-        submit_live_trade(
-            market_source="Kalshi", contract_id="X-T90", side="BUY",
-            quantity=1.0, price=0.5,
-        )
+    # Pass the paper/live gate so the engaged switch is what refuses, and
+    # assert the exchange is never called.
+    with patch.object(trade_execution, "get_setting",
+                      lambda k, d=None: False if k == "runtime.paper_trade" else d), \
+         patch.object(trade_execution.kalshi_client, "create_order") as create:
+        with pytest.raises(kill_switch.KillSwitchEngagedError, match="panic"):
+            submit_live_trade(
+                market_source="Kalshi", contract_id="X-T90", side="BUY",
+                quantity=1.0, price=0.5,
+            )
+    create.assert_not_called()
 
 
-def test_submit_live_trade_not_implemented_when_disengaged(_isolated_switch):
-    from deep_isobar.trading.trade_execution import submit_live_trade
+def test_submit_live_trade_paper_gate_refuses_when_disengaged(_isolated_switch):
+    from deep_isobar.trading.trade_execution import (
+        LiveTradingDisabledError,
+        submit_live_trade,
+    )
 
-    # Disengaged (default) — falls through to the existing "not implemented"
-    # placeholder, unchanged behaviour for the pre-Part-3 codebase.
-    with pytest.raises(RuntimeError, match="not implemented"):
+    # Disengaged switch, default config (runtime.paper_trade: true) — the
+    # paper/live gate refuses before the kill-switch check is even reached.
+    with pytest.raises(LiveTradingDisabledError, match="paper"):
         submit_live_trade(
             market_source="Kalshi", contract_id="X-T90", side="BUY",
             quantity=1.0, price=0.5,

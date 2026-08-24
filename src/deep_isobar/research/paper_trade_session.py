@@ -1192,12 +1192,12 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                 # bankroll_usd is intentionally not read from multi_bracket.kelly
                 # config — the single authoritative figure above always wins.
                 kelly_cfg["bankroll_usd"] = bankroll_usd
-                # Haircut for same-airmass correlation: every active city
-                # trades the same day, so N defaults to the city count.
-                kelly_cfg.setdefault(
-                    "n_correlated_bets",
-                    sum(1 for c in get_city_universe() if c.active),
-                )
+                # Haircut for same-airmass correlation: every TRADING city
+                # bets the same day, so N defaults to that count.  Counting
+                # all active cities here (as before 2026-08-22) silently
+                # shrank every position ~3x as data-only cities onboarded —
+                # they collect books but place no correlated bets.
+                kelly_cfg.setdefault("n_correlated_bets", n_active_trading_cities)
 
                 allocations = build_spread(
                     signals=open_signals,
@@ -1207,6 +1207,7 @@ def run_city_session(city: CityProfile, dry_run: bool = False) -> dict:
                     allocation_method=multi_bracket_cfg.get("allocation_method", "proportional"),
                     entry_prices=entry_prices,
                     kelly_cfg=kelly_cfg,
+                    max_sell_entry_price=multi_bracket_cfg.get("max_sell_entry_price"),
                 )
                 log_spread_summary(allocations, logger)
 

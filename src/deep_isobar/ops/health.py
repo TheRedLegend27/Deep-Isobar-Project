@@ -54,6 +54,7 @@ import pandas as pd
 from deep_isobar.calibration.emos import load_params
 from deep_isobar.data.city_universe import get_city_universe
 from deep_isobar.notifications.discord_notifier import COLOR_RED, post_embed
+from deep_isobar.notifications.local_notifier import post_notification
 from deep_isobar.ops import kill_switch
 
 logger = logging.getLogger(__name__)
@@ -383,7 +384,12 @@ def render_health_section(checks: list[HealthCheck]) -> str:
 
 
 def post_alarm_embed(checks: list[HealthCheck]) -> None:
-    """Scream on Discord — silent no-op when nothing is broken."""
+    """Scream on Discord AND the local machine — no-op when nothing is broken.
+
+    The local notification is the channel that cannot be unconfigured:
+    during the 2026-08-09..14 outage the Discord path was a silent no-op
+    (no webhook set) and the frozen system went unnoticed for days.
+    """
     broken = alarms(checks)
     if not broken:
         return
@@ -392,6 +398,10 @@ def post_alarm_embed(checks: list[HealthCheck]) -> None:
         description="The system may be failing silently — investigate today.",
         color=COLOR_RED,
         fields=[{"name": c.name, "value": c.detail} for c in broken],
+    )
+    post_notification(
+        title=f"🚨 Deep Isobar: {len(broken)} invariant(s) broken",
+        message="; ".join(c.name for c in broken) + " — investigate today.",
     )
 
 

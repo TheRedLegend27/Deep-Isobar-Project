@@ -236,3 +236,82 @@ def test_settle_pnl_fee_smaller_at_extremes():
     win_mid = _compute_pnl("BUY", 0.50, 1, 1.0)
     win_tail = _compute_pnl("BUY", 0.10, 1, 1.0)
     assert (1 - 0.5) - win_mid > (1 - 0.1) - win_tail
+
+
+# ── SELL entry-price filter + within-city haircut (2026-08-22) ──────────────
+
+
+def test_rich_sells_excluded_by_max_sell_entry_price():
+    signals = [
+        _signal("CHEAP_SELL", "SELL", 0.10, 0.32),
+        _signal("RICH_SELL", "SELL", 0.30, 0.62),
+        _signal("RICH_BUY", "BUY", 0.75, 0.60),
+    ]
+    prices = {"CHEAP_SELL": 0.30, "RICH_SELL": 0.60, "RICH_BUY": 0.61}
+    allocs = build_spread(
+        signals, 50.0, 3, 0.10, "kelly", entry_prices=prices,
+        kelly_cfg={"bankroll_usd": 1000, "n_correlated_bets": 1},
+        max_sell_entry_price=0.50,
+    )
+    ids = {a.signal.contract_id for a in allocs}
+    assert "RICH_SELL" not in ids          # SELL at 0.60 filtered
+    assert "CHEAP_SELL" in ids             # SELL below the cap trades
+    assert "RICH_BUY" in ids               # BUYs never touched by the filter
+
+
+def test_sell_filter_boundary_is_inclusive():
+    signals = [_signal("EDGE_SELL", "SELL", 0.15, 0.52)]
+    allocs = build_spread(
+        signals, 50.0, 3, 0.10, "kelly", entry_prices={"EDGE_SELL": 0.50},
+        kelly_cfg={"n_correlated_bets": 1},
+        max_sell_entry_price=0.50,
+    )
+    assert allocs == []
+
+
+def test_sell_filter_off_by_default():
+    signals = [_signal("RICH_SELL", "SELL", 0.30, 0.62)]
+    allocs = build_spread(
+        signals, 50.0, 3, 0.10, "kelly", entry_prices={"RICH_SELL": 0.60},
+        kelly_cfg={"bankroll_usd": 1000, "n_correlated_bets": 1},
+    )
+    assert len(allocs) == 1
+
+
+def test_sell_filter_keeps_signal_with_unknown_price():
+    # Non-kelly path with a price missing for the SELL: can't judge — keep.
+    signals = [_signal("NO_PRICE", "SELL", 0.30, 0.55)]
+    allocs = build_spread(
+        signals, 50.0, 3, 0.10, "equal", entry_prices={"OTHER": 0.60},
+        max_sell_entry_price=0.50,
+    )
+    assert len(allocs) == 1
+
+
+def test_within_city_haircut_scales_multi_bracket_spreads():
+    base = {"bankroll_usd": 1000, "fraction": 0.25,
+            "avg_pairwise_correlation": 0.0, "n_correlated_bets": 1}
+    signals = [
+        _signal("A", "BUY", 0.45, 0.30),
+        _signal("B", "BUY", 0.40, 0.28),
+    ]
+    prices = {"A": 0.31, "B": 0.29}
+    plain = build_spread(signals, 500.0, 3, 0.10, "kelly", entry_prices=prices,
+                         kelly_cfg=base)
+    cut = build_spread(signals, 500.0, 3, 0.10, "kelly", entry_prices=prices,
+                       kelly_cfg={**base, "within_city_correlation": 0.8})
+    factor = 1 / (1 + 1 * 0.8)  # k=2 brackets
+    for p, c in zip(plain, cut):
+        assert c.allocated_usd == pytest.approx(p.allocated_usd * factor, abs=0.01)
+
+
+def test_within_city_haircut_noop_for_single_bracket():
+    base = {"bankroll_usd": 1000, "fraction": 0.25,
+            "avg_pairwise_correlation": 0.0, "n_correlated_bets": 1}
+    signals = [_signal("A", "BUY", 0.45, 0.30)]
+    prices = {"A": 0.31}
+    plain = build_spread(signals, 500.0, 3, 0.10, "kelly", entry_prices=prices,
+                         kelly_cfg=base)
+    cut = build_spread(signals, 500.0, 3, 0.10, "kelly", entry_prices=prices,
+                       kelly_cfg={**base, "within_city_correlation": 0.8})
+    assert cut[0].allocated_usd == pytest.approx(plain[0].allocated_usd, abs=0.01)

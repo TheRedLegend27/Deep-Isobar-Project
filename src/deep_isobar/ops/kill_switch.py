@@ -70,6 +70,7 @@ from pathlib import Path
 
 from deep_isobar.config import get_project_root, get_setting
 from deep_isobar.notifications.discord_notifier import COLOR_GREEN, COLOR_RED, post_embed
+from deep_isobar.notifications.local_notifier import post_notification
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,12 @@ def engage(reason: str, source: str) -> None:
         )
     except Exception:  # noqa: BLE001
         logger.warning("kill_switch: could not post engage Discord embed", exc_info=True)
+    # Local notification — the un-unconfigurable channel (Discord has no
+    # webhook set on this deployment; see the 2026-08-09..14 incident).
+    post_notification(
+        title="\U0001f6d1 Deep Isobar: KILL SWITCH ENGAGED",
+        message=f"{source}: {reason}",
+    )
 
 
 def release(released_by: str, confirm: bool) -> None:
